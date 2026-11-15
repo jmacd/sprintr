@@ -156,7 +156,7 @@ Message format strings must contain exactly as many placeholders as
 there are positional arguments at the callsite. When >= 1 argument is
 present, the structured values are placed under the `args` section of
 the body, as a list.
-
+    
 ```
 {
   ...
@@ -184,26 +184,57 @@ expression and associated structured value, like `{
 "my_thing:thing_name": <expression-value> }`. Note that an
 `<expression-value>` may itself contain entity references.
 
-The "on first use" criteria will require entity handles to contain
-inner mutability via a `Cell` or otherwise idiomatic Rust, so as to be
-able to update the log record identifier. (If a shared entity handle
-is required, a `Arc<Mutex<_>>` or `OnceLock` may be required, however
-this is not initially required.)
+References will be logged at least once. This requires entity handles
+to contain inner mutability via a `Cell` or otherwise idiomatic Rust,
+so as to be able to update the log record identifier. (If a shared
+entity handle is required, a `Arc<Mutex<_>>` or `OnceLock` may be
+required, however this is not initially required.)
 
 An entity reference will appear using the "$ref" key (like JSON
 Schema). For example, to log a reference using an entity handle that ,
 the value will appear as a reference like `{ "$ref":
 "<record_uuid>#defs/my_thing:thing_name" }`, in addition to being
-placed in `defs` on first use.
+placed in `defs` at least once.
 
 References are also used to convey an association between attributes
 and positional arguments. For example, when a log statement uses an
 `my_attr = entity_hande` argument, two associations are in effect:
 
-1. One reference to `my_thing:thing_name` appears as a `$ref` value
-   in `args[0]`, referring to the entity value, e.g., as shown above.
+1. One reference to `my_thing:thing_name` appears as a `$ref` value in
+   `args[0]`, referring to the entity value, e.g., as shown above in
+   the defs section of an earlier log record.
 2. One reference appears in the record attributes, e.g. `{ "my_attr":
-   { "$ref": "#args/0" } }`, referring to the same entity value.
+   { "$ref": "#args/0" } }`, referring to the entity value reference
+   in the same log record.
+
+## Definitions
+
+The `defs` section of the record body stores entity references and
+values. Definitions are logged at least once, however note that
+entities are synchronized independently of log record emission. An
+entity's first reference may appear before an entity's
+definition. Readers should tolerate late-arriving definitions.
+
+Entities are (conditionally) encoded after the logs sampler interface
+`should_sample` method returns true.
+
+```
+{
+  ...
+  "defs": [
+    
+  ]
+}
+```
+
+
+## JSON Structure
+
+## Startup
+
+## Context
+
+## Application
 
 ## Additional context
 
