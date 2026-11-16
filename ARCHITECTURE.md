@@ -171,14 +171,16 @@ the body, as a list.
 ## References
 
 When an entity handle is used, it will be placed in the log record
-under the `defs` section of the body. The entity handle retains a
-unique identifier given to the associated log record where it was
-defined in the log. Log record unique identifiers are UUID7 values
-associated with a built-in entity named `log.record`.
+under the `defs` section of the body for future reference. The entity
+handle retains a unique identifier given to the associated log record
+where it was defined in the log. Log record unique identifiers consist
+of unique identifier(s) of the execution environment plus a sequence
+number. For example, a unique processor identifier and a unique thread
+name plus a sequence number are suitable; a task-local or synchronized
+logger may use different uniqueness coordinates. How the process
+self-identifies will be written in the initial log record.
 
-Every log record where an entity is defined will carry a
-`log.record:<uuid7>` attribute to uniquely identify itself, and entity
-handles will store the record identifier where their definition
+Entity handles store the record identifier where their definition
 appears. The entry definition will include the entity key:value
 expression and associated structured value, like `{
 "my_thing:thing_name": <expression-value> }`. Note that an
