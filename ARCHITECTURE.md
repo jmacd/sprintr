@@ -88,17 +88,22 @@ the indicated type.
 ## Entities
 
 Entities are declared similarly to attributes, however whereas
-attributes define global keys, entites define value properties.
-Weaver code generation will be used to declare these in a similar
-manner to attributes, as they have the same representation and
-semantic kind. Note that this concept of entity is not directly
-related to the experimental OpenTelemetry Entities specification.
+attributes define properties of log events, entities define properties
+of values within log events.  Weaver code generation will be used to
+declare these in a similar manner to attributes, as they have the same
+representation and structure (KeyValue). Entities are passed by handle
+to the log API; entities are constructed using the entity definition
+and a structured value; the value is evaluated and encoded once,
+eagerly, when the entity handle is constructed.
+
+Note that this concept of entity is not directly related to the
+experimental OpenTelemetry Entities specification.
 
 We have two categories of entity, named and anonymous. Callers
 construct named entities by providing a globally distinct string-value
 identifier. Semantically, a named entity is used to correlate the
 entity across process boundaries; they should be used when there
-is a natural given name for the entity.
+is a natural global-given name for the entity.
 
 Anonymous entities are a convenience for entities that are locally
 unique without a natural namespace; these entities are given unique
@@ -128,13 +133,11 @@ let handle = my_thing.new("thing_name", <expression>);
 info!("starting {}", handle);
 ```
 
-To avoid over-specifying this, since it requires attention to Rust
-semantics and idioms, the `<expression>` above is a placeholder for a
-suitable solution. The existing `as_struct()` method is suitable, as
-it enables a structured-value encoding for objects. In this example,
-the entity key-value `my_thing:thing_name` is defined by the expression
-and logged once; future uses of the `handle` are logged as an entity
-reference.
+The `<expression>` above is a placeholder for a structured value, as
+by the `as_struct()` method (or something similarly idiomiatic). In
+this example, the entity key-value `my_thing:thing_name` is defined by
+the expression and logged once; future uses of the `handle` are logged
+as an entity reference.
 
 For anonymous entities, simply remove the name and let the library
 fill one in:
@@ -213,9 +216,11 @@ and positional arguments. For example, when a log statement uses an
 
 The `defs` section of the record body stores entity references and
 values. Definitions are logged at least once, however note that
-entities are synchronized independently of log record emission. An
-entity's first reference may appear before an entity's
-definition. Readers should tolerate late-arriving definitions.
+entities are synchronized independently of log record emission, so the
+entity my be committed to a log record that records out-of-order with
+other records. An entity's first reference may appear before an
+entity's definition. Readers should tolerate late-arriving
+definitions.
 
 Entities are (conditionally) encoded after the logs sampler interface
 `should_sample` method returns true.
@@ -224,13 +229,36 @@ Entities are (conditionally) encoded after the logs sampler interface
 {
   ...
   "defs": [
-    
+    { "my_thing:thing_name": <expression-value> }
   ]
 }
 ```
 
+An entity value that itself contains other entities will encode refs
+to other defs. Entity handles are erased from structured values; their
+reference points into the definition, for example this `defs` contains
+a `b` key logged using an anonymous entity handle with value `4`:
+
+```
+{
+  ...
+  "defs": [
+    { "my_thing:thing_name": { "a": 3, "b": 4 },
+    { "b_attr:12345678": { "$ref": "#defs/my_thing:thing_name/b" },
+  ]
+}
+```
+
+Note that the order of encoding is non-deterministic: the same data
+could equivalently be encoded with `b_attr:12345678` define as `4`,
+with a ref embedded in `my_thing:thing_name`.
 
 ## JSON Structure
+
+To stay compatible with OTLP log structure, the `body` field contains
+the fields described above, including `defs`, `refs`, `seq`, `args`,
+and `msg`. Log attributes, scope attributes, and resource attributes
+are encoded in the appropriate level of OTLP structure.
 
 ## Startup
 
