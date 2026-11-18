@@ -93,8 +93,19 @@ of values within log events. Weaver code generation will be used to
 declare these in a similar manner to attributes, as they have the same
 representation and structure (KeyValue). Entities are passed by handle
 to the log API; entities are constructed using the entity definition
-and a structured value; the value is evaluated and encoded once,
-eagerly, when the entity handle is constructed.
+and a structured value. Construction evaluates the value exactly once
+and eagerly encodes it into a reusable intermediate representation.
+The entity is a construction-time snapshot; logging does not
+re-evaluate the expression.
+
+The intermediate representation retains encoded chunks for ordinary
+values, deferred slots for nested entities, and the entity dependencies
+needed to fill those slots. It need not be a complete OTLP byte string:
+a nested entity's definition location may not yet be known. Final
+assembly reuses the encoded chunks and fills deferred slots with inline
+entity values or references, according to the selected definition
+locations. Reference strings and enclosing protobuf lengths are
+finalized during assembly, rather than patched into fixed-size slots.
 
 Note that this concept of entity is not directly related to the
 experimental OpenTelemetry Entities specification.
@@ -239,8 +250,11 @@ other records. An entity's first reference may appear before an
 entity's definition. Readers should tolerate late-arriving
 definitions.
 
-Entities are (conditionally) encoded after the logs sampler interface's
-`should_sample` method returns true.
+Definition locations are selected and final OTLP bytes are assembled
+from the intermediate representations only after the logs sampler
+interface's `should_sample` method returns true. A rejected log record
+does not assign definition locations or mark entities as defined;
+eager construction-time encoding is independent of this decision.
 
 ```
 {
@@ -252,10 +266,12 @@ Entities are (conditionally) encoded after the logs sampler interface's
 ```
 
 An entity value that itself contains other entities will encode refs
-to other defs. Entity handles are erased from structured values, and
-entries in `refs` associate their entity names with locations in the
-definition. For example, this `defs` contains a `b` key logged using
-an anonymous entity handle with value `4`:
+to other defs. Entity handles are absent from the wire representation,
+but their identities and dependencies are retained in the intermediate
+representation until assembly. Entries in `refs` associate entity
+names with locations in the definition. For example, the anonymous
+entity's value `4` is encoded inline under `b` in the parent definition;
+the `refs` entry identifies that existing node as `b_attr:12345678`:
 
 ```json
 {
