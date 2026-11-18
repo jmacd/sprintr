@@ -12,7 +12,7 @@ A Rust logging library that:
 - Supports declaring entities that are named or anonymous
 - Supports declaring attributes with descriptions and types
 - Encodes definitions for callsite, stackframe, entity, attribute once
-  per log stream; uses references to refer to definitions
+  per log stream by default; uses references to refer to definitions
 - Reference syntax uses record identifiers and body-relative JSON Pointer
   fragments
 - Encodes directly to OTLP LogRecord bytes (minimizes allocations)
@@ -255,6 +255,18 @@ from the intermediate representations only after the logs sampler
 interface's `should_sample` method returns true. A rejected log record
 does not assign definition locations or mark entities as defined;
 eager construction-time encoding is independent of this decision.
+
+The initial design assumes reliable delivery of emitted records; it
+does not require a durable-delivery acknowledgment protocol for
+definitions. Record loss is nevertheless tolerated: references to a
+lost definition may remain explicitly unresolved without preventing
+the rest of the graph from being loaded.
+
+Entity definitions may be repeated periodically to limit the impact
+of loss on later references that target the repeated definitions.
+Repetition in a new record does not by itself repair references to a
+missing earlier record. The repetition policy and recovery of those
+earlier references are left for future work.
 
 ```
 {
