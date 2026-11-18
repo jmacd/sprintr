@@ -6,14 +6,15 @@ A Rust logging library that:
 - Uses structured logging, including nested structure
 - Enables formatted log recovery
 - Adds a new fundamental value-reference
-  - refer backwards in the same log stream,
+  - refer to values in the same log stream,
   - or refer to a qualified log record in another stream
 - Includes file:line and a limited number of stack frames
 - Supports declaring entities that are named or anonymous
 - Supports declaring attributes with descriptions and types
 - Encodes definitions for callsite, stackframe, entity, attribute once
   per log stream; uses references to refer to definitions
-- Reference syntax uses URN fragments mapped to JSON paths
+- Reference syntax uses record identifiers and body-relative JSON Pointer
+  fragments
 - Encodes directly to OTLP LogRecord bytes (minimizes allocations)
 
 ## Details
@@ -172,8 +173,8 @@ the body, as a list.
 
 ## References
 
-When an entity handle is used, it will be placed in the log record
-under the `defs` section of the body for future reference. The entity
+When an entity handle is used, its value is recorded in the log record
+body for future reference. The entity
 handle retains a unique identifier given to the associated log record
 where it was defined in the log. Log record unique identifiers consist
 of unique identifier(s) of the execution environment plus a sequence
@@ -194,11 +195,27 @@ so as to be able to update the log record identifier. (If a shared
 entity handle is required, an `Arc<Mutex<_>>` or `OnceLock` may be
 required; however, this is not initially required.)
 
-An entity reference will appear using the "$ref" key (like JSON
+An inline entity reference will appear using the "$ref" key (like JSON
 Schema). For example, when logging a reference using an entity handle,
 the value will appear as a reference like `{ "$ref":
-"<record_uuid>#defs/my_thing:thing_name" }`, in addition to being
-placed in `defs` at least once.
+"<record_id>#/defs/my_thing:thing_name" }`, in addition to being
+defined at least once.
+
+The `refs` section of the body is an array of single-entry maps of
+the form `{ "<entity-name>": "<fragment>" }`. Each entry
+associates an entity name with the location of its value in the containing
+record's `args` or `defs`, including nested values. Since these values
+are always reference fragments, no `$ref` wrapper is needed. For example, an anonymous entity
+whose value is stored directly in `args[0]` is referenced as follows:
+
+```json
+{
+  "args": [4],
+  "refs": [
+    { "my_session:12345678": "#/args/0" }
+  ]
+}
+```
 
 References are also used to convey an association between attributes
 and positional arguments. For example, when a log statement uses a
@@ -208,13 +225,14 @@ and positional arguments. For example, when a log statement uses a
    `args[0]`, referring to the entity value, e.g., as shown above in
    the defs section of an earlier log record.
 2. One reference appears in the record attributes, e.g. `{ "my_attr":
-   { "$ref": "#args/0" } }`, referring to the entity value reference
+   { "$ref": "#/args/0" } }`, referring to the entity value reference
    in the same log record.
 
 ## Definitions
 
-The `defs` section of the record body stores entity references and
-values. Definitions are logged at least once; however, note that
+The `defs` section of the record body is a map from entity names to
+their values, which may contain entity references. Definitions are
+logged at least once; however, note that
 entities are synchronized independently of log record emission, so the
 entity may be committed to a log record that is recorded out of order with
 other records. An entity's first reference may appear before an
@@ -227,23 +245,25 @@ Entities are (conditionally) encoded after the logs sampler interface's
 ```
 {
   ...
-  "defs": [
-    { "my_thing:thing_name": <expression-value> }
-  ]
+  "defs": {
+    "my_thing:thing_name": <expression-value>
+  }
 }
 ```
 
 An entity value that itself contains other entities will encode refs
-to other defs. Entity handles are erased from structured values; their
-reference points into the definition; for example, this `defs` contains
-a `b` key logged using an anonymous entity handle with value `4`:
+to other defs. Entity handles are erased from structured values, and
+entries in `refs` associate their entity names with locations in the
+definition. For example, this `defs` contains a `b` key logged using
+an anonymous entity handle with value `4`:
 
-```
+```json
 {
-  ...
-  "defs": [
-    { "my_thing:thing_name": { "a": 3, "b": 4 } },
-    { "b_attr:12345678": { "$ref": "#defs/my_thing:thing_name/b" } }
+  "defs": {
+    "my_thing:thing_name": { "a": 3, "b": 4 }
+  },
+  "refs": [
+    { "b_attr:12345678": "#/defs/my_thing:thing_name/b" }
   ]
 }
 ```
@@ -258,6 +278,41 @@ To stay compatible with OTLP log structure, the `body` field contains
 the fields described above, including `defs`, `refs`, `seq`, `args`,
 and `msg`. Log attributes, scope attributes, and resource attributes
 are encoded in the appropriate level of OTLP structure.
+
+## Paths and graph reconstruction
+
+Reference fragments use the URI fragment representation of
+[JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901#section-6).
+The pointer root is the decoded `LogRecord.body`, not the whole OTLP
+record or its protobuf-JSON representation. This applies even to
+references stored in record attributes. For example, `#/args/0`
+identifies the first argument, and `#/defs/my_thing:thing_name/b`
+identifies a nested field in an entity definition.
+
+Within each path component, `~` is escaped as `~0` and `/` as `~1`.
+The resulting pointer is then URI-fragment encoded, using UTF-8 and
+percent-encoding where required. For example, the entity name
+`file:/tmp/a` is addressed by `#/defs/file:~1tmp~1a`.
+
+A qualified reference has the form `<record_id>#/<pointer-path>`:
+the record identifier selects a record in the global collection, and
+the pointer selects a node within its body. The URI representation of
+record identifiers remains to be specified. A fragment-only reference
+implicitly selects the containing record. Entries in `refs` use local
+fragments targeting `args` or `defs`; inline `$ref` values may also
+identify targets in other records.
+
+Log records collectively describe a directed graph. Loading resolves
+reference targets into graph edges, preserving shared nodes and cycles
+rather than recursively expanding referenced values. JSON Pointers
+are interpreted against the encoded record structure before graph
+linking changes its representation; following a pointer does not
+implicitly traverse an inline `$ref`.
+
+Targets may arrive out of order. Loaders register target nodes and
+connect pending edges as records become available. An unavailable
+target remains explicitly unresolved, rather than becoming a null
+value. Cycles are valid graph structure, not resolution errors.
 
 ## Startup
 
