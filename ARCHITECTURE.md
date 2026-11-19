@@ -15,6 +15,8 @@ A Rust logging library that:
   per log stream by default; uses references to refer to definitions
 - Reference syntax uses record identifiers and body-relative JSON Pointer
   fragments
+- Builds a self-describing, self-bootstrapping graph of log records
+- Supports graph navigation and cross-process tracing through references
 - Encodes directly to OTLP LogRecord bytes (minimizes allocations)
 
 ## Details
@@ -50,6 +52,40 @@ bytes, and we want to know column types in advance; however, as
 discussed below, we will have to add columns to the OTAP logs
 representation, and for now we are embedding our new fields within
 the structure of the LogRecord body field.
+
+Each callsite is represented by an anonymous `log.callsite` entity
+containing its message format, argument metadata, and source file and
+line information. Its definition can be generated with the source code.
+Log events reference the callsite and supply argument values, allowing
+the recorded format to be reused when recovering formatted messages.
+
+## Relations
+
+The schema is self-describing, built on a base entity, `log.relation`.
+A relation definition describes a name, whether it denotes an attribute
+or an entity, its description, and its value type. Readers presume an
+understanding of the base relation; the remaining concepts are described
+through relation definitions in the graph.
+
+Each process uses one shared namespace and consistent definitions
+across all logging scopes. Names are used directly, without namespace
+qualification; dots in names such as `log.severity` do not introduce
+separate namespaces. Scopes neither shadow names nor change their
+meaning. Definitions may appear in multiple records or scopes, provided
+their values agree.
+
+Named definitions are immutable within a process. Conflicting
+definitions of the same name must cause an explicit failure. Agreement
+means semantic equality, not identical encoded bytes: serialization
+order or references to different records containing the same entity
+must not alone cause a conflict. The comparison mechanism remains to
+be specified.
+
+Value types include references to entities described by a particular
+relation, not only primitive values. For example, `log.level` describes
+severity entities such as `INFO`, `WARN`, `ERROR`, and `FATAL`;
+`log.severity` is an attribute whose value references one of those
+entities. These concepts are themselves described by `log.relation`.
 
 ## Attributes
 
@@ -116,11 +152,19 @@ identifier. Semantically, a named entity is used to correlate the
 entity across process boundaries; they should be used when there
 is a natural, globally given name for the entity.
 
+Repeated definitions of a named entity within a process must have the
+same value, as described under Relations; they are not updates to a
+mutable named value.
+
 Anonymous entities are a convenience for entities that are locally
 unique without a natural namespace; these entities are given unique
 integer identifiers, which may be randomly or sequentially assigned by
 the library, and which should not be presumed equal unless assigned
 within the same process. (Process identity is discussed below.)
+
+Each log record is itself an anonymous entity described by `log.record`.
+Records participate in the same graph as other entities and can be
+located through that relation.
 
 ```
 groups:
@@ -185,14 +229,13 @@ the body, as a list.
 ## References
 
 When an entity handle is used, its value is recorded in the log record
-body for future reference. The entity
-handle retains a unique identifier given to the associated log record
-where it was defined in the log. Log record unique identifiers consist
-of unique identifier(s) of the execution environment plus a sequence
-number. For example, a unique processor identifier and a unique thread
-name plus a sequence number are suitable; a task-local or synchronized
-logger may use different uniqueness coordinates. How the process
-self-identifies will be written in the initial log record.
+body for future reference. The entity handle retains the identifier of
+the log record where it was defined. Records are sequenced within a
+local logging scope. A globally qualified record identifier must
+distinguish the process execution and scope as well as the sequence
+number; its exact representation remains to be specified. Thread names
+are entity data, not a sufficient basis for record identity. The
+process's identifying information is recorded during startup.
 
 Entity handles store the record identifier where their definition
 appears. The entry definition will include the entity key:value
@@ -243,12 +286,11 @@ and positional arguments. For example, when a log statement uses a
 
 The `defs` section of the record body is a map from entity names to
 their values, which may contain entity references. Definitions are
-logged at least once; however, note that
-entities are synchronized independently of log record emission, so the
-entity may be committed to a log record that is recorded out of order with
-other records. An entity's first reference may appear before an
-entity's definition. Readers should tolerate late-arriving
-definitions.
+logged at least once. Entities are synchronized independently of log
+record emission. Although each scope emits records in ascending
+sequence order, readers may observe references before their definitions,
+including when combining records from different scopes. Readers should
+tolerate late-arriving definitions.
 
 Definition locations are selected and final OTLP bytes are assembled
 from the intermediate representations only after the logs sampler
@@ -337,16 +379,121 @@ are interpreted against the encoded record structure before graph
 linking changes its representation; following a pointer does not
 implicitly traverse an inline `$ref`.
 
+Cycles are natural in this graph. Serialization can choose where to
+stop nesting values and encode an edge as a `$ref` instead. This breaks
+recursive expansion in the serialized representation, not the cycle
+in the graph; loading reconnects the edge to its target.
+
 Targets may arrive out of order. Loaders register target nodes and
 connect pending edges as records become available. An unavailable
 target remains explicitly unresolved, rather than becoming a null
 value. Cycles are valid graph structure, not resolution errors.
 
+The reconstructed graph also provides a process-wide relation lookup.
+Within that process's graph view, `/log.relation/<name>/desc` selects
+a relation's description; `kind` and type information describe its
+meaning. The name is escaped as a JSON Pointer component. This is a
+lookup in the reconstructed graph, not the wire layout of a record's
+`defs` map. JSON Pointer provides navigation; the loader establishes
+the process context and relation lookup. The full relation schema and
+its wire representation remain to be specified.
+
 ## Startup
+
+The initial log record contains the definitions of all relations and
+entities referenced initially, bootstrapping the graph from the
+presumed understanding of `log.relation`. Registered attributes and
+entity types are described there. The schema can emerge as the program
+starts, with conflicting named definitions rejected. Later definitions
+extend the same process-wide namespace; repeated definitions must agree.
+
+Common definitions can be generated from external schema files,
+including the Weaver definitions described above. A more restrictive
+future model would require common named definitions to come from those
+files and allow only anonymous entities to be created at runtime.
+Library-assigned unique identities avoid named-definition conflicts
+for those anonymous entities. Build-time validation can catch schema
+conflicts earlier, while process-wide consistency checks can catch
+incompatible definitions supplied by different dependencies.
 
 ## Context
 
+Each local logging scope defines a sequence of log records, emitted in
+ascending sequence order. The OTel instrumentation scope carries the
+defining attributes, and its associated records are grouped under that
+scope. Different scopes share the process's definitions; they do not
+create separate namespaces. There is no implied total order across
+scopes.
+
+Threads are entities described by the `log.thread` relation. A thread
+instance records its details and is distinct from the definition of its
+entity type. Callsites are anonymous `log.callsite` entities; stack
+frames are entities, and callstacks are composed of references to frame
+entities. Each concept is described through a relation rooted in
+`log.relation`. Placement of this context in OTel resources is deferred.
+
 ## Application
+
+### Graph navigation
+
+The in-log reference is a fundamental part of the design, not merely
+a way to avoid repeating values. Once records are loaded into the
+graph, entity identities and attribute-value associations connect
+their occurrences to the records containing them. Navigation can
+follow those relationships in either direction to locate every
+appearance of an entity or attribute value in the loaded records.
+
+Path expressions over the graph can select matching records by
+attribute or entity and traverse the relationships between them.
+The `log.record` relation provides access to the records themselves.
+This graph-query capability is distinct from JSON Pointer addressing
+of individual wire targets; its expression language and indexing
+mechanisms are not specified here.
+
+### Tracing through log references
+
+A guiding idea is that a trace span can be represented by two related
+log events: a start and an end. The start event is addressable by a
+global log reference, and the end event can refer back to it. Context
+propagation carries that reference, connecting activity through the
+same graph used for ordinary logging.
+
+For an RPC, the client records its start event and sends a global
+reference to that event with the request. The server records the
+propagated reference in its own log. In its response, the server
+returns a reference to one of its own log records, which the client
+records in its log, for example in the end event.
+
+Both sides therefore record references into the other side's log.
+When loaded together, their records are part of the same global graph
+and can be navigated across the RPC boundary. The exact propagation
+format and mapping to OpenTelemetry tracing are left open; the design
+principle is to express the relationship using ordinary log references.
+
+## Initial deliverables
+
+### Structured recording and formatted playback
+
+The first deliverable is an end-to-end JSON Lines log: one JSON log
+record per line, using the definitions, references, and bootstrap
+structure described above. JSON Lines is the initial recording format;
+direct OTLP encoding remains an architectural objective.
+
+A reader loads the log, connects reference targets, and uses the
+recorded callsite formats and argument values to produce plain-text
+messages. Playback executes the formatting operations, including the
+recorded format specifiers, rather than displaying templates or dumping
+structured values. The output omits the structured envelope and
+definition/reference machinery.
+
+### Interactive log browser
+
+The second deliverable is a web-based log browser that supports
+pivoting between chronological and frequency-based views. Both views
+operate on records selected by a conjunction of entity/attribute pairs:
+a matching record satisfies every selected pair. Pivoting between views
+preserves that selection, allowing the same subset of the graph to be
+examined in time order or by frequency.
 
 ## Additional context
 
