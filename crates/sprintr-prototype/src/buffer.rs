@@ -1,6 +1,6 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
-// Adapted from the original slogr buffers; see NOTICE for provenance.
+// Adapted from the original buffer implementation; see NOTICE for provenance.
 
 //! Reusable heap or fixed stack storage for complete JSON records.
 //!

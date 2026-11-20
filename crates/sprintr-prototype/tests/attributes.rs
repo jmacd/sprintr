@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use slogr_prototype::buffer::{RecordBuffer, StackBuffer};
-use slogr_prototype::{
+use sprintr_prototype::buffer::{RecordBuffer, StackBuffer};
+use sprintr_prototype::{
     Attribute, Definition, Logger, Message, Renderer, StatementTemplate, attribute, info, message,
     replay,
 };

@@ -1,6 +1,6 @@
-# slogr
+# sprintr
 
-An experiment in structured, formatted logging with self-describing schemas
+**Structured PRINT in Rust**: an experiment in structured, formatted output with self-describing schemas
 and in-log references. **Production-quality producer performance is a core
 requirement of the experiment**, not an optimization postponed until later.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and planned entity model.
@@ -14,7 +14,7 @@ There is no Tokio, tracing, or OpenTelemetry SDK dependency.
 ## Try it
 
 ```sh
-cargo run --quiet -p slogr-prototype --example json_lines -- record
+cargo run --quiet -p sprintr-prototype --example json_lines -- record
 ```
 
 ```json
@@ -23,8 +23,8 @@ cargo run --quiet -p slogr-prototype --example json_lines -- record
 ```
 
 ```sh
-cargo run --quiet -p slogr-prototype --example json_lines -- record \
-  | cargo run --quiet -p slogr-prototype --example json_lines -- replay
+cargo run --quiet -p sprintr-prototype --example json_lines -- record \
+  | cargo run --quiet -p sprintr-prototype --example json_lines -- replay
 ```
 
 ```text
@@ -34,7 +34,7 @@ hello Grace, value 002a
 account.name = Grace
 ```
 
-See the [prototype API and format subset](crates/slogr-prototype/README.md)
+See the [prototype API and format subset](crates/sprintr-prototype/README.md)
 for implicit captures, positional expressions, caller-owned writers, and
 stack-backed encoding.
 
@@ -42,9 +42,9 @@ stack-backed encoding.
 
 | Crate | Purpose |
 |-------|---------|
-| `slogr-message` | Message representation, shared format grammar, and rendering |
-| `slogr-prototype-macros` | Compile-time format parsing and typed argument capture |
-| `slogr-prototype` | Public macros, direct JSON recording, reusable buffers, and playback |
+| `sprintr-message` | Message representation, shared format grammar, and rendering |
+| `sprintr-prototype-macros` | Compile-time format parsing and typed argument capture |
+| `sprintr-prototype` | Public macros, direct JSON recording, reusable buffers, and playback |
 
 Generic entities, additional attribute types, graph navigation, and binary
 encoding are future work. The old tracing/OTLP runtime, adapters, and examples have been
@@ -71,7 +71,7 @@ The current allocation assertions do not establish production readiness.
 ## Schema tooling
 
 The `tools/weaver` submodule is retained for future schema work. It is not a
-workspace member or a build dependency of this milestone. The old `slogr-build`
+workspace member or a build dependency of this milestone. The old `sprintr-build`
 helper and its example targeted the removed runtime and have been removed.
 
 ## Development

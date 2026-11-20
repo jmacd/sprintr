@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "crates/slogr-message",
-    "crates/slogr-prototype-macros",
-    "crates/slogr-prototype",
+    "crates/sprintr-message",
+    "crates/sprintr-prototype-macros",
+    "crates/sprintr-prototype",
 ]
 resolver = "3"

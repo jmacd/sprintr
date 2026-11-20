@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use slogr_prototype::buffer::{HeapBuffer, RecordBuffer, StackBuffer};
-use slogr_prototype::{
+use sprintr_prototype::buffer::{HeapBuffer, RecordBuffer, StackBuffer};
+use sprintr_prototype::{
     Argument, Definition, Logger, Message, StatementTemplate, info, message, replay,
 };
 use std::cell::Cell;
@@ -287,7 +287,7 @@ fn io_errors_are_returned() {
 /// Guarantees: generated code uses the wrapper's crate and standard-library paths hygienically.
 #[test]
 fn macro_paths_are_hygienic() {
-    use slogr_prototype as renamed;
+    use sprintr_prototype as renamed;
     let name = "Ada";
     let value = 42u8;
     let record = renamed::message!("{name:s} {value:04x}");

@@ -14,22 +14,24 @@ pub mod buffer;
 mod statement;
 
 use buffer::{HeapBuffer, RecordBuffer};
-use slogr_message::BorrowedArgument;
+use sprintr_message::BorrowedArgument;
 use statement::Statement;
 
 pub use attribute::Attribute;
-pub use slogr_message::{
+pub use sprintr_message::{
     Argument, ArgumentBinding, Definition, Message, RelationDefinition, RelationKind, RelationType,
     Renderer, StatementTemplate, format::FormatError,
 };
 
 #[doc(hidden)]
-pub use slogr_prototype_macros::{attribute as __attribute, info as __info, message as __message};
+pub use sprintr_prototype_macros::{
+    attribute as __attribute, info as __info, message as __message,
+};
 
 /// Declare a string attribute with compile-time-encoded metadata.
 ///
 /// ```
-/// use slogr_prototype::{Attribute, attribute, message};
+/// use sprintr_prototype::{Attribute, attribute, message};
 /// static ACCOUNT: Attribute = attribute!("account.name", "Account name");
 /// assert_eq!(message!("{}", ACCOUNT = "Ada").render().unwrap(), "Ada\naccount.name = Ada");
 /// ```
@@ -37,7 +39,7 @@ pub use slogr_prototype_macros::{attribute as __attribute, info as __info, messa
 /// Scenario: a name cannot be represented in a canonical attribute placeholder.
 /// Guarantees: invalid static names fail at compilation.
 /// ```compile_fail
-/// static BAD: slogr_prototype::Attribute = slogr_prototype::attribute!("bad:name", "Invalid");
+/// static BAD: sprintr_prototype::Attribute = sprintr_prototype::attribute!("bad:name", "Invalid");
 /// ```
 #[macro_export]
 macro_rules! attribute {
@@ -52,7 +54,7 @@ macro_rules! attribute {
 /// [`info!`] returns the error instead.
 ///
 /// ```rust
-/// use slogr_prototype::message;
+/// use sprintr_prototype::message;
 /// let name = String::from("Ada");
 /// let value = 42u32;
 /// let record = message!("hello {name:s}, value {value:04x}");
@@ -71,57 +73,57 @@ macro_rules! attribute {
 /// Guarantees: unsupported implicit typing fails at compilation.
 /// ```compile_fail
 /// let name = "Ada";
-/// slogr_prototype::message!("hello {name}");
+/// sprintr_prototype::message!("hello {name}");
 /// ```
 ///
 /// Scenario: a numeric value is supplied for string encoding.
 /// Guarantees: capture requires `AsRef<str>`, not eager Display formatting.
 /// ```compile_fail
-/// slogr_prototype::message!("{:s}", 42u32);
+/// sprintr_prototype::message!("{:s}", 42u32);
 /// ```
 ///
 /// Scenario: a signed integer is supplied for the unsigned hexadecimal subset.
 /// Guarantees: unsupported integer types cannot silently lose signedness.
 /// ```compile_fail
-/// slogr_prototype::message!("{:x}", -1i32);
+/// sprintr_prototype::message!("{:x}", -1i32);
 /// ```
 ///
 /// Scenario: a placeholder has no corresponding positional expression.
 /// Guarantees: argument count mismatches are compile errors.
 /// ```compile_fail
-/// slogr_prototype::message!("{:s}");
+/// sprintr_prototype::message!("{:s}");
 /// ```
 ///
 /// Scenario: a positional expression has no corresponding placeholder.
 /// Guarantees: surplus arguments cannot be silently discarded.
 /// ```compile_fail
-/// slogr_prototype::message!("hello", "Ada");
+/// sprintr_prototype::message!("hello", "Ada");
 /// ```
 ///
 /// Scenario: an attribute name has not been registered or declared.
 /// Guarantees: unbound attribute handles are compile errors.
 /// ```compile_fail
-/// slogr_prototype::message!("{:s}", name = "Ada");
+/// sprintr_prototype::message!("{:s}", name = "Ada");
 /// ```
 ///
 /// Scenario: a string attribute is associated with a number.
 /// Guarantees: its declared string type is enforced even with an untyped placeholder.
 /// ```compile_fail
-/// static ACCOUNT: slogr_prototype::Attribute = slogr_prototype::attribute!("account.name", "Account name");
-/// slogr_prototype::message!("{}", ACCOUNT = 42u32);
+/// static ACCOUNT: sprintr_prototype::Attribute = sprintr_prototype::attribute!("account.name", "Account name");
+/// sprintr_prototype::message!("{}", ACCOUNT = 42u32);
 /// ```
 ///
 /// Scenario: a local attribute value would make a statement depend on runtime bindings.
 /// Guarantees: statement metadata must be statically declared.
 /// ```compile_fail
-/// let account = slogr_prototype::attribute!("account.name", "Account name");
-/// slogr_prototype::message!("{}", account = "Ada");
+/// let account = sprintr_prototype::attribute!("account.name", "Account name");
+/// sprintr_prototype::message!("{}", account = "Ada");
 /// ```
 ///
 /// Scenario: the source requests a format outside the prototype subset.
 /// Guarantees: unsupported formats fail instead of degrading to text.
 /// ```compile_fail
-/// slogr_prototype::message!("{:?}", "Ada");
+/// sprintr_prototype::message!("{:?}", "Ada");
 /// ```
 #[macro_export]
 macro_rules! message {
@@ -136,12 +138,12 @@ macro_rules! message {
 /// to select a caller-owned [`Logger`]. No global logger is installed.
 ///
 /// ```rust
-/// use slogr_prototype::{Logger, info};
+/// use sprintr_prototype::{Logger, info};
 /// let mut logger = Logger::new(Vec::new());
 /// let name = "Ada";
 /// let value = 42u32;
 /// info!("hello {name:s}, value {value:04x}", logger: logger)?;
-/// let record: slogr_prototype::Message = serde_json::from_slice(&logger.into_inner())?;
+/// let record: sprintr_prototype::Message = serde_json::from_slice(&logger.into_inner())?;
 /// assert_eq!(record.render().unwrap(), "hello Ada, value 002a");
 /// # Ok::<(), std::io::Error>(())
 /// ```
@@ -316,7 +318,7 @@ pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
 pub mod __private {
     use super::{HeapBuffer, RecordBuffer, StreamState, encode_compiled};
     pub use crate::statement::{Statement, concatenate, encoded_len, owned_message};
-    pub use slogr_message::BorrowedArgument;
+    pub use sprintr_message::BorrowedArgument;
     use std::cell::RefCell;
     use std::io::{self, Write};
 

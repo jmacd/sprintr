@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use slogr_prototype::buffer::{HeapBuffer, StackBuffer};
-use slogr_prototype::{Attribute, Logger, attribute, info};
+use sprintr_prototype::buffer::{HeapBuffer, StackBuffer};
+use sprintr_prototype::{Attribute, Logger, attribute, info};
 use std::hint::black_box;
 use std::io;
 

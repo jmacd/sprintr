@@ -82,30 +82,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "slogr-message"
+name = "sprintr-message"
 version = "0.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
-name = "slogr-prototype"
+name = "sprintr-prototype"
 version = "0.1.0"
 dependencies = [
  "allocation-counter",
  "serde_json",
- "slogr-message",
- "slogr-prototype-macros",
+ "sprintr-message",
+ "sprintr-prototype-macros",
 ]
 
 [[package]]
-name = "slogr-prototype-macros"
+name = "sprintr-prototype-macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
  "serde_json",
- "slogr-message",
+ "sprintr-message",
  "syn 2.0.119",
 ]
 

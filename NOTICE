@@ -1,4 +1,4 @@
-slogr contains buffer code derived from OpenTelemetry Arrow.
+sprintr contains buffer code derived from OpenTelemetry Arrow.
 Copyright The OpenTelemetry Authors
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
@@ -11,8 +11,8 @@ Original source:
   (bounded protobuf buffers only)
 
 Retained adaptation:
-  crates/slogr-prototype/src/buffer.rs
-  Adapted heap/stack storage and rollback through the original slogr
+  crates/sprintr-prototype/src/buffer.rs
+  Adapted heap/stack storage and rollback through the original
     src/buffer.rs extraction, which is available in repository history.
   Removed protobuf-specific operations.
   Complete JSON records reuse storage and reject overflow rather than truncate.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use slogr_prototype::{Attribute, attribute, info, replay};
+use sprintr_prototype::{Attribute, attribute, info, replay};
 use std::io;
 
 static ACCT_NAME: Attribute = attribute!("account.name", "Account name");

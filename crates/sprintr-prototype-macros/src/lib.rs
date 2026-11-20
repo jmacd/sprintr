@@ -3,8 +3,8 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{ToTokens, quote};
-use slogr_message::format::{Part, Spec, parse};
-use slogr_message::{RelationDefinition, RelationKind, RelationType, validate_attribute_name};
+use sprintr_message::format::{Part, Spec, parse};
+use sprintr_message::{RelationDefinition, RelationKind, RelationType, validate_attribute_name};
 use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, LitByteStr, LitStr, Path, Token, parse_macro_input};
 

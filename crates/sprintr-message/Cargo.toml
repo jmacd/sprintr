@@ -1,9 +1,9 @@
 [package]
-name = "slogr-message"
+name = "sprintr-message"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96.1"
-description = "Shared message format and playback grammar for the slogr prototype"
+description = "Shared message format and playback grammar for the sprintr prototype"
 license = "Apache-2.0"
 publish = false
 

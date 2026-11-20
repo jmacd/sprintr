@@ -1,6 +1,6 @@
 ## Objective
 
-A Rust logging library that:
+sprintr (Structured PRINT in Rust) is a structured printing library that:
 
 - Compiles message formatting strings using source material
 - Uses structured logging, including nested structure
@@ -68,7 +68,7 @@ JSON or breaking the correspondence between formats and arguments.
 
 ### Message formats
 
-Users of slogr can log `format!`-like expressions in Rust while
+Users of sprintr can log `format!`-like expressions in Rust while
 retaining structured formatting. Message format placeholders may
 contain expression text or attribute names, and they can be
 overridden. Arguments are positional.
@@ -146,14 +146,14 @@ is present, the type is presumed to be string.
 
 ```
 groups:
-  - id: registry.slogr_example
+  - id: registry.sprintr_example
     type: attribute_group
-    brief: Attributes used by the slogr example process.
+    brief: Attributes used by the sprintr example process.
     attributes:
       - ref: my_str   # default type is string
       - ref: my_int
         annotations:
-          slogr:
+          sprintr:
             type: u64
 ```
 
@@ -215,13 +215,13 @@ located through that relation.
 
 ```
 groups:
-  - id: registry.slogr_example
+  - id: registry.sprintr_example
     type: attribute_group
-    brief: Attributes used by the slogr example process.
+    brief: Attributes used by the sprintr example process.
     attributes:
       - ref: my_thing
         annotations:
-          slogr:
+          sprintr:
             entity: named  # implies type: string
 ```
 
@@ -543,12 +543,12 @@ There are no attributes, entities (including callsites and `log.record`),
 definitions, references, or schema bootstrap in this milestone. The
 message format is repeated in each record.
 
-The standalone `slogr-prototype` crate implements this first slice
+The standalone `sprintr-prototype` crate implements this first slice
 without Tokio or `tracing`. It is an API and text-format prototype, not
 a production logger. For example:
 
 ```rust
-use slogr_prototype::info;
+use sprintr_prototype::info;
 
 let name = "Ada";
 let value = 42u32;
@@ -611,7 +611,7 @@ The next slice declares a string attribute statically and pre-encodes a
 statement template with its canonical name. Declaration emits no record:
 
 ```rust
-use slogr_prototype::{Attribute, attribute, info};
+use sprintr_prototype::{Attribute, attribute, info};
 
 static ACCT_NAME: Attribute = attribute!("account.name", "Account name");
 let value = 42u32;

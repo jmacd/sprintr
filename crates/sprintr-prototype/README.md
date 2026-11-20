@@ -1,4 +1,4 @@
-# Standalone slogr prototype
+# Standalone sprintr prototype
 
 This non-production prototype captures a message format and typed positional
 arguments, records JSON Lines, and replays plain-text messages. Static
@@ -11,7 +11,7 @@ There is no dependency on Tokio, tracing, or an OpenTelemetry runtime.
 From the repository root:
 
 ```sh
-cargo run --quiet -p slogr-prototype --example json_lines -- record
+cargo run --quiet -p sprintr-prototype --example json_lines -- record
 ```
 
 ```json
@@ -22,8 +22,8 @@ cargo run --quiet -p slogr-prototype --example json_lines -- record
 Replay from stdin:
 
 ```sh
-cargo run --quiet -p slogr-prototype --example json_lines -- record \
-  | cargo run --quiet -p slogr-prototype --example json_lines -- replay
+cargo run --quiet -p sprintr-prototype --example json_lines -- record \
+  | cargo run --quiet -p sprintr-prototype --example json_lines -- replay
 ```
 
 ```text
@@ -40,7 +40,7 @@ line number. Input, output, and flush failures are returned rather than ignored.
 ## Try the API
 
 ```rust
-use slogr_prototype::{Logger, info, message};
+use sprintr_prototype::{Logger, info, message};
 
 let name = String::from("Ada");
 let value = 42u32;
@@ -71,7 +71,7 @@ Call `Logger::flush` explicitly for buffered output.
 ## Static string attributes
 
 ```rust
-use slogr_prototype::{Attribute, attribute, info};
+use sprintr_prototype::{Attribute, attribute, info};
 
 static ACCT_NAME: Attribute = attribute!("account.name", "Account name");
 let name = "Ada";
@@ -159,7 +159,7 @@ Fixed stack storage avoids the initial heap-buffer allocation, but first-use
 definition tracking can still allocate:
 
 ```rust
-use slogr_prototype::{Logger, buffer::StackBuffer, info};
+use sprintr_prototype::{Logger, buffer::StackBuffer, info};
 
 let mut logger = Logger::with_buffer(std::io::sink(), StackBuffer::<512>::new());
 let name = "Ada";
@@ -205,6 +205,6 @@ wrong argument types, and missing or surplus arguments are compilation errors.
 JSON retains the full `u64` range; the playback reader does not convert it to
 floating point.
 
-The small `slogr-message` crate shares the format grammar between the capture
-proc macros (`slogr-prototype-macros`) and playback. `slogr-prototype` exposes
+The small `sprintr-message` crate shares the format grammar between the capture
+proc macros (`sprintr-prototype-macros`) and playback. `sprintr-prototype` exposes
 the public macros, caller-owned logger, and reader. These APIs are experimental.
