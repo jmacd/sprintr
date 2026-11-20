@@ -6,8 +6,9 @@ requirement of the experiment**, not an optimization postponed until later.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and planned entity model.
 
 The current milestone is a standalone JSON Lines logger and plain-text reader.
-It captures source-derived message formats and typed arguments, then executes
-the recorded formatting during playback. It is not production-ready.
+It captures source-derived message formats, typed arguments, and registered
+string attributes, then executes the recorded formatting during playback.
+Attribute definitions bootstrap the reader on first use. It is not production-ready.
 There is no Tokio, tracing, or OpenTelemetry SDK dependency.
 
 ## Try it
@@ -17,7 +18,7 @@ cargo run --quiet -p slogr-prototype --example json_lines -- record
 ```
 
 ```json
-{"msg":"hello {name}, value {value:04x}","args":["Ada",42]}
+{"msg":"hello {acct_name}, value {value:04x}","args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"}},"refs":[{"account.name":"#/args/0"}]}
 ```
 
 ```sh
@@ -27,6 +28,7 @@ cargo run --quiet -p slogr-prototype --example json_lines -- record \
 
 ```text
 hello Ada, value 002a
+account.name = Ada
 ```
 
 See the [prototype API and format subset](crates/slogr-prototype/README.md)
@@ -41,8 +43,8 @@ stack-backed encoding.
 | `slogr-prototype-macros` | Compile-time format parsing and typed argument capture |
 | `slogr-prototype` | Public macros, direct JSON recording, reusable buffers, and playback |
 
-Attributes, entities, schema bootstrap, graph navigation, and binary encoding
-are future work. The old tracing/OTLP runtime, adapters, and examples have been
+Generic entities, additional attribute types, graph navigation, and binary
+encoding are future work. The old tracing/OTLP runtime, adapters, and examples have been
 removed rather than maintained as a second implementation.
 
 ## Performance
@@ -50,10 +52,12 @@ removed rather than maintained as a second implementation.
 `info!` uses a compile-time-encoded JSON prefix and a stack array of borrowed
 arguments. It writes directly into reusable heap or fixed stack storage,
 without constructing an owned message or reparsing the format on the producer
-path. Successful recording makes zero library heap allocations once heap
-capacity is sufficient, or from the first record with sufficient stack storage.
-Caller expressions, output sinks, initialization/growth, and error reporting
-are outside that allocation budget.
+path. Successful steady-state recording makes zero library heap allocations
+once storage and definition bookkeeping are initialized. Plain messages need
+no initial heap allocation with sufficient stack storage. Attribute registration
+caches definition bytes; repeated uses emit only positional `refs`, with no
+registry lock. Caller expressions, output sinks, initialization/growth, and
+error reporting are outside that allocation budget.
 
 The planned entity API must capture and encode a snapshot once, then emit
 references on repeated use. JSON versus binary encoding is secondary to

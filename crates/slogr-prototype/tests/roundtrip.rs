@@ -209,6 +209,7 @@ fn writer_validates_before_output() {
     let record = Message {
         msg: "{value:x}".into(),
         args: vec![Argument::String("not numeric".into())],
+        ..Message::default()
     };
     assert_eq!(
         logger.write(&record).unwrap_err().kind(),

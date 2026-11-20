@@ -134,9 +134,9 @@ entities. These concepts are themselves described by `log.relation`.
 
 ## Attributes
 
-Attributes, generally those which are used by more than one callsite,
-are declared explicitly using OpenTelemetry Weaver semantic definition
-files. In this case, the attributes specify the structured argument
+Attributes may be registered at runtime, as in the prototype below.
+For shared definitions, the intended schema-driven path uses OpenTelemetry
+Weaver semantic definition files. In this case, the attributes specify the structured argument
 type that will be encoded for the attribute, along with the attribute
 name and description. A Weaver annotation supports the additional type
 information which semantic conventions do not convey. When no annotation
@@ -169,8 +169,8 @@ the indicated type.
 ## Entities
 
 Entities are declared similarly to attributes; however, whereas
-attributes define properties of log events, entities define properties
-of values within log events. Weaver code generation will be used to
+attributes label values, entities give values a shared identity.
+Weaver code generation will be used to
 declare these in a similar manner to attributes, as they have the same
 representation and structure (KeyValue). Entities are passed by handle
 to the log API; entities are constructed using the entity definition
@@ -301,8 +301,8 @@ the value will appear as a reference like `{ "$ref":
 defined at least once.
 
 The `refs` section of the body is an array of single-entry maps of
-the form `{ "<entity-name>": "<fragment>" }`. Each entry
-associates an entity name with the location of its value in the containing
+the form `{ "<attribute-or-entity-name>": "<fragment>" }`. Each entry
+associates a name with the location of its value in the containing
 record's `args` or `defs`, including nested values. Since these values
 are always reference fragments, no `$ref` wrapper is needed. For example, an anonymous entity
 whose value is stored directly in `args[0]` is referenced as follows:
@@ -323,9 +323,15 @@ and positional arguments. For example, when a log statement uses a
 1. One reference to `my_thing:thing_name` appears as a `$ref` value in
    `args[0]`, referring to the entity value, e.g., as shown above in
    the defs section of an earlier log record.
-2. One reference appears in the record attributes, e.g. `{ "my_attr":
-   { "$ref": "#/args/0" } }`, referring to the entity value reference
+2. One association appears in `refs`, e.g. `{ "my_attr": "#/args/0" }`,
+   referring to the entity value reference
    in the same log record.
+
+The same `refs` association labels a primitive argument, such as
+`{ "account.name": "#/args/0" }` for a string. The list preserves multiple
+associations using the same name; it is not a map keyed by attribute name.
+An event-attributes section is reserved for non-positional labels such as
+severity, and is not part of the current prototype.
 
 ## Definitions
 
@@ -398,9 +404,10 @@ are encoded in the appropriate level of OTLP structure.
 
 Reference fragments use the URI fragment representation of
 [JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901#section-6).
-The pointer root is the decoded `LogRecord.body`, not the whole OTLP
-record or its protobuf-JSON representation. This applies even to
-references stored in record attributes. For example, `#/args/0`
+The pointer root is the logical record body: the JSON object itself in
+the standalone prototype, or the decoded `LogRecord.body` when using
+OTLP, not the whole OTLP record or its protobuf-JSON representation.
+For example, `#/args/0`
 identifies the first argument, and `#/defs/my_thing:thing_name/b`
 identifies a nested field in an entity definition.
 
@@ -579,11 +586,59 @@ braces. Unsupported formats and argument types fail at compilation;
 malformed recorded input fails during playback. The obsolete `otel_*`
 runtime and its examples are no longer part of the workspace.
 
-Self-describing definitions, reference-based deduplication, and direct
-OTLP encoding remain later goals. A web-based log browser is also a
+The following extension adds self-describing attribute definitions.
+Generic entity references and binary encoding remain later goals.
+A web-based log browser is also a
 later goal: it will preserve a conjunction of entity/attribute pairs
 while pivoting between chronological and frequency-based views of the
 matching records. Those features are outside this first milestone.
+
+## Registered-attribute extension
+
+The next slice registers one string attribute and associates it with a
+message argument. Registration emits no record:
+
+```rust
+use slogr_prototype::{info, register_attribute};
+
+let acct_name = register_attribute("account.name", "Account name")?;
+let name = "Ada";
+let value = 42u32;
+info!("hello {}, value {value:04x}", acct_name = name)?;
+```
+
+The handle specifies the argument type, allowing a bare `{}`. `acct_name`
+is the local source label, while `account.name` is the canonical relation
+name. The first record includes everything needed to interpret it:
+
+```json
+{"msg":"hello {acct_name}, value {value:04x}","args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"}},"refs":[{"account.name":"#/args/0"}]}
+```
+
+`log.relation:account.name` defines the named attribute under the
+presumed-understood bootstrap relation. The `refs` entry associates it
+with the first positional argument; it is not an event-level attribute
+and introduces no `attrs` section. Rendering produces:
+
+```text
+hello Ada, value 002a
+account.name = Ada
+```
+
+Definitions are immutable and process-wide. Identical registrations
+reuse cached definition bytes; conflicts fail. Each logger emits a
+definition on its first successful use, then emits only `refs` on later
+uses. Stdout keeps this bookkeeping per thread, allowing equal repeated
+definitions across threads without a producer-side registry lock.
+Registration and first-use bookkeeping may allocate; repeated recording
+must preserve the zero-allocation steady-state target.
+
+The reader retains definitions across records and rejects conflicting or
+missing definitions, invalid argument pointers, and type mismatches.
+Owned `message!` snapshots include all their definitions and can render
+independently. This extension supports string attributes and local
+`#/args/<index>` references only; generic entities and graph navigation
+remain unimplemented.
 
 ## Additional context
 

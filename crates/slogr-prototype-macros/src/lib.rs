@@ -56,6 +56,7 @@ struct Compiled {
     prefix: LitByteStr,
     owned: Vec<proc_macro2::TokenStream>,
     borrowed: Vec<proc_macro2::TokenStream>,
+    bindings: Vec<proc_macro2::TokenStream>,
 }
 
 fn compile(input: &Input) -> syn::Result<Compiled> {
@@ -65,6 +66,7 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
     let mut arguments = input.arguments.iter();
     let mut owned = Vec::new();
     let mut borrowed = Vec::new();
+    let mut bindings = Vec::new();
     let mut stored = String::new();
     for part in parts {
         match part {
@@ -72,35 +74,64 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
                 stored.push_str(&text.replace('{', "{{").replace('}', "}}"));
             }
             Part::Field(field) => {
-                if field.format.is_empty() {
-                    return Err(error(
-                        "use :s for strings or :x for unsigned integers".into(),
-                    ));
-                }
-                let (label, expression) = if field.name.is_empty() {
+                let (label, expression, attribute) = if field.name.is_empty() {
                     let expression = arguments
                         .next()
                         .ok_or_else(|| error("missing positional argument".into()))?;
-                    if matches!(expression, Expr::Assign(_)) {
-                        return Err(syn::Error::new_spanned(
-                            expression,
-                            "attribute assignments are not supported by this prototype",
-                        ));
+                    if let Expr::Assign(assignment) = expression {
+                        let Expr::Path(attribute) = assignment.left.as_ref() else {
+                            return Err(syn::Error::new_spanned(
+                                &assignment.left,
+                                "expected a registered attribute handle",
+                            ));
+                        };
+                        let label = attribute
+                            .path
+                            .segments
+                            .last()
+                            .expect("attribute path")
+                            .ident
+                            .to_string();
+                        let value = &assignment.right;
+                        (label, quote!(#value), Some(quote!(#attribute)))
+                    } else {
+                        let label = expression.to_token_stream().to_string();
+                        if label.contains(['{', '}', ':']) {
+                            return Err(syn::Error::new_spanned(
+                                expression,
+                                "bind this expression to a local variable before logging it",
+                            ));
+                        }
+                        (label, quote!(#expression), None)
                     }
-                    let label = expression.to_token_stream().to_string();
-                    if label.contains(['{', '}', ':']) {
-                        return Err(syn::Error::new_spanned(
-                            expression,
-                            "bind this expression to a local variable before logging it",
-                        ));
-                    }
-                    (label, quote!(#expression))
                 } else {
                     let mut ident = syn::parse_str::<Ident>(&field.name).map_err(|_| {
                         error("captured placeholders must name a local variable".into())
                     })?;
                     ident.set_span(input.format.span());
-                    (field.name, quote!(#ident))
+                    (field.name, quote!(#ident), None)
+                };
+                if field.format.is_empty() && attribute.is_none() {
+                    return Err(error(
+                        "use :s for strings or :x for unsigned integers".into(),
+                    ));
+                }
+                if attribute.is_some() && field.spec != Spec::String {
+                    return Err(error(
+                        "registered string attributes require {} or {:s}".into(),
+                    ));
+                }
+                let string_value = if let Some(attribute) = &attribute {
+                    let argument = owned.len();
+                    bindings.push(quote! {
+                        #root::__private::AttributeBinding {
+                            attribute: &(#attribute),
+                            argument: #argument,
+                        }
+                    });
+                    quote! { (#attribute).__value(&(#expression)) }
+                } else {
+                    quote! { ::core::convert::AsRef::<str>::as_ref(&(#expression)) }
                 };
                 stored.push('{');
                 stored.push_str(&label);
@@ -113,7 +144,7 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
                     Spec::String => quote! {
                         #root::Argument::String(
                             ::std::string::String::from(
-                                ::core::convert::AsRef::<str>::as_ref(&(#expression))
+                                #string_value
                             )
                         )
                     },
@@ -124,7 +155,7 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
                 borrowed.push(match field.spec {
                     Spec::String => quote! {
                         #root::__private::BorrowedArgument::String(
-                            ::core::convert::AsRef::<str>::as_ref(&(#expression))
+                            #string_value
                         )
                     },
                     Spec::Hex { .. } => quote! {
@@ -146,6 +177,7 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
         prefix: LitByteStr::new(prefix.as_bytes(), input.format.span()),
         owned,
         borrowed,
+        bindings,
     })
 }
 
@@ -163,11 +195,11 @@ pub fn message(input: TokenStream) -> TokenStream {
             let root = &input.root;
             let format = compiled.format;
             let arguments = compiled.owned;
+            let bindings = compiled.bindings;
             quote! {
-                #root::Message {
-                    msg: ::std::string::String::from(#format),
-                    args: ::std::vec![#(#arguments),*],
-                }
+                #root::__private::owned_message(
+                    #format, ::std::vec![#(#arguments),*], &[#(#bindings),*],
+                )
             }
         })
     };
@@ -181,11 +213,12 @@ pub fn info(input: TokenStream) -> TokenStream {
     let result = compile(&input).map(|compiled| {
         let prefix = compiled.prefix;
         let arguments = compiled.borrowed;
+        let bindings = compiled.bindings;
         if let Some(logger) = input.logger {
-            quote! { (#logger).__write_compiled(#prefix, &[#(#arguments),*]) }
+            quote! { (#logger).__write_compiled(#prefix, &[#(#arguments),*], &[#(#bindings),*]) }
         } else {
             let root = input.root;
-            quote! { #root::__private::write_stdout(#prefix, &[#(#arguments),*]) }
+            quote! { #root::__private::write_stdout(#prefix, &[#(#arguments),*], &[#(#bindings),*]) }
         }
     });
     result.unwrap_or_else(syn::Error::into_compile_error).into()

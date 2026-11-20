@@ -2,18 +2,25 @@
 
 //! Non-production, standalone JSON Lines recording and plain-text playback.
 //!
-//! No tracing subscriber, runtime, attributes, or entities are required.
+//! No tracing subscriber or runtime is required.
 
 #![doc = include_str!("../README.md")]
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 
+mod attribute;
 pub mod buffer;
 
+use attribute::AttributeBinding;
 use buffer::{HeapBuffer, RecordBuffer};
 use slogr_message::BorrowedArgument;
 
-pub use slogr_message::{Argument, Message, format::FormatError};
+pub use attribute::{Attribute, register_attribute};
+pub use slogr_message::{
+    Argument, Message, RelationDefinition, RelationKind, RelationType, Renderer,
+    format::FormatError,
+};
 
 #[doc(hidden)]
 pub use slogr_prototype_macros::{info as __info, message as __message};
@@ -70,10 +77,17 @@ pub use slogr_prototype_macros::{info as __info, message as __message};
 /// slogr_prototype::message!("hello", "Ada");
 /// ```
 ///
-/// Scenario: an attribute assignment is passed where a positional value belongs.
-/// Guarantees: attributes cannot accidentally enter the first milestone's wire format.
+/// Scenario: an attribute name has not been registered or declared.
+/// Guarantees: unbound attribute handles are compile errors.
 /// ```compile_fail
 /// slogr_prototype::message!("{:s}", name = "Ada");
+/// ```
+///
+/// Scenario: a string attribute is associated with a number.
+/// Guarantees: its declared string type is enforced even with an untyped placeholder.
+/// ```compile_fail
+/// let account = slogr_prototype::register_attribute("account.name", "Account name").unwrap();
+/// slogr_prototype::message!("{}", account = 42u32);
 /// ```
 ///
 /// Scenario: the source requests a format outside the prototype subset.
@@ -121,6 +135,7 @@ macro_rules! info {
 pub struct Logger<W, B = HeapBuffer> {
     writer: W,
     buffer: B,
+    definitions: HashSet<usize>,
 }
 
 impl<W: Write> Logger<W> {
@@ -132,8 +147,12 @@ impl<W: Write> Logger<W> {
 
 impl<W: Write, B: RecordBuffer> Logger<W, B> {
     /// Select storage, including a fixed [`buffer::StackBuffer`].
-    pub const fn with_buffer(writer: W, buffer: B) -> Self {
-        Self { writer, buffer }
+    pub fn with_buffer(writer: W, buffer: B) -> Self {
+        Self {
+            writer,
+            buffer,
+            definitions: HashSet::new(),
+        }
     }
 
     /// Validate and encode an owned message before writing it.
@@ -159,9 +178,18 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
         &mut self,
         prefix: &'static [u8],
         arguments: &[BorrowedArgument<'_>],
+        bindings: &[AttributeBinding<'_>],
     ) -> io::Result<()> {
-        encode_compiled(&mut self.buffer, prefix, arguments)?;
-        self.writer.write_all(self.buffer.as_slice())
+        encode_compiled(
+            &mut self.buffer,
+            prefix,
+            arguments,
+            bindings,
+            &self.definitions,
+        )?;
+        self.writer.write_all(self.buffer.as_slice())?;
+        mark_emitted(&mut self.definitions, bindings);
+        Ok(())
     }
 
     /// Flush buffered output, reporting any failure.
@@ -179,13 +207,56 @@ fn encode_compiled(
     buffer: &mut impl RecordBuffer,
     prefix: &'static [u8],
     arguments: &[BorrowedArgument<'_>],
+    bindings: &[AttributeBinding<'_>],
+    definitions: &HashSet<usize>,
 ) -> io::Result<()> {
     buffer.clear();
     buffer.try_atomic(|buffer| {
         buffer.write_all(prefix)?;
         serde_json::to_writer(&mut *buffer, arguments).map_err(json_error)?;
+        let mut wrote_definition = false;
+        for (index, binding) in bindings.iter().enumerate() {
+            let relation = &binding.attribute.relation;
+            if !definitions.contains(&relation.id)
+                && !bindings[..index]
+                    .iter()
+                    .any(|previous| previous.attribute.relation.id == relation.id)
+            {
+                buffer.write_all(if wrote_definition {
+                    b","
+                } else {
+                    b",\"defs\":{"
+                })?;
+                buffer.write_all(&relation.encoded_definition)?;
+                wrote_definition = true;
+            }
+        }
+        if wrote_definition {
+            buffer.write_all(b"}")?;
+        }
+        if !bindings.is_empty() {
+            buffer.write_all(b",\"refs\":[")?;
+            for (index, binding) in bindings.iter().enumerate() {
+                if index > 0 {
+                    buffer.write_all(b",")?;
+                }
+                buffer.write_all(&binding.attribute.relation.reference_prefix)?;
+                write!(buffer, "{}", binding.argument)?;
+                buffer.write_all(b"\"}")?;
+            }
+            buffer.write_all(b"]")?;
+        }
         buffer.write_all(b"}\n")
     })
+}
+
+fn mark_emitted(definitions: &mut HashSet<usize>, bindings: &[AttributeBinding<'_>]) {
+    for binding in bindings {
+        let id = binding.attribute.relation.id;
+        if !definitions.contains(&id) {
+            definitions.insert(id);
+        }
+    }
 }
 
 fn json_error(error: serde_json::Error) -> io::Error {
@@ -200,6 +271,7 @@ fn json_error(error: serde_json::Error) -> io::Error {
 /// Invalid records report their one-based input line. Processing stops on the
 /// first error; previously written messages are not rolled back.
 pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
+    let mut renderer = Renderer::default();
     for (index, line) in input.lines().enumerate() {
         let number = index + 1;
         let line =
@@ -210,7 +282,7 @@ pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
                 format!("line {number}: {error}"),
             )
         })?;
-        let text = message.render().map_err(|error| {
+        let text = renderer.render(&message).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("line {number}: {error}"),
@@ -223,13 +295,21 @@ pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
 
 #[doc(hidden)]
 pub mod __private {
-    use super::{HeapBuffer, RecordBuffer, encode_compiled};
+    use super::{HeapBuffer, RecordBuffer, encode_compiled, mark_emitted};
+    pub use crate::attribute::{AttributeBinding, owned_message};
     pub use slogr_message::BorrowedArgument;
     use std::cell::RefCell;
+    use std::collections::HashSet;
     use std::io::{self, Write};
 
+    #[derive(Default)]
+    struct StdoutState {
+        buffer: HeapBuffer,
+        definitions: HashSet<usize>,
+    }
+
     thread_local! {
-        static STDOUT_BUFFER: RefCell<HeapBuffer> = RefCell::new(HeapBuffer::default());
+        static STDOUT_STATE: RefCell<StdoutState> = RefCell::new(StdoutState::default());
     }
 
     mod sealed {
@@ -268,14 +348,21 @@ pub mod __private {
     pub fn write_stdout(
         prefix: &'static [u8],
         arguments: &[BorrowedArgument<'_>],
+        bindings: &[AttributeBinding<'_>],
     ) -> io::Result<()> {
-        STDOUT_BUFFER
-            .try_with(|buffer| {
-                let mut buffer = buffer
+        STDOUT_STATE
+            .try_with(|state| {
+                let mut state = state
                     .try_borrow_mut()
                     .map_err(|_| io::Error::other("stdout encoding buffer is already in use"))?;
-                encode_compiled(&mut *buffer, prefix, arguments)?;
-                io::stdout().lock().write_all(buffer.as_slice())
+                let StdoutState {
+                    buffer,
+                    definitions,
+                } = &mut *state;
+                encode_compiled(buffer, prefix, arguments, bindings, definitions)?;
+                io::stdout().lock().write_all(buffer.as_slice())?;
+                mark_emitted(definitions, bindings);
+                Ok(())
             })
             .map_err(|_| io::Error::other("stdout encoding buffer is unavailable"))?
     }
