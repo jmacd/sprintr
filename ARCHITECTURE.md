@@ -99,8 +99,8 @@ representation, and for now we are embedding our new fields within
 the structure of the LogRecord body field.
 
 Each callsite is represented by an anonymous `log.statement` entity
-containing its message format and static argument bindings. Source file,
-line information, and static severity can be added there as well.
+containing its message format, static argument bindings, and level.
+Source file and line information can be added there as well.
 Its value is pre-encoded with the source code.
 Log events reference the statement and supply argument values, allowing
 the recorded format to be reused when recovering formatted messages.
@@ -115,7 +115,7 @@ through relation definitions in the graph.
 
 Each process uses one shared namespace and consistent definitions
 across all logging scopes. Names are used directly, without namespace
-qualification; dots in names such as `log.severity` do not introduce
+qualification; dots in names such as `log.level` do not introduce
 separate namespaces. Scopes neither shadow names nor change their
 meaning. Definitions may appear in multiple records or scopes, provided
 their values agree.
@@ -129,9 +129,10 @@ be specified.
 
 Value types include references to entities described by a particular
 relation, not only primitive values. For example, `log.level` describes
-severity entities such as `INFO`, `WARN`, `ERROR`, and `FATAL`;
-`log.severity` is an attribute whose value references one of those
-entities. These concepts are themselves described by `log.relation`.
+named severity entities `INFO`, `WARN`, and `ERROR`, each carrying a
+description. Statement metadata `{"log.level":"INFO"}` refers to the
+named entity `log.level:INFO`. The entity type is itself described by
+`log.relation:log.level`; the level name is not an untyped string value.
 
 ## Attributes
 
@@ -333,7 +334,7 @@ The same `refs` association labels a primitive argument, such as
 `{ "account.name": "#/args/0" }` for a string. The list preserves multiple
 associations using the same name; it is not a map keyed by attribute name.
 Event `attrs` holds non-positional associations, including the reference to
-`log.statement`. Static severity will belong to the statement's `attrs`.
+`log.statement`. Static severity belongs to the statement's `attrs`.
 Within statement templates, positional associations use explicit parameter
 bindings instead: `{ "account.name": { "$arg": 0 } }`. These bindings are
 instantiated for each event, not resolved against the template definition.
@@ -626,17 +627,17 @@ Each callsite defines an anonymous `log.statement` entity whose value
 contains only static `attrs`, argument bindings in `refs`, and `msg`:
 
 ```json
-{"attrs":{},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}
+{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}
 ```
 
 `log.relation:log.statement` describes anonymous object entities;
 `log.relation:account.name` describes the named string attribute. A template
-contains neither dynamic `args` nor nested `defs`. Static severity will go
-in its `attrs` when supported. The first event bootstraps all required
+contains neither dynamic `args` nor nested `defs`. Its `attrs` contains a
+static reference to the named `log.level:INFO` entity. The first event bootstraps all required
 definitions; subsequent events only reference the statement:
 
 ```json
-{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
+{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:log.level":{"kind":"entity","type":"object","desc":"Logging level"},"log.level:INFO":{"desc":"Informational event"},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
 {"attrs":{"log.statement":1},"args":["Grace",42]}
 ```
 
@@ -647,9 +648,9 @@ even when its template is equal to another's. Rendering produces:
 
 ```text
 hello Ada, value 002a
-account.name = Ada
+log.level = INFO, account.name = Ada
 hello Grace, value 002a
-account.name = Grace
+log.level = INFO, account.name = Grace
 ```
 
 Definitions are immutable and process-wide. Equal static declarations may
@@ -666,9 +667,15 @@ The reader compiles templates once into formatting operations and argument
 bindings. It applies them to each event without copying an expanded record.
 Missing or conflicting definitions, invalid bindings, and type mismatches
 are errors. Owned `message!` snapshots include their definitions and render
-independently. The current extension supports string attributes, statement
-entities, and `$arg` bindings only; generic entities, JSON Pointer graph
-linking, severity, and graph navigation remain future work.
+independently. `message!` captures an unlevelled snapshot; `info!`, `warn!`,
+and `error!` bake `INFO`, `WARN`, or `ERROR` into their statement templates.
+The named values carry the descriptions "Informational event", "Warning
+condition", and "Error condition". Each output emits a level definition only
+when first needed, and reuses it across statements. All non-positional
+attributes are static for now; thread-local injection is a later step.
+The current extension supports string attributes, statement and level
+entities, and `$arg` bindings; generic entities, JSON Pointer graph linking,
+filtering, and graph navigation remain future work.
 
 ## Additional context
 

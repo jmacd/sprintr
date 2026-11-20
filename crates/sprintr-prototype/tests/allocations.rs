@@ -46,7 +46,7 @@ fn warmed_stack_recording_does_not_allocate() {
 #[test]
 fn repeated_attribute_recording_does_not_allocate() {
     static ACCOUNT: Attribute = attribute!("account.name", "Account name");
-    let mut logger = Logger::with_buffer(io::sink(), StackBuffer::<512>::new());
+    let mut logger = Logger::with_buffer(io::sink(), StackBuffer::<1024>::new());
     let mut emit =
         |name| info!("hello {}", logger: black_box(&mut logger), ACCOUNT = name).unwrap();
     emit("Ada");

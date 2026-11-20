@@ -7,6 +7,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and planned entity model.
 
 The current milestone is a standalone JSON Lines logger and plain-text reader.
 It pre-encodes statement templates and statically declared string attributes.
+`info!`, `warn!`, and `error!` attach named levels to those static templates.
 Events carry a statement reference and typed arguments; first-use definitions
 bootstrap the reader. Playback executes the stored formatting. It is not production-ready.
 There is no Tokio, tracing, or OpenTelemetry SDK dependency.
@@ -18,7 +19,7 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record
 ```
 
 ```json
-{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
+{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:log.level":{"kind":"entity","type":"object","desc":"Logging level"},"log.level:INFO":{"desc":"Informational event"},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
 {"attrs":{"log.statement":1},"args":["Grace",42]}
 ```
 
@@ -29,9 +30,9 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record \
 
 ```text
 hello Ada, value 002a
-account.name = Ada
+log.level = INFO, account.name = Ada
 hello Grace, value 002a
-account.name = Grace
+log.level = INFO, account.name = Grace
 ```
 
 See the [prototype API and format subset](crates/sprintr-prototype/README.md)

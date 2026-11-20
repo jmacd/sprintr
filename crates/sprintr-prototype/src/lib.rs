@@ -19,13 +19,14 @@ use statement::Statement;
 
 pub use attribute::Attribute;
 pub use sprintr_message::{
-    Argument, ArgumentBinding, Definition, Message, RelationDefinition, RelationKind, RelationType,
-    Renderer, StatementTemplate, format::FormatError,
+    Argument, ArgumentBinding, Definition, Level, Message, NamedEntity, RelationDefinition,
+    RelationKind, RelationType, Renderer, StatementTemplate, format::FormatError,
 };
 
 #[doc(hidden)]
 pub use sprintr_prototype_macros::{
-    attribute as __attribute, info as __info, message as __message,
+    attribute as __attribute, error as __error, info as __info, message as __message,
+    warn as __warn,
 };
 
 /// Declare a string attribute with compile-time-encoded metadata.
@@ -144,11 +145,11 @@ macro_rules! message {
 /// let value = 42u32;
 /// info!("hello {name:s}, value {value:04x}", logger: logger)?;
 /// let record: sprintr_prototype::Message = serde_json::from_slice(&logger.into_inner())?;
-/// assert_eq!(record.render().unwrap(), "hello Ada, value 002a");
+/// assert_eq!(record.render().unwrap(), "hello Ada, value 002a\nlog.level = INFO");
 /// # Ok::<(), std::io::Error>(())
 /// ```
 ///
-/// The prototype does not yet record a severity field or filter messages.
+/// The statement records a static `log.level:INFO` reference. No filtering is applied.
 /// Formats are checked and JSON-escaped at compile time. Arguments are borrowed
 /// in a stack array and serialized directly into the logger's reusable buffer.
 /// See [`message!`] for the supported format subset.
@@ -157,6 +158,22 @@ macro_rules! info {
     ($($input:tt)*) => {
         $crate::__info!($crate; $($input)*)
     };
+}
+
+/// Write a message whose statement has the static named level `log.level:WARN`.
+///
+/// Accepts the same format, arguments, and optional `logger:` as [`info!`].
+#[macro_export]
+macro_rules! warn {
+    ($($input:tt)*) => { $crate::__warn!($crate; $($input)*) };
+}
+
+/// Write a message whose statement has the static named level `log.level:ERROR`.
+///
+/// Accepts the same format, arguments, and optional `logger:` as [`info!`].
+#[macro_export]
+macro_rules! error {
+    ($($input:tt)*) => { $crate::__error!($crate; $($input)*) };
 }
 
 /// A synchronous, caller-owned JSON Lines writer.
@@ -235,12 +252,16 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
 struct StreamState {
     statements: HashSet<u64>,
     attributes: HashSet<&'static str>,
+    levels: u8,
 }
 
 impl StreamState {
     fn mark_emitted(&mut self, statement: &Statement, id: u64) {
         if !self.statements.contains(&id) {
             self.statements.insert(id);
+            if let Some(level) = statement.level {
+                self.levels |= 1 << level as u8;
+            }
             for attribute in statement.attributes {
                 self.attributes.insert(attribute.name);
             }
@@ -263,6 +284,15 @@ fn encode_compiled(
             buffer.write_all(b",\"defs\":{")?;
             if definitions.statements.is_empty() {
                 buffer.write_all(b"\"log.relation:log.statement\":{\"kind\":\"entity\",\"type\":\"object\",\"desc\":\"Logging statement\",\"anonymous\":true},")?;
+            }
+            if let Some(level) = statement.level
+                && definitions.levels & (1 << level as u8) == 0
+            {
+                if definitions.levels == 0 {
+                    buffer.write_all(b"\"log.relation:log.level\":{\"kind\":\"entity\",\"type\":\"object\",\"desc\":\"Logging level\"},")?;
+                }
+                buffer.write_all(statement.level_definition)?;
+                buffer.write_all(b",")?;
             }
             for (index, attribute) in statement.attributes.iter().enumerate() {
                 if !definitions.attributes.contains(attribute.name)
@@ -318,7 +348,7 @@ pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
 pub mod __private {
     use super::{HeapBuffer, RecordBuffer, StreamState, encode_compiled};
     pub use crate::statement::{Statement, concatenate, encoded_len, owned_message};
-    pub use sprintr_message::BorrowedArgument;
+    pub use sprintr_message::{BorrowedArgument, Level};
     use std::cell::RefCell;
     use std::io::{self, Write};
 

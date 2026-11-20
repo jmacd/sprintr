@@ -42,7 +42,7 @@ fn positional_and_captured_roundtrip() {
     replay(encoded.as_slice(), &mut output).unwrap();
     assert_eq!(
         String::from_utf8(output).unwrap(),
-        "hello Ada, value 002a\nhello Ada, value 002a\n"
+        "hello Ada, value 002a\nlog.level = INFO\nhello Ada, value 002a\nlog.level = INFO\n"
     );
     assert_eq!(name, "Ada");
 }
@@ -101,8 +101,12 @@ fn direct_encoding_matches_owned_encoding() {
     let owned = message!("line\n{{{text:s}}} {value:#04x}");
     let direct: Message = serde_json::from_slice(&logger.into_inner()).unwrap();
     assert_eq!(direct.args, owned.args);
-    assert_eq!(template(&direct), template(&owned));
-    assert_eq!(direct.render().unwrap(), owned.render().unwrap());
+    assert_eq!(template(&direct).msg, template(&owned).msg);
+    assert_eq!(template(&direct).refs, template(&owned).refs);
+    assert_eq!(
+        direct.render().unwrap(),
+        format!("{}\nlog.level = INFO", owned.render().unwrap())
+    );
 
     let calls = Cell::new(0);
     let temporary = || {
@@ -114,7 +118,7 @@ fn direct_encoding_matches_owned_encoding() {
     let mut output = Vec::new();
     replay(logger.into_inner().as_slice(), &mut output).unwrap();
     assert_eq!(calls.get(), 1);
-    assert_eq!(output, b"hello temporary\n");
+    assert_eq!(output, b"hello temporary\nlog.level = INFO\n");
 }
 
 /// Scenario: escaped argument data exceeds a bounded buffer between two successful writes.
@@ -124,7 +128,7 @@ fn oversized_records_roll_back_and_allow_reuse() {
     fn check(buffer: impl RecordBuffer) {
         let mut logger = Logger::with_buffer(Vec::new(), buffer);
         info!("before", logger: logger).unwrap();
-        let text = "\n".repeat(140);
+        let text = "\n".repeat(300);
         assert_eq!(
             info!("{text:s}", logger: logger).unwrap_err().kind(),
             io::ErrorKind::StorageFull
@@ -132,10 +136,13 @@ fn oversized_records_roll_back_and_allow_reuse() {
         info!("after", logger: logger).unwrap();
         let mut output = Vec::new();
         replay(logger.into_inner().as_slice(), &mut output).unwrap();
-        assert_eq!(output, b"before\nafter\n");
+        assert_eq!(
+            output,
+            b"before\nlog.level = INFO\nafter\nlog.level = INFO\n"
+        );
     }
-    check(HeapBuffer::with_capacity_and_limit(16, 256));
-    check(StackBuffer::<256>::new());
+    check(HeapBuffer::with_capacity_and_limit(16, 512));
+    check(StackBuffer::<512>::new());
 }
 
 /// Scenario: an encoded record exactly fills storage, or lacks room for its final newline.

@@ -41,7 +41,7 @@ fn first_record_bootstraps_statement_and_later_records_reuse_it() {
     assert_eq!(
         serde_json::to_value(template(&first)).unwrap(),
         serde_json::json!({
-            "attrs": {},
+            "attrs": {"log.level": "INFO"},
             "refs": [{"account.name": {"$arg": 0}}],
             "msg": "hello {@account.name}, value {value:04x}"
         })
@@ -60,7 +60,7 @@ fn first_record_bootstraps_statement_and_later_records_reuse_it() {
     );
     let mut output = Vec::new();
     replay(encoded.as_slice(), &mut output).unwrap();
-    assert_eq!(output, b"hello Ada, value 002a\naccount.name = Ada\nhello Grace, value 002a\naccount.name = Grace\n");
+    assert_eq!(output, b"hello Ada, value 002a\nlog.level = INFO, account.name = Ada\nhello Grace, value 002a\nlog.level = INFO, account.name = Grace\n");
 
     let mut another = Logger::new(Vec::new());
     log_name(&mut another, "Ada").unwrap();
@@ -98,7 +98,8 @@ fn static_aliases_and_multiple_positions() {
         "{before:x} {@account.name} {@account.name}"
     );
     let owned = message!("{before:x} {} {}", ACCT_NAME = "Ada", AGAIN = "Grace");
-    assert_eq!(template(&owned), template(&first));
+    assert_eq!(template(&owned).msg, template(&first).msg);
+    assert_eq!(template(&owned).refs, template(&first).refs);
     assert_eq!(
         owned.render().unwrap(),
         "7 Ada Grace\naccount.name = Ada, account.name = Grace"
@@ -120,24 +121,27 @@ fn static_conflicts_fail_before_output() {
         io::ErrorKind::InvalidInput
     );
     let record: Message = serde_json::from_slice(&logger.into_inner()).unwrap();
-    assert_eq!(record.render().unwrap(), "Ada\ntests.conflict = Ada");
+    assert_eq!(
+        record.render().unwrap(),
+        "Ada\nlog.level = INFO, tests.conflict = Ada"
+    );
 }
 
 /// Scenario: an oversized first use is followed by a smaller occurrence of the same statement.
 /// Guarantees: encoding rollback preserves all first-use definitions for the retry.
 #[test]
 fn overflow_does_not_consume_first_definition() {
-    let mut logger = Logger::with_buffer(Vec::new(), StackBuffer::<512>::new());
+    let mut logger = Logger::with_buffer(Vec::new(), StackBuffer::<1024>::new());
     assert_eq!(
         log_name(&mut logger, &"x".repeat(1024)).unwrap_err().kind(),
         io::ErrorKind::StorageFull
     );
     log_name(&mut logger, "Ada").unwrap();
     let record: Message = serde_json::from_slice(&logger.into_inner()).unwrap();
-    assert_eq!(record.defs.len(), 3);
+    assert_eq!(record.defs.len(), 5);
     assert_eq!(
         record.render().unwrap(),
-        "hello Ada, value 002a\naccount.name = Ada"
+        "hello Ada, value 002a\nlog.level = INFO, account.name = Ada"
     );
 }
 
@@ -175,7 +179,7 @@ fn failed_output_does_not_consume_first_definition() {
     let record: Message = serde_json::from_slice(&logger.into_inner().output).unwrap();
     assert_eq!(
         record.render().unwrap(),
-        "hello Ada, value 002a\naccount.name = Ada"
+        "hello Ada, value 002a\nlog.level = INFO, account.name = Ada"
     );
 }
 
@@ -287,7 +291,7 @@ fn escaped_names_and_temporary_values_roundtrip() {
     assert_eq!(
         record.render().unwrap(),
         format!(
-            "Ada\t\"name\"\n{} = {}",
+            "Ada\t\"name\"\nlog.level = INFO, {} = {}",
             ESCAPED.name().escape_debug(),
             "Ada\t\"name\"".escape_debug()
         )
@@ -309,5 +313,8 @@ fn concurrent_first_use_has_one_identity() {
         .map(|thread| thread.join().unwrap())
         .collect();
     assert!(records.windows(2).all(|pair| pair[0] == pair[1]));
-    assert_eq!(records[0].render().unwrap(), "Ada\naccount.name = Ada");
+    assert_eq!(
+        records[0].render().unwrap(),
+        "Ada\nlog.level = INFO, account.name = Ada"
+    );
 }

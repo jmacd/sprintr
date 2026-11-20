@@ -10,6 +10,40 @@ use std::collections::BTreeMap;
 
 pub const RELATION_PREFIX: &str = "log.relation:";
 pub const STATEMENT_PREFIX: &str = "log.statement:";
+pub const LEVEL_PREFIX: &str = "log.level:";
+
+/// Built-in named values of the `log.level` entity relation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    Info,
+    Warn,
+    Error,
+}
+
+impl Level {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Info => "Informational event",
+            Self::Warn => "Warning condition",
+            Self::Error => "Error condition",
+        }
+    }
+}
+
+/// The value of a named level entity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedEntity {
+    pub desc: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -41,6 +75,15 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl RelationDefinition {
+    pub fn level() -> Self {
+        Self {
+            kind: RelationKind::Entity,
+            value_type: RelationType::Object,
+            desc: "Logging level".into(),
+            anonymous: false,
+        }
+    }
+
     pub fn statement() -> Self {
         Self {
             kind: RelationKind::Entity,
@@ -54,7 +97,7 @@ impl RelationDefinition {
 /// Names must also be representable inside a canonical `{@name}` placeholder.
 pub fn validate_attribute_name(name: &str) -> Result<(), FormatError> {
     if name.is_empty()
-        || matches!(name, "log.relation" | "log.statement")
+        || matches!(name, "log.relation" | "log.statement" | "log.level")
         || name.contains(['{', '}', ':'])
     {
         return Err(FormatError(
@@ -91,7 +134,7 @@ pub struct ArgumentBinding {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatementTemplate {
-    pub attrs: BTreeMap<String, u64>,
+    pub attrs: BTreeMap<String, String>,
     pub refs: Vec<BTreeMap<String, ArgumentBinding>>,
     pub msg: String,
 }
@@ -101,6 +144,7 @@ pub struct StatementTemplate {
 pub enum Definition {
     Relation(RelationDefinition),
     Statement(StatementTemplate),
+    NamedEntity(NamedEntity),
 }
 
 /// One occurrence, plus any definitions first needed by this stream.
@@ -135,11 +179,20 @@ impl CompiledStatement {
     fn compile<'a>(
         template: &StatementTemplate,
         relation: impl Fn(&str) -> Option<&'a RelationDefinition>,
+        has_level: impl Fn(&str) -> bool,
     ) -> Result<Self, FormatError> {
-        if !template.attrs.is_empty() {
-            return Err(FormatError(
-                "static event attributes are not supported yet".into(),
-            ));
+        for (name, value) in &template.attrs {
+            if name != "log.level" {
+                return Err(FormatError(format!(
+                    "unsupported static attribute {name:?}"
+                )));
+            }
+            if relation(name).is_none() {
+                return Err(FormatError(format!("unknown relation {name:?}")));
+            }
+            if !has_level(value) {
+                return Err(FormatError(format!("unknown entity {name}:{value}")));
+            }
         }
         let parts = format::parse(&template.msg)?;
         let fields: Vec<_> = parts
@@ -245,11 +298,21 @@ impl CompiledStatement {
                 }
             }
         }
+        for (position, (name, value)) in self.template.attrs.iter().enumerate() {
+            output.push_str(if position == 0 { "\n" } else { ", " });
+            output.extend(name.escape_debug());
+            output.push_str(" = ");
+            output.extend(value.escape_debug());
+        }
         for (position, (name, index)) in self.bindings.iter().enumerate() {
             let Argument::String(value) = &args[*index] else {
                 unreachable!("binding and argument types were validated");
             };
-            output.push_str(if position == 0 { "\n" } else { ", " });
+            output.push_str(if position == 0 && self.template.attrs.is_empty() {
+                "\n"
+            } else {
+                ", "
+            });
             output.extend(name.escape_debug());
             output.push_str(" = ");
             output.extend(value.escape_debug());
@@ -271,6 +334,7 @@ fn statement_id(key: &str) -> Result<u64, FormatError> {
 #[derive(Default)]
 pub struct Renderer {
     relations: BTreeMap<String, RelationDefinition>,
+    levels: BTreeMap<String, NamedEntity>,
     statements: BTreeMap<u64, CompiledStatement>,
 }
 
@@ -304,6 +368,15 @@ impl Renderer {
                             "log.statement must describe anonymous object entities".into(),
                         ));
                     }
+                } else if name == "log.level" {
+                    if definition.kind != RelationKind::Entity
+                        || definition.value_type != RelationType::Object
+                        || definition.anonymous
+                    {
+                        return Err(FormatError(
+                            "log.level must describe named object entities".into(),
+                        ));
+                    }
                 } else {
                     validate_attribute_name(name)?;
                     if definition.kind != RelationKind::Attribute
@@ -320,7 +393,7 @@ impl Renderer {
                 } else {
                     relations.insert(name.to_string(), definition.clone());
                 }
-            } else if !key.starts_with(STATEMENT_PREFIX) {
+            } else if !key.starts_with(STATEMENT_PREFIX) && !key.starts_with(LEVEL_PREFIX) {
                 return Err(FormatError(format!("unsupported definition {key:?}")));
             }
         }
@@ -328,6 +401,28 @@ impl Renderer {
         if relation("log.statement").is_none() {
             return Err(FormatError("unknown relation \"log.statement\"".into()));
         }
+        let mut levels = BTreeMap::new();
+        for (key, definition) in &message.defs {
+            if let Some(name) = key.strip_prefix(LEVEL_PREFIX) {
+                if relation("log.level").is_none() {
+                    return Err(FormatError("unknown relation \"log.level\"".into()));
+                }
+                let Definition::NamedEntity(entity) = definition else {
+                    return Err(FormatError(format!("expected named entity for {key:?}")));
+                };
+                if name.is_empty() {
+                    return Err(FormatError("level entity names must not be empty".into()));
+                }
+                if let Some(existing) = self.levels.get(name) {
+                    if existing != entity {
+                        return Err(FormatError(format!("conflicting definition for {key:?}")));
+                    }
+                } else {
+                    levels.insert(name.to_string(), entity.clone());
+                }
+            }
+        }
+        let has_level = |name: &str| levels.contains_key(name) || self.levels.contains_key(name);
         let mut statements = BTreeMap::new();
         for (key, definition) in &message.defs {
             if key.starts_with(STATEMENT_PREFIX) {
@@ -344,7 +439,7 @@ impl Renderer {
                 } else {
                     statements.insert(
                         statement_id,
-                        CompiledStatement::compile(template, relation)?,
+                        CompiledStatement::compile(template, relation, has_level)?,
                     );
                 }
             }
@@ -355,6 +450,7 @@ impl Renderer {
             .ok_or_else(|| FormatError(format!("unknown statement {id}")))?;
         let output = statement.render(&message.args)?;
         self.relations.extend(relations);
+        self.levels.extend(levels);
         self.statements.extend(statements);
         Ok(output)
     }

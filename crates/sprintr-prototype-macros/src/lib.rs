@@ -4,6 +4,7 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{ToTokens, quote};
 use sprintr_message::format::{Part, Spec, parse};
+use sprintr_message::{Level, NamedEntity};
 use sprintr_message::{RelationDefinition, RelationKind, RelationType, validate_attribute_name};
 use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, LitByteStr, LitStr, Path, Token, parse_macro_input};
@@ -131,7 +132,7 @@ struct Compiled {
     borrowed: Vec<Tokens>,
 }
 
-fn compile(input: &Input) -> syn::Result<Compiled> {
+fn compile(input: &Input, level: Option<Level>) -> syn::Result<Compiled> {
     let root = &input.root;
     let span = input.format.span();
     let error = |message: &str| syn::Error::new(span, message);
@@ -220,14 +221,48 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
     if let Some(extra) = arguments.next() {
         return Err(syn::Error::new_spanned(extra, "unused positional argument"));
     }
+    let (prefix, level_value, level_definition) = if let Some(level) = level {
+        let variant = match level {
+            Level::Info => quote!(#root::__private::Level::Info),
+            Level::Warn => quote!(#root::__private::Level::Warn),
+            Level::Error => quote!(#root::__private::Level::Error),
+        };
+        let definition = NamedEntity {
+            desc: level.description().into(),
+        };
+        (
+            bytes(
+                &format!(
+                    "{{\"attrs\":{{\"log.level\":\"{}\"}},\"refs\":[",
+                    level.name()
+                ),
+                span,
+            ),
+            quote!(::core::option::Option::Some(#variant)),
+            bytes(
+                &format!(
+                    "\"log.level:{}\":{}",
+                    level.name(),
+                    serde_json::to_string(&definition).expect("named level JSON encoding")
+                ),
+                span,
+            ),
+        )
+    } else {
+        (
+            bytes("{\"attrs\":{},\"refs\":[", span),
+            quote!(::core::option::Option::None),
+            bytes("", span),
+        )
+    };
     let declaration = quote! {
         const __PARTS: &[&[u8]] = &[
-            b"{\"attrs\":{},\"refs\":[", #(#references,)* b"],\"msg\":\"", #(#message,)* b"\"}",
+            #prefix, #(#references,)* b"],\"msg\":\"", #(#message,)* b"\"}",
         ];
         static __ENCODED: [u8; #root::__private::encoded_len(__PARTS)] =
             #root::__private::concatenate(__PARTS);
         static __STATEMENT: #root::__private::Statement =
-            #root::__private::Statement::new(&__ENCODED, &[#(#attributes),*]);
+            #root::__private::Statement::new(&__ENCODED, &[#(#attributes),*], #level_value, #level_definition);
     };
     Ok(Compiled {
         declaration,
@@ -245,7 +280,7 @@ pub fn message(input: TokenStream) -> TokenStream {
             "message! constructs a record; use info! for logger output",
         ))
     } else {
-        compile(&input).map(|compiled| {
+        compile(&input, None).map(|compiled| {
             let root = &input.root;
             let declaration = compiled.declaration;
             let arguments = compiled.owned;
@@ -260,8 +295,22 @@ pub fn message(input: TokenStream) -> TokenStream {
 
 #[proc_macro]
 pub fn info(input: TokenStream) -> TokenStream {
+    record(input, Level::Info)
+}
+
+#[proc_macro]
+pub fn warn(input: TokenStream) -> TokenStream {
+    record(input, Level::Warn)
+}
+
+#[proc_macro]
+pub fn error(input: TokenStream) -> TokenStream {
+    record(input, Level::Error)
+}
+
+fn record(input: TokenStream, level: Level) -> TokenStream {
     let input = parse_macro_input!(input as Input);
-    let result = compile(&input).map(|compiled| {
+    let result = compile(&input, Some(level)).map(|compiled| {
         let declaration = compiled.declaration;
         let arguments = compiled.borrowed;
         let call = if let Some(logger) = input.logger {

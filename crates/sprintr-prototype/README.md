@@ -2,8 +2,8 @@
 
 This non-production prototype captures a message format and typed positional
 arguments, records JSON Lines, and replays plain-text messages. Static
-string attributes and anonymous statement entities supply self-describing metadata.
-There are no generic entities, severity fields, filtering, or binary encoding yet.
+string attributes, named level entities, and anonymous statements supply self-describing metadata.
+There are no generic entities, thread-local attribute injection, filtering, or binary encoding yet.
 There is no dependency on Tokio, tracing, or an OpenTelemetry runtime.
 
 ## Run the example
@@ -15,7 +15,7 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record
 ```
 
 ```json
-{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
+{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:log.level":{"kind":"entity","type":"object","desc":"Logging level"},"log.level:INFO":{"desc":"Informational event"},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
 {"attrs":{"log.statement":1},"args":["Grace",42]}
 ```
 
@@ -28,9 +28,9 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record \
 
 ```text
 hello Ada, value 002a
-account.name = Ada
+log.level = INFO, account.name = Ada
 hello Grace, value 002a
-account.name = Grace
+log.level = INFO, account.name = Grace
 ```
 
 The reader requires only the recorded JSON, not the original application.
@@ -62,11 +62,48 @@ assert_eq!(record.render()?, "hello Ada, value 0x2a");
 `info!` returns `std::io::Result<()>`. It borrows string data and encodes it
 directly without requiring `Display` or allocating intermediate owned arguments.
 The caller retains ownership. Expressions are evaluated once per placeholder
-occurrence. `message!` is a separate, allocating API for owned snapshots.
+occurrence. `message!` is a separate, allocating API for unlevelled owned snapshots.
 Its snapshots include their definitions; conflicting static declarations panic
 on this infallible convenience path. `info!` returns schema conflicts as errors.
 Writers are synchronous, and I/O failure may leave a partially written line.
 Call `Logger::flush` explicitly for buffered output.
+
+## Static levels
+
+```rust
+use sprintr_prototype::{Logger, error, info, warn};
+
+let mut logger = Logger::new(Vec::new());
+info!("ready", logger: logger)?;
+warn!("retrying", logger: logger)?;
+error!("failed", logger: logger)?;
+logger.flush()?;
+# Ok::<(), std::io::Error>(())
+```
+
+The macros share the same capture syntax and return `std::io::Result<()>`.
+They bake `{"log.level":"INFO"}`, `{"log.level":"WARN"}`, or
+`{"log.level":"ERROR"}` into the statement's `attrs`. `log.level` is a named
+object-entity relation, not a string attribute. A value such as `"INFO"` is a
+typed reference to `defs["log.level:INFO"]`, whose value supplies its description:
+
+| Entity | Description |
+|--------|-------------|
+| `log.level:INFO` | Informational event |
+| `log.level:WARN` | Warning condition |
+| `log.level:ERROR` | Error condition |
+
+The relation and each used named value are emitted once per output stream,
+alongside the first statement that needs them. Unused levels are not emitted.
+Another statement at the same level reuses its definition, and subsequent
+occurrences still contain only a statement reference and arguments.
+Definitions are immutable; missing or conflicting named values fail playback.
+
+All non-positional attributes currently come from static statement metadata.
+There is no dynamic override, filtering, or thread-local injection yet.
+Positional `$arg` associations still bind to each event's argument values.
+Playback includes the level first on the association line, for example
+`log.level = INFO, account.name = Ada`.
 
 ## Static string attributes
 
@@ -84,7 +121,7 @@ info!("hello {}, value {value:04x}", ACCT_NAME = name)?;
 attribute; it is not a named formatting argument or an assignment to the handle.
 The handle supplies the string type, so `{}` or `{:s}` is accepted. The stored
 placeholder is `{@account.name}` regardless of the Rust variable or import alias.
-Canonical names cannot be empty, reserved (`log.relation`, `log.statement`), or
+Canonical names cannot be empty, reserved (`log.relation`, `log.statement`, `log.level`), or
 contain braces/colons, which would conflict with placeholder syntax.
 
 Use `static` or `const` handles, not runtime locals. `attribute!` pre-encodes the
@@ -97,12 +134,12 @@ across independently compiled modules. The current API supports only strings.
 
 ## Statement templates and events
 
-Every `info!` or `message!` callsite has a static anonymous `log.statement`
+Every `info!`, `warn!`, `error!`, or `message!` callsite has a static anonymous `log.statement`
 entity. Its complete JSON value is assembled during Rust constant evaluation:
 
 ```json
 {
-  "attrs": {},
+  "attrs": {"log.level": "INFO"},
   "refs": [{"account.name": {"$arg": 0}}],
   "msg": "hello {@account.name}, value {value:04x}"
 }
@@ -111,17 +148,17 @@ entity. Its complete JSON value is assembled during Rust constant evaluation:
 The template contains no `args` or nested `defs`. `{"$arg": 0}` binds to the
 first argument of each event using it; it is not a pointer into the template's
 record. Ordinary JSON Pointer semantics are unchanged. Repeated associations
-remain separate `refs` entries. Static severity will eventually go in template
-`attrs`; nonempty template attributes are not supported yet.
+remain separate `refs` entries. Named level references live in static template
+`attrs`; `message!` omits the level and keeps that map empty.
 
 First use assigns a process-local nonzero `u64` identity. `attrs.log.statement`
 is a typed reference to that entity, resolved through `defs["log.statement:<id>"]`.
 IDs are not globally qualified references and must not be conflated across
 processes. Distinct callsites have distinct identities even for equal templates.
 Declarations alone emit nothing. The first occurrence carries its statement,
-attribute, and `log.statement` relation definitions in the same event. Later
+attribute, and required relation/level definitions in the same event. Later
 occurrences contain only `attrs` and `args`. New callsites introduce their own
-statement definitions but need not repeat already-emitted relations.
+statement definitions but need not repeat already-emitted relations or levels.
 
 Each caller-owned logger tracks first use independently. Stdout tracks it per
 thread alongside its scratch buffer, so different threads may repeat identical
@@ -132,7 +169,7 @@ snapshot so that `Message::render()` works independently.
 `replay` retains definitions and compiles each template once into formatting
 operations and argument bindings; `Renderer` exposes the same behavior directly.
 It binds each occurrence without copying an expanded record. Playback renders the message followed by an
-association line (`account.name = Ada`), with multiple associations separated
+association line (`log.level = INFO, account.name = Ada`), with multiple associations separated
 by commas. The association line escapes control characters. Unknown relations,
 conflicting definitions, type mismatches, and invalid bindings stop playback.
 The prototype implements `$arg` bindings, not generic entity pointers yet.

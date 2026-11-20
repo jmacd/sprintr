@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Argument, Attribute, Definition, Message, RelationDefinition, RelationKind, RelationType,
+    Argument, Attribute, Definition, Level, Message, NamedEntity, RelationDefinition, RelationKind,
+    RelationType,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -16,14 +17,23 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub struct Statement {
     pub(crate) encoded: &'static [u8],
     pub(crate) attributes: &'static [&'static Attribute],
+    pub(crate) level: Option<Level>,
+    pub(crate) level_definition: &'static [u8],
     id: OnceLock<Result<u64, String>>,
 }
 
 impl Statement {
-    pub const fn new(encoded: &'static [u8], attributes: &'static [&'static Attribute]) -> Self {
+    pub const fn new(
+        encoded: &'static [u8],
+        attributes: &'static [&'static Attribute],
+        level: Option<Level>,
+        level_definition: &'static [u8],
+    ) -> Self {
         Self {
             encoded,
             attributes,
+            level,
+            level_definition,
             id: OnceLock::new(),
         }
     }
@@ -106,6 +116,18 @@ pub fn owned_message(statement: &'static Statement, args: Vec<Argument>) -> Mess
             ),
         ),
     ]);
+    if let Some(level) = statement.level {
+        defs.insert(
+            "log.relation:log.level".into(),
+            Definition::Relation(RelationDefinition::level()),
+        );
+        defs.insert(
+            format!("log.level:{}", level.name()),
+            Definition::NamedEntity(NamedEntity {
+                desc: level.description().into(),
+            }),
+        );
+    }
     for attribute in statement.attributes {
         defs.entry(format!("log.relation:{}", attribute.name))
             .or_insert_with(|| {
