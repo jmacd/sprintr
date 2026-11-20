@@ -1,4 +1,4 @@
-slogr contains code derived from OpenTelemetry Arrow.
+slogr contains buffer code derived from OpenTelemetry Arrow.
 Copyright The OpenTelemetry Authors
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
@@ -6,52 +6,17 @@ Source repository: https://github.com/jmacd/otel-arrow
 Source revision: 351e0e59db18cebfb542bdc5aed2e181b0f5c974
 Source branch at extraction: jmacd/encode_any_value
 
-Extracted from rust/otap-dataflow/crates:
-  telemetry/src/self_tracing.rs and self_tracing/{encoder,formatter,structured}.rs
-  telemetry/src/internal_events.rs
-  pdata/src/otlp/common.rs (bounded protobuf buffers only)
-  pdata/src/proto/consts.rs (common/log fields only)
-  pdata/src/views/otlp/bytes/{common,decode,logs}.rs (formatting dependencies only)
-  pdata-views/src/views/{common,logs}.rs (required view traits only)
-  pdata/src/proto/opentelemetry.proto.{common,logs}.v1.rs (test-only types)
+Original source:
+  rust/otap-dataflow/crates/pdata/src/otlp/common.rs
+  (bounded protobuf buffers only)
 
-Changes for this standalone distribution:
-  Removed engine context, configuration, registries, export batching, metrics,
-  lifecycle reporting, serialization adapters, and process-wide output services.
-  Rebased modules/imports onto a single independent crate.
-  Added a callback-based tracing layer and fallible synchronous console writes.
-  Carried record-level dropped-attribute counts into console formatting.
-  Retained the scalar fast path, structured encoding, and bounded buffer logic.
-  Retained focused source tests and added standalone integration coverage.
+Retained adaptation:
+  crates/slogr-prototype/src/buffer.rs
+  Adapted heap/stack storage and rollback through the original slogr
+    src/buffer.rs extraction, which is available in repository history.
+  Removed protobuf-specific operations.
+  Complete JSON records reuse storage and reject overflow rather than truncate.
 
-src/macros/event.rs also contains code derived from Tokio tracing.
-Copyright (c) 2019 Tokio Contributors
-Licensed under the MIT License (see LICENSE-TRACING).
-
-Source repository: https://github.com/tokio-rs/tracing
-tracing 0.1.44 revision: 2d55f6faf9be83e7e4634129fb96813241aac2b8
-tracing-core 0.1.36 revision: 10a9e838a35e6ded79d66af246be2ee05417136d
-
-Derived from:
-  tracing/src/macros.rs (named event normalization, event dispatch, callsite2,
-    level_enabled, valueset_all, valueset, fieldset, __tracing_stringify)
-  tracing/src/lib.rs (__is_enabled, FieldName, and fallback field support)
-  tracing-core/src/lib.rs (metadata construction)
-
-Changes for local macro ownership:
-  Retained only the named, targeted event forms used by slogr's public macros.
-  Unified the identical level-specific argument normalization into one helper.
-  Renamed/rebased helper macros and runtime type paths into slogr.
-  Inlined metadata construction instead of invoking upstream metadata macros.
-  Omitted inactive legacy log-backend hooks, span macros, and unused forms.
-  Used safe const UTF-8 validation instead of unchecked conversion.
-  Consumed temporary value sets through callbacks inside their construction
-    scope to preserve borrowed-field lifetimes under Rust edition 2024.
-  Kept tracing runtime types, field visitors, dispatch, and subscriber behavior.
-
-Subsequent local calling-convention changes:
-  Replaced free-form field syntax with static Attribute<T> declarations.
-  Required one body string first; removed public event-name, parent, target,
-    format-string, message-key, and field-formatting shortcuts.
-  Retained only the callsite, level-check, borrowed-value, and dispatch machinery
-    needed by the typed macros; removed field-name stringification and fake fields.
+The earlier tracing/OTLP runtime, protobuf views, and Tokio-derived event
+macros have been removed. The current prototype does not contain those
+implementations or depend on the tracing runtime.

@@ -1,0 +1,17 @@
+[package]
+name = "slogr-message"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+description = "Shared message format and playback grammar for the slogr prototype"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"

@@ -17,7 +17,52 @@ A Rust logging library that:
   fragments
 - Builds a self-describing, self-bootstrapping graph of log records
 - Supports graph navigation and cross-process tracing through references
-- Encodes directly to OTLP LogRecord bytes (minimizes allocations)
+- Encodes directly into reusable or stack-backed storage, using JSON
+  initially and binary formats when useful
+
+## Performance goals
+
+**Performance is a primary outcome of this experiment.** Proving that
+the API, schema, and graph work is not sufficient if logging imposes
+avoidable allocations or repeats expensive encoding. Production-quality
+producer performance must shape the implementation from the beginning,
+not be postponed until a later rewrite or a switch to binary encoding.
+
+The ordinary producer path should borrow arguments, use compile-time
+format metadata, and encode directly into reusable or stack-backed
+storage. The target
+is zero steady-state library allocations for records that fit available
+storage, excluding work performed by caller expressions and output
+sinks. It must not require constructing an owned value tree per event.
+Parsing formats, copying argument strings into intermediate objects,
+and allocating argument collections do not belong on this path.
+
+Entity construction pays for capturing and encoding an immutable
+snapshot once. Subsequent uses emit references, rather than evaluating
+or encoding the entity value again. Re-emitting a definition should
+reuse its encoded chunks, with deferred references and framing assembled
+as needed. Reference bookkeeping must not introduce per-use allocations
+on the steady-state path.
+
+The original direct OTLP implementation provides the performance model:
+borrowed values, static metadata, direct writes, reusable storage, and
+explicit handling of buffer limits. The unused tracing/OTLP runtime has
+been removed; the prototype retains adapted heap/stack storage and
+rollback mechanisms rather than maintaining a second logging system.
+JSON and binary encoders should share these principles. The choice of
+wire format is secondary to avoiding repeated work and allocations.
+
+Performance evaluation must distinguish one-time construction and
+buffer growth from repeated logging. It must measure allocation counts
+and bytes, throughput, latency, contention, and retained memory. As
+entities are introduced, repeated references must be measured separately
+from their initial encoding. Allocation regressions should be guarded
+explicitly; zero allocations alone do not establish production readiness.
+
+Owned decoded records and graph construction belong on the reader side
+and need not follow the producer's allocation budget. When a producer
+buffer is bounded, overflow must be reported without emitting malformed
+JSON or breaking the correspondence between formats and arguments.
 
 ## Details
 
@@ -470,30 +515,75 @@ and can be navigated across the RPC boundary. The exact propagation
 format and mapping to OpenTelemetry tracing are left open; the design
 principle is to express the relationship using ordinary log references.
 
-## Initial deliverables
+## First milestone: message format and arguments
 
-### Structured recording and formatted playback
+Start with JSON Lines recording and plain-text playback of a message
+format and its positional arguments. Each line contains only `msg`
+and `args`, representing the logical record body without OTLP framing.
+There are no attributes, entities (including callsites and `log.record`),
+definitions, references, or schema bootstrap in this milestone. The
+message format is repeated in each record.
 
-The first deliverable is an end-to-end JSON Lines log: one JSON log
-record per line, using the definitions, references, and bootstrap
-structure described above. JSON Lines is the initial recording format;
-direct OTLP encoding remains an architectural objective.
+The standalone `slogr-prototype` crate implements this first slice
+without Tokio or `tracing`. It is an API and text-format prototype, not
+a production logger. For example:
 
-A reader loads the log, connects reference targets, and uses the
-recorded callsite formats and argument values to produce plain-text
-messages. Playback executes the formatting operations, including the
-recorded format specifiers, rather than displaying templates or dumping
-structured values. The output omits the structured envelope and
-definition/reference machinery.
+```rust
+use slogr_prototype::info;
 
-### Interactive log browser
+let name = "Ada";
+let value = 42u32;
 
-The second deliverable is a web-based log browser that supports
-pivoting between chronological and frequency-based views. Both views
-operate on records selected by a conjunction of entity/attribute pairs:
-a matching record satisfies every selected pair. Pivoting between views
-preserves that selection, allowing the same subset of the graph to be
-examined in time order or by frequency.
+info!("hello {:s}, value {:04x}", name, value)?;
+```
+
+The equivalent implicit-capture form is
+`info!("hello {name:s}, value {value:04x}")?`.
+Both return output errors to the caller. The prototype defaults to
+JSON Lines on stdout; an optional `logger:` argument selects a
+caller-owned writer. `info!` encodes borrowed arguments directly into
+reusable storage, using a statically encoded format prefix. Heap and
+fixed stack buffers reuse the original implementation's storage and
+rollback approach. Bounded buffers reject a whole record on overflow,
+rather than truncating JSON or dropping arguments.
+
+Owned record construction is available separately through `message!`.
+This convenience path may allocate and is not required for logging.
+
+The recorded JSON line is:
+
+```json
+{"msg":"hello {name}, value {value:04x}","args":["Ada",42]}
+```
+
+Placeholder names are labels derived from the source expressions, not
+attribute declarations. Placeholders consume `args` in occurrence order.
+The string designation `:s` is omitted from the stored format, while
+`:04x` is retained because it controls rendering. The integer stays a
+JSON number rather than becoming the preformatted string `"002a"`.
+
+Reading that line produces:
+
+```text
+hello Ada, value 002a
+```
+
+The milestone is complete when a writer records this structure and a
+reader reconstructs the plain-text message from the JSON line alone,
+applying the stored formatting operations to the argument values. This
+small example exercises string insertion and zero-padded hexadecimal
+integer formatting; full formatting-language coverage is deferred.
+The prototype supports `AsRef<str>` strings and `u8`, `u16`, `u32`, and
+`u64` integers, including alternate hexadecimal prefixes and escaped
+braces. Unsupported formats and argument types fail at compilation;
+malformed recorded input fails during playback. The obsolete `otel_*`
+runtime and its examples are no longer part of the workspace.
+
+Self-describing definitions, reference-based deduplication, and direct
+OTLP encoding remain later goals. A web-based log browser is also a
+later goal: it will preserve a conjunction of entity/attribute pairs
+while pivoting between chronological and frequency-based views of the
+matching records. Those features are outside this first milestone.
 
 ## Additional context
 
