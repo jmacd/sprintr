@@ -6,9 +6,9 @@ requirement of the experiment**, not an optimization postponed until later.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and planned entity model.
 
 The current milestone is a standalone JSON Lines logger and plain-text reader.
-It captures source-derived message formats, typed arguments, and registered
-string attributes, then executes the recorded formatting during playback.
-Attribute definitions bootstrap the reader on first use. It is not production-ready.
+It pre-encodes statement templates and statically declared string attributes.
+Events carry a statement reference and typed arguments; first-use definitions
+bootstrap the reader. Playback executes the stored formatting. It is not production-ready.
 There is no Tokio, tracing, or OpenTelemetry SDK dependency.
 
 ## Try it
@@ -18,7 +18,8 @@ cargo run --quiet -p slogr-prototype --example json_lines -- record
 ```
 
 ```json
-{"msg":"hello {acct_name}, value {value:04x}","args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"}},"refs":[{"account.name":"#/args/0"}]}
+{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
+{"attrs":{"log.statement":1},"args":["Grace",42]}
 ```
 
 ```sh
@@ -29,6 +30,8 @@ cargo run --quiet -p slogr-prototype --example json_lines -- record \
 ```text
 hello Ada, value 002a
 account.name = Ada
+hello Grace, value 002a
+account.name = Grace
 ```
 
 See the [prototype API and format subset](crates/slogr-prototype/README.md)
@@ -49,14 +52,14 @@ removed rather than maintained as a second implementation.
 
 ## Performance
 
-`info!` uses a compile-time-encoded JSON prefix and a stack array of borrowed
+`info!` uses compile-time-encoded statement templates and a stack array of borrowed
 arguments. It writes directly into reusable heap or fixed stack storage,
 without constructing an owned message or reparsing the format on the producer
 path. Successful steady-state recording makes zero library heap allocations
-once storage and definition bookkeeping are initialized. Plain messages need
-no initial heap allocation with sufficient stack storage. Attribute registration
-caches definition bytes; repeated uses emit only positional `refs`, with no
-registry lock. Caller expressions, output sinks, initialization/growth, and
+once storage and definition bookkeeping are initialized. Repeated events emit
+only `attrs.log.statement` and `args`, without re-encoding templates or taking
+the schema registry lock. First use may allocate even with stack-backed storage.
+Caller expressions, output sinks, initialization/growth, and
 error reporting are outside that allocation budget.
 
 The planned entity API must capture and encode a snapshot once, then emit

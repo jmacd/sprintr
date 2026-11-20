@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The standalone prototype's message representation and format grammar.
+//! Statement templates, event records, and stateful formatted playback.
 
 pub mod format;
 
@@ -8,26 +8,23 @@ use format::{FormatError, Part, Spec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Wire key prefix for definitions described by the bootstrap relation.
 pub const RELATION_PREFIX: &str = "log.relation:";
+pub const STATEMENT_PREFIX: &str = "log.statement:";
 
-/// Relation kinds supported by the current prototype.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RelationKind {
-    /// An attribute associating a name with an argument value.
     Attribute,
+    Entity,
 }
 
-/// Value types supported by registered attributes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RelationType {
-    /// String values, captured through `AsRef<str>`.
     String,
+    Object,
 }
 
-/// A self-describing attribute definition under `log.relation`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelationDefinition {
@@ -35,19 +32,45 @@ pub struct RelationDefinition {
     #[serde(rename = "type")]
     pub value_type: RelationType,
     pub desc: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
 }
 
-/// A captured value, retained as its native JSON type rather than formatted text.
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+impl RelationDefinition {
+    pub fn statement() -> Self {
+        Self {
+            kind: RelationKind::Entity,
+            value_type: RelationType::Object,
+            desc: "Logging statement".into(),
+            anonymous: true,
+        }
+    }
+}
+
+/// Names must also be representable inside a canonical `{@name}` placeholder.
+pub fn validate_attribute_name(name: &str) -> Result<(), FormatError> {
+    if name.is_empty()
+        || matches!(name, "log.relation" | "log.statement")
+        || name.contains(['{', '}', ':'])
+    {
+        return Err(FormatError(
+            "attribute name is empty, reserved, or contains braces/colon".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Argument {
-    /// String data, including any literal braces or newlines.
     String(String),
-    /// An unsigned integer, with the full `u64` range preserved.
     Unsigned(u64),
 }
 
-/// Borrowed arguments used by generated direct-encoding code.
 #[doc(hidden)]
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -56,200 +79,283 @@ pub enum BorrowedArgument<'a> {
     Unsigned(u64),
 }
 
-/// One JSON Lines record, with optional relation definitions and associations.
+/// A template parameter, not a JSON Pointer into the definition's record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArgumentBinding {
+    #[serde(rename = "$arg")]
+    pub argument: usize,
+}
+
+/// Static metadata shared by every occurrence of a logging statement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatementTemplate {
+    pub attrs: BTreeMap<String, u64>,
+    pub refs: Vec<BTreeMap<String, ArgumentBinding>>,
+    pub msg: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Definition {
+    Relation(RelationDefinition),
+    Statement(StatementTemplate),
+}
+
+/// One occurrence, plus any definitions first needed by this stream.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[must_use = "a captured message must be recorded or rendered"]
 pub struct Message {
-    /// The stored format, with source labels and rendering specifiers.
-    pub msg: String,
-    /// Arguments in placeholder occurrence order.
+    pub attrs: BTreeMap<String, u64>,
     pub args: Vec<Argument>,
-    /// Relation definitions included in this record.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub defs: BTreeMap<String, RelationDefinition>,
-    /// Ordered singleton maps associating names with local argument pointers.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub refs: Vec<BTreeMap<String, String>>,
+    pub defs: BTreeMap<String, Definition>,
 }
 
 impl Message {
-    /// Check format syntax, argument types/counts, and local reference structure.
-    ///
-    /// Relation availability and stream-wide conflicts are checked by [`Renderer`].
+    /// Validate a self-contained snapshot. Stream-dependent events need a [`Renderer`].
     pub fn validate(&self) -> Result<(), FormatError> {
-        self.validate_parts(&format::parse(&self.msg)?)?;
-        self.validate_metadata()
+        self.render().map(|_| ())
     }
 
-    fn validate_metadata(&self) -> Result<(), FormatError> {
-        for key in self.defs.keys() {
-            relation_name(key)?;
-        }
-        for reference in &self.refs {
-            if reference.len() != 1 {
-                return Err(FormatError(
-                    "each refs entry must contain exactly one name and pointer".into(),
-                ));
-            }
-            let (name, pointer) = reference.iter().next().expect("one reference");
-            if name.is_empty() {
-                return Err(FormatError("reference names must not be empty".into()));
-            }
-            let index = argument_index(pointer)?;
-            if index >= self.args.len() {
-                return Err(FormatError(format!(
-                    "reference {pointer:?} is outside args"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_parts(&self, parts: &[Part]) -> Result<(), FormatError> {
-        let fields = parts.iter().filter_map(|part| match part {
-            Part::Field(field) => Some(field),
-            Part::Literal(_) => None,
-        });
-        let count = fields.clone().count();
-        if count != self.args.len() {
-            return Err(FormatError(format!(
-                "format has {count} placeholders but record has {} arguments",
-                self.args.len()
-            )));
-        }
-        for (index, (field, argument)) in fields.zip(&self.args).enumerate() {
-            if !matches!(
-                (field.spec, argument),
-                (Spec::String, Argument::String(_)) | (Spec::Hex { .. }, Argument::Unsigned(_))
-            ) {
-                return Err(FormatError(format!(
-                    "argument {index} ({}) must be {}",
-                    field.name,
-                    match field.spec {
-                        Spec::String => "a string",
-                        Spec::Hex { .. } => "an unsigned integer",
-                    }
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Render a self-contained record, followed by its positional associations.
-    ///
-    /// Use [`Renderer`] when later records refer to definitions from earlier ones.
     pub fn render(&self) -> Result<String, FormatError> {
         Renderer::default().render(self)
     }
+}
 
-    fn render_text(&self) -> Result<String, FormatError> {
-        let parts = format::parse(&self.msg)?;
-        self.validate_parts(&parts)?;
-        let mut arguments = self.args.iter();
-        let mut output = String::new();
-        for part in parts {
-            match part {
-                Part::Literal(text) => output.push_str(&text),
-                Part::Field(field) => match (field.spec, arguments.next()) {
-                    (Spec::String, Some(Argument::String(value))) => output.push_str(value),
-                    (
-                        Spec::Hex {
-                            alternate,
-                            zero_pad,
-                            width,
-                        },
-                        Some(Argument::Unsigned(value)),
-                    ) => {
-                        let text = match (alternate, zero_pad) {
-                            (true, true) => format!("{value:#0width$x}"),
-                            (true, false) => format!("{value:#width$x}"),
-                            (false, true) => format!("{value:0width$x}"),
-                            (false, false) => format!("{value:width$x}"),
-                        };
-                        output.push_str(&text);
-                    }
-                    _ => unreachable!("argument count and types were validated"),
-                },
-            }
+struct CompiledStatement {
+    template: StatementTemplate,
+    parts: Vec<Part>,
+    bindings: Vec<(String, usize)>,
+}
+
+impl CompiledStatement {
+    fn compile<'a>(
+        template: &StatementTemplate,
+        relation: impl Fn(&str) -> Option<&'a RelationDefinition>,
+    ) -> Result<Self, FormatError> {
+        if !template.attrs.is_empty() {
+            return Err(FormatError(
+                "static event attributes are not supported yet".into(),
+            ));
         }
-        Ok(output)
-    }
-}
-
-fn relation_name(key: &str) -> Result<&str, FormatError> {
-    match key.strip_prefix(RELATION_PREFIX) {
-        Some(name) if !name.is_empty() && name != "log.relation" => Ok(name),
-        _ => Err(FormatError(format!(
-            "unsupported relation definition {key:?}"
-        ))),
-    }
-}
-
-fn argument_index(pointer: &str) -> Result<usize, FormatError> {
-    let invalid = || FormatError(format!("unsupported argument reference {pointer:?}"));
-    let index = pointer.strip_prefix("#/args/").ok_or_else(invalid)?;
-    if index.is_empty()
-        || !index.bytes().all(|byte| byte.is_ascii_digit())
-        || (index.len() > 1 && index.starts_with('0'))
-    {
-        return Err(invalid());
-    }
-    index.parse().map_err(|_| invalid())
-}
-
-/// Relation-aware playback for one process's record stream.
-#[derive(Default)]
-pub struct Renderer {
-    relations: BTreeMap<String, RelationDefinition>,
-}
-
-impl Renderer {
-    /// Load definitions and render text plus a second line of positional associations.
-    ///
-    /// Conflicts and unresolved references are errors. Invalid records do not
-    /// change the renderer's definition table.
-    pub fn render(&mut self, message: &Message) -> Result<String, FormatError> {
-        message.validate_metadata()?;
-        let mut output = message.render_text()?;
-        for (key, definition) in &message.defs {
-            let name = relation_name(key)?;
-            if self
-                .relations
-                .get(name)
-                .is_some_and(|existing| existing != definition)
+        let parts = format::parse(&template.msg)?;
+        let fields: Vec<_> = parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Field(field) => Some(field),
+                Part::Literal(_) => None,
+            })
+            .collect();
+        let mut bindings = Vec::new();
+        for reference in &template.refs {
+            if reference.len() != 1 {
+                return Err(FormatError(
+                    "each refs entry must contain exactly one name and binding".into(),
+                ));
+            }
+            let (name, binding) = reference.iter().next().expect("one binding");
+            let definition =
+                relation(name).ok_or_else(|| FormatError(format!("unknown relation {name:?}")))?;
+            if definition.kind != RelationKind::Attribute
+                || definition.value_type != RelationType::String
             {
-                return Err(FormatError(format!("conflicting definition for {name:?}")));
+                return Err(FormatError(format!("{name:?} is not a string attribute")));
+            }
+            let Some(field) = fields.get(binding.argument) else {
+                return Err(FormatError(
+                    "argument binding is outside the statement's placeholders".into(),
+                ));
+            };
+            if field.spec != Spec::String {
+                return Err(FormatError(format!(
+                    "attribute {name:?} requires a string argument"
+                )));
+            }
+            bindings.push((name.clone(), binding.argument));
+        }
+        for (index, field) in fields.iter().enumerate() {
+            if let Some(name) = field.name.strip_prefix('@')
+                && !bindings
+                    .iter()
+                    .any(|(bound, argument)| bound == name && *argument == index)
+            {
+                return Err(FormatError(format!(
+                    "missing argument binding for {name:?}"
+                )));
             }
         }
-        for (position, reference) in message.refs.iter().enumerate() {
-            let (name, pointer) = reference.iter().next().expect("validated reference");
-            let key = format!("{RELATION_PREFIX}{name}");
-            let definition = message
-                .defs
-                .get(&key)
-                .or_else(|| self.relations.get(name))
-                .ok_or_else(|| FormatError(format!("unknown relation {name:?}")))?;
-            let index = argument_index(pointer)?;
-            let value = match (&definition.value_type, &message.args[index]) {
-                (RelationType::String, Argument::String(value)) => value,
-                _ => {
-                    return Err(FormatError(format!(
-                        "attribute {name:?} requires a string argument"
-                    )));
+        Ok(Self {
+            template: template.clone(),
+            parts,
+            bindings,
+        })
+    }
+
+    fn render(&self, args: &[Argument]) -> Result<String, FormatError> {
+        let count = self
+            .parts
+            .iter()
+            .filter(|part| matches!(part, Part::Field(_)))
+            .count();
+        if count != args.len() {
+            return Err(FormatError(format!(
+                "format has {count} placeholders but record has {} arguments",
+                args.len()
+            )));
+        }
+        let mut arguments = args.iter();
+        let mut output = String::new();
+        for part in &self.parts {
+            match part {
+                Part::Literal(text) => output.push_str(text),
+                Part::Field(field) => {
+                    match (field.spec, arguments.next().expect("validated count")) {
+                        (Spec::String, Argument::String(value)) => output.push_str(value),
+                        (
+                            Spec::Hex {
+                                alternate,
+                                zero_pad,
+                                width,
+                            },
+                            Argument::Unsigned(value),
+                        ) => {
+                            let text = match (alternate, zero_pad) {
+                                (true, true) => format!("{value:#0width$x}"),
+                                (true, false) => format!("{value:#width$x}"),
+                                (false, true) => format!("{value:0width$x}"),
+                                (false, false) => format!("{value:width$x}"),
+                            };
+                            output.push_str(&text);
+                        }
+                        _ => {
+                            return Err(FormatError(format!(
+                                "argument {} must be {}",
+                                field.name,
+                                if field.spec == Spec::String {
+                                    "a string"
+                                } else {
+                                    "an unsigned integer"
+                                }
+                            )));
+                        }
+                    }
                 }
+            }
+        }
+        for (position, (name, index)) in self.bindings.iter().enumerate() {
+            let Argument::String(value) = &args[*index] else {
+                unreachable!("binding and argument types were validated");
             };
             output.push_str(if position == 0 { "\n" } else { ", " });
             output.extend(name.escape_debug());
             output.push_str(" = ");
             output.extend(value.escape_debug());
         }
+        Ok(output)
+    }
+}
+
+fn statement_id(key: &str) -> Result<u64, FormatError> {
+    let suffix = key.strip_prefix(STATEMENT_PREFIX).unwrap_or("");
+    let id = suffix.parse::<u64>().ok().filter(|id| *id != 0);
+    if suffix.starts_with('0') || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(FormatError(format!("invalid statement identity {key:?}")));
+    }
+    id.ok_or_else(|| FormatError(format!("invalid statement identity {key:?}")))
+}
+
+/// Compiles each statement once and binds its parameters to each event's arguments.
+#[derive(Default)]
+pub struct Renderer {
+    relations: BTreeMap<String, RelationDefinition>,
+    statements: BTreeMap<u64, CompiledStatement>,
+}
+
+impl Renderer {
+    /// Invalid records never change the definition tables.
+    pub fn render(&mut self, message: &Message) -> Result<String, FormatError> {
+        let id = message
+            .attrs
+            .get("log.statement")
+            .copied()
+            .filter(|id| *id != 0 && message.attrs.len() == 1)
+            .ok_or_else(|| {
+                FormatError(
+                    "event attrs must contain only a nonzero log.statement reference".into(),
+                )
+            })?;
+        let mut relations = BTreeMap::new();
         for (key, definition) in &message.defs {
-            let name = relation_name(key)?;
-            if !self.relations.contains_key(name) {
-                self.relations.insert(name.into(), definition.clone());
+            if let Some(name) = key.strip_prefix(RELATION_PREFIX) {
+                let Definition::Relation(definition) = definition else {
+                    return Err(FormatError(format!(
+                        "expected relation definition for {key:?}"
+                    )));
+                };
+                if name == "log.statement" {
+                    if definition.kind != RelationKind::Entity
+                        || definition.value_type != RelationType::Object
+                        || !definition.anonymous
+                    {
+                        return Err(FormatError(
+                            "log.statement must describe anonymous object entities".into(),
+                        ));
+                    }
+                } else {
+                    validate_attribute_name(name)?;
+                    if definition.kind != RelationKind::Attribute
+                        || definition.value_type != RelationType::String
+                        || definition.anonymous
+                    {
+                        return Err(FormatError(format!("unsupported relation {name:?}")));
+                    }
+                }
+                if let Some(existing) = self.relations.get(name) {
+                    if existing != definition {
+                        return Err(FormatError(format!("conflicting definition for {name:?}")));
+                    }
+                } else {
+                    relations.insert(name.to_string(), definition.clone());
+                }
+            } else if !key.starts_with(STATEMENT_PREFIX) {
+                return Err(FormatError(format!("unsupported definition {key:?}")));
             }
         }
+        let relation = |name: &str| relations.get(name).or_else(|| self.relations.get(name));
+        if relation("log.statement").is_none() {
+            return Err(FormatError("unknown relation \"log.statement\"".into()));
+        }
+        let mut statements = BTreeMap::new();
+        for (key, definition) in &message.defs {
+            if key.starts_with(STATEMENT_PREFIX) {
+                let statement_id = statement_id(key)?;
+                let Definition::Statement(template) = definition else {
+                    return Err(FormatError(format!(
+                        "expected statement template for {key:?}"
+                    )));
+                };
+                if let Some(existing) = self.statements.get(&statement_id) {
+                    if &existing.template != template {
+                        return Err(FormatError(format!("conflicting statement {statement_id}")));
+                    }
+                } else {
+                    statements.insert(
+                        statement_id,
+                        CompiledStatement::compile(template, relation)?,
+                    );
+                }
+            }
+        }
+        let statement = statements
+            .get(&id)
+            .or_else(|| self.statements.get(&id))
+            .ok_or_else(|| FormatError(format!("unknown statement {id}")))?;
+        let output = statement.render(&message.args)?;
+        self.relations.extend(relations);
+        self.statements.extend(statements);
         Ok(output)
     }
 }

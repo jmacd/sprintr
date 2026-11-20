@@ -98,10 +98,11 @@ discussed below, we will have to add columns to the OTAP logs
 representation, and for now we are embedding our new fields within
 the structure of the LogRecord body field.
 
-Each callsite is represented by an anonymous `log.callsite` entity
-containing its message format, argument metadata, and source file and
-line information. Its definition can be generated with the source code.
-Log events reference the callsite and supply argument values, allowing
+Each callsite is represented by an anonymous `log.statement` entity
+containing its message format and static argument bindings. Source file,
+line information, and static severity can be added there as well.
+Its value is pre-encoded with the source code.
+Log events reference the statement and supply argument values, allowing
 the recorded format to be reused when recovering formatted messages.
 
 ## Relations
@@ -134,7 +135,8 @@ entities. These concepts are themselves described by `log.relation`.
 
 ## Attributes
 
-Attributes may be registered at runtime, as in the prototype below.
+The prototype declares attributes statically, as shown below, so their
+metadata and the statements using them can be pre-encoded at build time.
 For shared definitions, the intended schema-driven path uses OpenTelemetry
 Weaver semantic definition files. In this case, the attributes specify the structured argument
 type that will be encoded for the attribute, along with the attribute
@@ -300,8 +302,8 @@ the value will appear as a reference like `{ "$ref":
 "<record_id>#/defs/my_thing:thing_name" }`, in addition to being
 defined at least once.
 
-The `refs` section of the body is an array of single-entry maps of
-the form `{ "<attribute-or-entity-name>": "<fragment>" }`. Each entry
+The `refs` section of the body is an array of single-entry maps.
+Ordinary references have the form `{ "<attribute-or-entity-name>": "<fragment>" }`. Each entry
 associates a name with the location of its value in the containing
 record's `args` or `defs`, including nested values. Since these values
 are always reference fragments, no `$ref` wrapper is needed. For example, an anonymous entity
@@ -330,8 +332,11 @@ and positional arguments. For example, when a log statement uses a
 The same `refs` association labels a primitive argument, such as
 `{ "account.name": "#/args/0" }` for a string. The list preserves multiple
 associations using the same name; it is not a map keyed by attribute name.
-An event-attributes section is reserved for non-positional labels such as
-severity, and is not part of the current prototype.
+Event `attrs` holds non-positional associations, including the reference to
+`log.statement`. Static severity will belong to the statement's `attrs`.
+Within statement templates, positional associations use explicit parameter
+bindings instead: `{ "account.name": { "$arg": 0 } }`. These bindings are
+instantiated for each event, not resolved against the template definition.
 
 ## Definitions
 
@@ -420,9 +425,12 @@ A qualified reference has the form `<record_id>#/<pointer-path>`:
 the record identifier selects a record in the global collection, and
 the pointer selects a node within its body. The URI representation of
 record identifiers remains to be specified. A fragment-only reference
-implicitly selects the containing record. Entries in `refs` use local
+implicitly selects the containing record. Ordinary entries in `refs` use local
 fragments targeting `args` or `defs`; inline `$ref` values may also
-identify targets in other records.
+identify targets in other records. A statement's `{ "$arg": n }` binding
+is a distinct template parameter, not a JSON Pointer. It associates a name
+with argument `n` of each event using the template. The resulting graph
+edges connect to event argument values, never to nonexistent template arguments.
 
 Log records collectively describe a directed graph. Loading resolves
 reference targets into graph edges, preserving shared nodes and cycles
@@ -479,7 +487,7 @@ scopes.
 
 Threads are entities described by the `log.thread` relation. A thread
 instance records its details and is distinct from the definition of its
-entity type. Callsites are anonymous `log.callsite` entities; stack
+entity type. Callsites are anonymous `log.statement` entities; stack
 frames are entities, and callstacks are composed of references to frame
 entities. Each concept is described through a relation rooted in
 `log.relation`. Placement of this context in OTel resources is deferred.
@@ -523,6 +531,10 @@ format and mapping to OpenTelemetry tracing are left open; the design
 principle is to express the relationship using ordinary log references.
 
 ## First milestone: message format and arguments
+
+This section records the initial slice before statement deduplication.
+The current wire format is described in the statement-template extension
+below; the initial per-record `msg` format is no longer emitted or accepted.
 
 Start with JSON Lines recording and plain-text playback of a message
 format and its positional arguments. Each line contains only `msg`
@@ -593,52 +605,70 @@ later goal: it will preserve a conjunction of entity/attribute pairs
 while pivoting between chronological and frequency-based views of the
 matching records. Those features are outside this first milestone.
 
-## Registered-attribute extension
+## Static attributes and statement-template extension
 
-The next slice registers one string attribute and associates it with a
-message argument. Registration emits no record:
+The next slice declares a string attribute statically and pre-encodes a
+statement template with its canonical name. Declaration emits no record:
 
 ```rust
-use slogr_prototype::{info, register_attribute};
+use slogr_prototype::{Attribute, attribute, info};
 
-let acct_name = register_attribute("account.name", "Account name")?;
-let name = "Ada";
+static ACCT_NAME: Attribute = attribute!("account.name", "Account name");
 let value = 42u32;
-info!("hello {}, value {value:04x}", acct_name = name)?;
+for name in ["Ada", "Grace"] {
+    info!("hello {}, value {value:04x}", ACCT_NAME = name)?;
+}
 ```
 
-The handle specifies the argument type, allowing a bare `{}`. `acct_name`
-is the local source label, while `account.name` is the canonical relation
-name. The first record includes everything needed to interpret it:
+The handle specifies the argument type, allowing a bare `{}`. Attributed
+placeholders use canonical names prefixed with `@`, not Rust variable names.
+Each callsite defines an anonymous `log.statement` entity whose value
+contains only static `attrs`, argument bindings in `refs`, and `msg`:
 
 ```json
-{"msg":"hello {acct_name}, value {value:04x}","args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"}},"refs":[{"account.name":"#/args/0"}]}
+{"attrs":{},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}
 ```
 
-`log.relation:account.name` defines the named attribute under the
-presumed-understood bootstrap relation. The `refs` entry associates it
-with the first positional argument; it is not an event-level attribute
-and introduces no `attrs` section. Rendering produces:
+`log.relation:log.statement` describes anonymous object entities;
+`log.relation:account.name` describes the named string attribute. A template
+contains neither dynamic `args` nor nested `defs`. Static severity will go
+in its `attrs` when supported. The first event bootstraps all required
+definitions; subsequent events only reference the statement:
+
+```json
+{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
+{"attrs":{"log.statement":1},"args":["Grace",42]}
+```
+
+`attrs.log.statement` is a typed reference to `defs["log.statement:1"]`.
+The nonzero integer identity is assigned on first use and is process-local,
+not a globally qualified reference. Each callsite has its own identity,
+even when its template is equal to another's. Rendering produces:
 
 ```text
 hello Ada, value 002a
 account.name = Ada
+hello Grace, value 002a
+account.name = Grace
 ```
 
-Definitions are immutable and process-wide. Identical registrations
-reuse cached definition bytes; conflicts fail. Each logger emits a
-definition on its first successful use, then emits only `refs` on later
-uses. Stdout keeps this bookkeeping per thread, allowing equal repeated
-definitions across threads without a producer-side registry lock.
-Registration and first-use bookkeeping may allocate; repeated recording
-must preserve the zero-allocation steady-state target.
+Definitions are immutable and process-wide. Equal static declarations may
+appear in multiple modules; first-use validation rejects conflicts across
+compilation units. Static attribute and statement values are encoded during
+compilation, not lazily encoded on the first event. Runtime work assigns
+statement identities and tracks which definitions each output has accepted.
+Stdout keeps this bookkeeping per thread, allowing equal repeated definitions
+across threads. First-use bookkeeping may allocate, even with stack-backed
+storage; subsequent recording must preserve the zero-allocation target and
+does not lock the schema registry.
 
-The reader retains definitions across records and rejects conflicting or
-missing definitions, invalid argument pointers, and type mismatches.
-Owned `message!` snapshots include all their definitions and can render
-independently. This extension supports string attributes and local
-`#/args/<index>` references only; generic entities and graph navigation
-remain unimplemented.
+The reader compiles templates once into formatting operations and argument
+bindings. It applies them to each event without copying an expanded record.
+Missing or conflicting definitions, invalid bindings, and type mismatches
+are errors. Owned `message!` snapshots include their definitions and render
+independently. The current extension supports string attributes, statement
+entities, and `$arg` bindings only; generic entities, JSON Pointer graph
+linking, severity, and graph navigation remain future work.
 
 ## Additional context
 

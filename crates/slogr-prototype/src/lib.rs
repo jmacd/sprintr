@@ -11,24 +11,45 @@ use std::io::{self, BufRead, Write};
 
 mod attribute;
 pub mod buffer;
+mod statement;
 
-use attribute::AttributeBinding;
 use buffer::{HeapBuffer, RecordBuffer};
 use slogr_message::BorrowedArgument;
+use statement::Statement;
 
-pub use attribute::{Attribute, register_attribute};
+pub use attribute::Attribute;
 pub use slogr_message::{
-    Argument, Message, RelationDefinition, RelationKind, RelationType, Renderer,
-    format::FormatError,
+    Argument, ArgumentBinding, Definition, Message, RelationDefinition, RelationKind, RelationType,
+    Renderer, StatementTemplate, format::FormatError,
 };
 
 #[doc(hidden)]
-pub use slogr_prototype_macros::{info as __info, message as __message};
+pub use slogr_prototype_macros::{attribute as __attribute, info as __info, message as __message};
+
+/// Declare a string attribute with compile-time-encoded metadata.
+///
+/// ```
+/// use slogr_prototype::{Attribute, attribute, message};
+/// static ACCOUNT: Attribute = attribute!("account.name", "Account name");
+/// assert_eq!(message!("{}", ACCOUNT = "Ada").render().unwrap(), "Ada\naccount.name = Ada");
+/// ```
+///
+/// Scenario: a name cannot be represented in a canonical attribute placeholder.
+/// Guarantees: invalid static names fail at compilation.
+/// ```compile_fail
+/// static BAD: slogr_prototype::Attribute = slogr_prototype::attribute!("bad:name", "Invalid");
+/// ```
+#[macro_export]
+macro_rules! attribute {
+    ($($input:tt)*) => { $crate::__attribute!($crate; $($input)*) };
+}
 
 /// Capture owned arguments without writing or preformatting them.
 ///
 /// This convenience API allocates an owned snapshot. Use [`info!`] to encode
 /// borrowed arguments directly without constructing this intermediate value.
+/// Conflicting static declarations panic on this infallible convenience path;
+/// [`info!`] returns the error instead.
 ///
 /// ```rust
 /// use slogr_prototype::message;
@@ -86,8 +107,15 @@ pub use slogr_prototype_macros::{info as __info, message as __message};
 /// Scenario: a string attribute is associated with a number.
 /// Guarantees: its declared string type is enforced even with an untyped placeholder.
 /// ```compile_fail
-/// let account = slogr_prototype::register_attribute("account.name", "Account name").unwrap();
-/// slogr_prototype::message!("{}", account = 42u32);
+/// static ACCOUNT: slogr_prototype::Attribute = slogr_prototype::attribute!("account.name", "Account name");
+/// slogr_prototype::message!("{}", ACCOUNT = 42u32);
+/// ```
+///
+/// Scenario: a local attribute value would make a statement depend on runtime bindings.
+/// Guarantees: statement metadata must be statically declared.
+/// ```compile_fail
+/// let account = slogr_prototype::attribute!("account.name", "Account name");
+/// slogr_prototype::message!("{}", account = "Ada");
 /// ```
 ///
 /// Scenario: the source requests a format outside the prototype subset.
@@ -113,10 +141,8 @@ macro_rules! message {
 /// let name = "Ada";
 /// let value = 42u32;
 /// info!("hello {name:s}, value {value:04x}", logger: logger)?;
-/// assert_eq!(
-///     String::from_utf8(logger.into_inner()).unwrap(),
-///     "{\"msg\":\"hello {name}, value {value:04x}\",\"args\":[\"Ada\",42]}\n"
-/// );
+/// let record: slogr_prototype::Message = serde_json::from_slice(&logger.into_inner())?;
+/// assert_eq!(record.render().unwrap(), "hello Ada, value 002a");
 /// # Ok::<(), std::io::Error>(())
 /// ```
 ///
@@ -135,7 +161,7 @@ macro_rules! info {
 pub struct Logger<W, B = HeapBuffer> {
     writer: W,
     buffer: B,
-    definitions: HashSet<usize>,
+    definitions: StreamState,
 }
 
 impl<W: Write> Logger<W> {
@@ -151,14 +177,14 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
         Self {
             writer,
             buffer,
-            definitions: HashSet::new(),
+            definitions: StreamState::default(),
         }
     }
 
     /// Validate and encode an owned message before writing it.
     ///
-    /// This path parses the format at runtime; [`info!`] bypasses that work
-    /// using compile-time-validated metadata.
+    /// The snapshot must contain its required definitions. This path validates
+    /// at runtime; [`info!`] bypasses that work using compile-time metadata.
     /// An I/O failure can still leave a partially written line in the sink.
     pub fn write(&mut self, message: &Message) -> io::Result<()> {
         message
@@ -176,19 +202,19 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
     #[doc(hidden)]
     pub fn __write_compiled(
         &mut self,
-        prefix: &'static [u8],
+        statement: &'static Statement,
         arguments: &[BorrowedArgument<'_>],
-        bindings: &[AttributeBinding<'_>],
     ) -> io::Result<()> {
+        let id = statement.id()?;
         encode_compiled(
             &mut self.buffer,
-            prefix,
+            statement,
+            id,
             arguments,
-            bindings,
             &self.definitions,
         )?;
         self.writer.write_all(self.buffer.as_slice())?;
-        mark_emitted(&mut self.definitions, bindings);
+        self.definitions.mark_emitted(statement, id);
         Ok(())
     }
 
@@ -203,60 +229,53 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
     }
 }
 
+#[derive(Default)]
+struct StreamState {
+    statements: HashSet<u64>,
+    attributes: HashSet<&'static str>,
+}
+
+impl StreamState {
+    fn mark_emitted(&mut self, statement: &Statement, id: u64) {
+        if !self.statements.contains(&id) {
+            self.statements.insert(id);
+            for attribute in statement.attributes {
+                self.attributes.insert(attribute.name);
+            }
+        }
+    }
+}
+
 fn encode_compiled(
     buffer: &mut impl RecordBuffer,
-    prefix: &'static [u8],
+    statement: &Statement,
+    id: u64,
     arguments: &[BorrowedArgument<'_>],
-    bindings: &[AttributeBinding<'_>],
-    definitions: &HashSet<usize>,
+    definitions: &StreamState,
 ) -> io::Result<()> {
     buffer.clear();
     buffer.try_atomic(|buffer| {
-        buffer.write_all(prefix)?;
+        write!(buffer, "{{\"attrs\":{{\"log.statement\":{id}}},\"args\":")?;
         serde_json::to_writer(&mut *buffer, arguments).map_err(json_error)?;
-        let mut wrote_definition = false;
-        for (index, binding) in bindings.iter().enumerate() {
-            let relation = &binding.attribute.relation;
-            if !definitions.contains(&relation.id)
-                && !bindings[..index]
-                    .iter()
-                    .any(|previous| previous.attribute.relation.id == relation.id)
-            {
-                buffer.write_all(if wrote_definition {
-                    b","
-                } else {
-                    b",\"defs\":{"
-                })?;
-                buffer.write_all(&relation.encoded_definition)?;
-                wrote_definition = true;
+        if !definitions.statements.contains(&id) {
+            buffer.write_all(b",\"defs\":{")?;
+            if definitions.statements.is_empty() {
+                buffer.write_all(b"\"log.relation:log.statement\":{\"kind\":\"entity\",\"type\":\"object\",\"desc\":\"Logging statement\",\"anonymous\":true},")?;
             }
-        }
-        if wrote_definition {
-            buffer.write_all(b"}")?;
-        }
-        if !bindings.is_empty() {
-            buffer.write_all(b",\"refs\":[")?;
-            for (index, binding) in bindings.iter().enumerate() {
-                if index > 0 {
+            for (index, attribute) in statement.attributes.iter().enumerate() {
+                if !definitions.attributes.contains(attribute.name)
+                    && !statement.attributes[..index].iter().any(|previous| previous.name == attribute.name)
+                {
+                    buffer.write_all(attribute.encoded_definition)?;
                     buffer.write_all(b",")?;
                 }
-                buffer.write_all(&binding.attribute.relation.reference_prefix)?;
-                write!(buffer, "{}", binding.argument)?;
-                buffer.write_all(b"\"}")?;
             }
-            buffer.write_all(b"]")?;
+            write!(buffer, "\"log.statement:{id}\":")?;
+            buffer.write_all(statement.encoded)?;
+            buffer.write_all(b"}")?;
         }
         buffer.write_all(b"}\n")
     })
-}
-
-fn mark_emitted(definitions: &mut HashSet<usize>, bindings: &[AttributeBinding<'_>]) {
-    for binding in bindings {
-        let id = binding.attribute.relation.id;
-        if !definitions.contains(&id) {
-            definitions.insert(id);
-        }
-    }
 }
 
 fn json_error(error: serde_json::Error) -> io::Error {
@@ -295,17 +314,16 @@ pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
 
 #[doc(hidden)]
 pub mod __private {
-    use super::{HeapBuffer, RecordBuffer, encode_compiled, mark_emitted};
-    pub use crate::attribute::{AttributeBinding, owned_message};
+    use super::{HeapBuffer, RecordBuffer, StreamState, encode_compiled};
+    pub use crate::statement::{Statement, concatenate, encoded_len, owned_message};
     pub use slogr_message::BorrowedArgument;
     use std::cell::RefCell;
-    use std::collections::HashSet;
     use std::io::{self, Write};
 
     #[derive(Default)]
     struct StdoutState {
         buffer: HeapBuffer,
-        definitions: HashSet<usize>,
+        definitions: StreamState,
     }
 
     thread_local! {
@@ -346,10 +364,10 @@ pub mod __private {
     }
 
     pub fn write_stdout(
-        prefix: &'static [u8],
+        statement: &'static Statement,
         arguments: &[BorrowedArgument<'_>],
-        bindings: &[AttributeBinding<'_>],
     ) -> io::Result<()> {
+        let id = statement.id()?;
         STDOUT_STATE
             .try_with(|state| {
                 let mut state = state
@@ -359,9 +377,9 @@ pub mod __private {
                     buffer,
                     definitions,
                 } = &mut *state;
-                encode_compiled(buffer, prefix, arguments, bindings, definitions)?;
+                encode_compiled(buffer, statement, id, arguments, definitions)?;
                 io::stdout().lock().write_all(buffer.as_slice())?;
-                mark_emitted(definitions, bindings);
+                definitions.mark_emitted(statement, id);
                 Ok(())
             })
             .map_err(|_| io::Error::other("stdout encoding buffer is unavailable"))?

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use proc_macro::TokenStream;
+use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{ToTokens, quote};
 use slogr_message::format::{Part, Spec, parse};
+use slogr_message::{RelationDefinition, RelationKind, RelationType, validate_attribute_name};
 use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, LitByteStr, LitStr, Path, Token, parse_macro_input};
 
@@ -51,49 +53,115 @@ impl Parse for Input {
     }
 }
 
+struct AttributeInput {
+    root: Path,
+    name: LitStr,
+    description: LitStr,
+}
+
+impl Parse for AttributeInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let root = input.parse()?;
+        input.parse::<Token![;]>()?;
+        let name = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let description = input.parse()?;
+        if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+        }
+        Ok(Self {
+            root,
+            name,
+            description,
+        })
+    }
+}
+
+fn bytes(text: &str, span: Span) -> LitByteStr {
+    LitByteStr::new(text.as_bytes(), span)
+}
+
+fn json_content(text: &str, span: Span) -> LitByteStr {
+    let encoded = serde_json::to_string(text).expect("string JSON encoding");
+    bytes(&encoded[1..encoded.len() - 1], span)
+}
+
+/// Pre-encode an immutable, statically declared string attribute.
+#[proc_macro]
+pub fn attribute(input: TokenStream) -> TokenStream {
+    let AttributeInput {
+        root,
+        name,
+        description,
+    } = parse_macro_input!(input as AttributeInput);
+    if let Err(error) = validate_attribute_name(&name.value()) {
+        return syn::Error::new(name.span(), error)
+            .into_compile_error()
+            .into();
+    }
+    let key = serde_json::to_string(&format!("log.relation:{}", name.value()))
+        .expect("string JSON encoding");
+    let definition = RelationDefinition {
+        kind: RelationKind::Attribute,
+        value_type: RelationType::String,
+        desc: description.value(),
+        anonymous: false,
+    };
+    let definition = bytes(
+        &format!(
+            "{key}:{}",
+            serde_json::to_string(&definition).expect("relation JSON encoding")
+        ),
+        name.span(),
+    );
+    let label = json_content(&format!("@{}", name.value()), name.span());
+    let reference = bytes(
+        &format!(
+            "{{{}:{{\"$arg\":",
+            serde_json::to_string(&name.value()).expect("string JSON encoding")
+        ),
+        name.span(),
+    );
+    quote! { #root::Attribute::__new(#name, #description, #definition, #label, #reference) }.into()
+}
+
 struct Compiled {
-    format: LitStr,
-    prefix: LitByteStr,
-    owned: Vec<proc_macro2::TokenStream>,
-    borrowed: Vec<proc_macro2::TokenStream>,
-    bindings: Vec<proc_macro2::TokenStream>,
+    declaration: Tokens,
+    owned: Vec<Tokens>,
+    borrowed: Vec<Tokens>,
 }
 
 fn compile(input: &Input) -> syn::Result<Compiled> {
     let root = &input.root;
-    let error = |message| syn::Error::new(input.format.span(), message);
-    let parts = parse(&input.format.value()).map_err(|err| error(err.to_string()))?;
+    let span = input.format.span();
+    let error = |message: &str| syn::Error::new(span, message);
+    let parts = parse(&input.format.value()).map_err(|err| error(&err.to_string()))?;
     let mut arguments = input.arguments.iter();
     let mut owned = Vec::new();
     let mut borrowed = Vec::new();
-    let mut bindings = Vec::new();
-    let mut stored = String::new();
+    let mut attributes = Vec::new();
+    let mut message = Vec::new();
+    let mut references = Vec::new();
     for part in parts {
         match part {
             Part::Literal(text) => {
-                stored.push_str(&text.replace('{', "{{").replace('}', "}}"));
+                let literal = json_content(&text.replace('{', "{{").replace('}', "}}"), span);
+                message.push(quote!(#literal));
             }
             Part::Field(field) => {
                 let (label, expression, attribute) = if field.name.is_empty() {
                     let expression = arguments
                         .next()
-                        .ok_or_else(|| error("missing positional argument".into()))?;
+                        .ok_or_else(|| error("missing positional argument"))?;
                     if let Expr::Assign(assignment) = expression {
                         let Expr::Path(attribute) = assignment.left.as_ref() else {
                             return Err(syn::Error::new_spanned(
                                 &assignment.left,
-                                "expected a registered attribute handle",
+                                "expected a static attribute path",
                             ));
                         };
-                        let label = attribute
-                            .path
-                            .segments
-                            .last()
-                            .expect("attribute path")
-                            .ident
-                            .to_string();
                         let value = &assignment.right;
-                        (label, quote!(#value), Some(quote!(#attribute)))
+                        (String::new(), quote!(#value), Some(quote!(#attribute)))
                     } else {
                         let label = expression.to_token_stream().to_string();
                         if label.contains(['{', '}', ':']) {
@@ -105,64 +173,46 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
                         (label, quote!(#expression), None)
                     }
                 } else {
-                    let mut ident = syn::parse_str::<Ident>(&field.name).map_err(|_| {
-                        error("captured placeholders must name a local variable".into())
-                    })?;
-                    ident.set_span(input.format.span());
+                    let mut ident = syn::parse_str::<Ident>(&field.name)
+                        .map_err(|_| error("captured placeholders must name a local variable"))?;
+                    ident.set_span(span);
                     (field.name, quote!(#ident), None)
                 };
                 if field.format.is_empty() && attribute.is_none() {
-                    return Err(error(
-                        "use :s for strings or :x for unsigned integers".into(),
-                    ));
+                    return Err(error("use :s for strings or :x for unsigned integers"));
                 }
                 if attribute.is_some() && field.spec != Spec::String {
-                    return Err(error(
-                        "registered string attributes require {} or {:s}".into(),
-                    ));
+                    return Err(error("static string attributes require {} or {:s}"));
                 }
                 let string_value = if let Some(attribute) = &attribute {
-                    let argument = owned.len();
-                    bindings.push(quote! {
-                        #root::__private::AttributeBinding {
-                            attribute: &(#attribute),
-                            argument: #argument,
-                        }
-                    });
-                    quote! { (#attribute).__value(&(#expression)) }
+                    if !attributes.is_empty() {
+                        references.push(quote!(b","));
+                    }
+                    let index = bytes(&format!("{}}}}}", owned.len()), span);
+                    references.push(quote!((#attribute).__reference_prefix()));
+                    references.push(quote!(#index));
+                    attributes.push(quote!(&(#attribute)));
+                    message.push(quote!(b"{"));
+                    message.push(quote!((#attribute).__format_name()));
+                    message.push(quote!(b"}"));
+                    quote!((#attribute).__value(&(#expression)))
                 } else {
-                    quote! { ::core::convert::AsRef::<str>::as_ref(&(#expression)) }
+                    let suffix = if field.spec == Spec::String {
+                        String::new()
+                    } else {
+                        format!(":{}", field.format)
+                    };
+                    let label = json_content(&format!("{{{label}{suffix}}}"), span);
+                    message.push(quote!(#label));
+                    quote!(::core::convert::AsRef::<str>::as_ref(&(#expression)))
                 };
-                stored.push('{');
-                stored.push_str(&label);
-                if field.spec != Spec::String {
-                    stored.push(':');
-                    stored.push_str(&field.format);
-                }
-                stored.push('}');
                 owned.push(match field.spec {
-                    Spec::String => quote! {
-                        #root::Argument::String(
-                            ::std::string::String::from(
-                                #string_value
-                            )
-                        )
-                    },
-                    Spec::Hex { .. } => quote! {
-                        #root::Argument::Unsigned(#root::__private::unsigned(&(#expression)))
-                    },
+                    Spec::String => quote!(#root::Argument::String(::std::string::String::from(#string_value))),
+                    Spec::Hex { .. } => quote!(#root::Argument::Unsigned(#root::__private::unsigned(&(#expression)))),
                 });
                 borrowed.push(match field.spec {
-                    Spec::String => quote! {
-                        #root::__private::BorrowedArgument::String(
-                            #string_value
-                        )
-                    },
-                    Spec::Hex { .. } => quote! {
-                        #root::__private::BorrowedArgument::Unsigned(
-                            #root::__private::unsigned(&(#expression))
-                        )
-                    },
+                    Spec::String => quote!(#root::__private::BorrowedArgument::String(#string_value)),
+                    Spec::Hex { .. } => quote!(#root::__private::BorrowedArgument::Unsigned(#root::__private::unsigned(&(#expression)))),
                 });
             }
         }
@@ -170,18 +220,22 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
     if let Some(extra) = arguments.next() {
         return Err(syn::Error::new_spanned(extra, "unused positional argument"));
     }
-    let json = serde_json::to_string(&stored).map_err(|err| error(err.to_string()))?;
-    let prefix = format!("{{\"msg\":{json},\"args\":");
+    let declaration = quote! {
+        const __PARTS: &[&[u8]] = &[
+            b"{\"attrs\":{},\"refs\":[", #(#references,)* b"],\"msg\":\"", #(#message,)* b"\"}",
+        ];
+        static __ENCODED: [u8; #root::__private::encoded_len(__PARTS)] =
+            #root::__private::concatenate(__PARTS);
+        static __STATEMENT: #root::__private::Statement =
+            #root::__private::Statement::new(&__ENCODED, &[#(#attributes),*]);
+    };
     Ok(Compiled {
-        format: LitStr::new(&stored, input.format.span()),
-        prefix: LitByteStr::new(prefix.as_bytes(), input.format.span()),
+        declaration,
         owned,
         borrowed,
-        bindings,
     })
 }
 
-/// Internal entry point; use the public wrapper in `slogr-prototype`.
 #[proc_macro]
 pub fn message(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as Input);
@@ -193,33 +247,30 @@ pub fn message(input: TokenStream) -> TokenStream {
     } else {
         compile(&input).map(|compiled| {
             let root = &input.root;
-            let format = compiled.format;
+            let declaration = compiled.declaration;
             let arguments = compiled.owned;
-            let bindings = compiled.bindings;
-            quote! {
-                #root::__private::owned_message(
-                    #format, ::std::vec![#(#arguments),*], &[#(#bindings),*],
-                )
-            }
+            quote! {{
+                #declaration
+                #root::__private::owned_message(&__STATEMENT, ::std::vec![#(#arguments),*])
+            }}
         })
     };
     result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
-/// Internal entry point; use the public wrapper in `slogr-prototype`.
 #[proc_macro]
 pub fn info(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as Input);
     let result = compile(&input).map(|compiled| {
-        let prefix = compiled.prefix;
+        let declaration = compiled.declaration;
         let arguments = compiled.borrowed;
-        let bindings = compiled.bindings;
-        if let Some(logger) = input.logger {
-            quote! { (#logger).__write_compiled(#prefix, &[#(#arguments),*], &[#(#bindings),*]) }
+        let call = if let Some(logger) = input.logger {
+            quote!((#logger).__write_compiled(&__STATEMENT, &[#(#arguments),*]))
         } else {
             let root = input.root;
-            quote! { #root::__private::write_stdout(#prefix, &[#(#arguments),*], &[#(#bindings),*]) }
-        }
+            quote!(#root::__private::write_stdout(&__STATEMENT, &[#(#arguments),*]))
+        };
+        quote! {{ #declaration #call }}
     });
     result.unwrap_or_else(syn::Error::into_compile_error).into()
 }

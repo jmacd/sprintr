@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use slogr_prototype::buffer::{HeapBuffer, RecordBuffer, StackBuffer};
-use slogr_prototype::{Argument, Logger, Message, info, message, replay};
+use slogr_prototype::{
+    Argument, Definition, Logger, Message, StatementTemplate, info, message, replay,
+};
 use std::cell::Cell;
 use std::io::{self, Write};
+
+fn template(record: &Message) -> &StatementTemplate {
+    let key = format!("log.statement:{}", record.attrs["log.statement"]);
+    let Definition::Statement(template) = &record.defs[&key] else {
+        panic!("statement definition")
+    };
+    template
+}
 
 /// Scenario: explicit positional expressions and implicit captures describe the same message.
 /// Guarantees: the documented JSON retains native values and playback needs no source or tracing.
@@ -16,13 +26,18 @@ fn positional_and_captured_roundtrip() {
     info!("hello {name:s}, value {value:04x}", logger: logger).unwrap();
     logger.flush().unwrap();
     let encoded = logger.into_inner();
+    let records: Vec<Message> = encoded
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(template(&records[0]), template(&records[1]));
+    assert_eq!(template(&records[0]).msg, "hello {name}, value {value:04x}");
     assert_eq!(
-        String::from_utf8(encoded.clone()).unwrap(),
-        concat!(
-            "{\"msg\":\"hello {name}, value {value:04x}\",\"args\":[\"Ada\",42]}\n",
-            "{\"msg\":\"hello {name}, value {value:04x}\",\"args\":[\"Ada\",42]}\n",
-        )
+        records[0].args,
+        [Argument::String("Ada".into()), Argument::Unsigned(42)]
     );
+    assert_eq!(records[0].args, records[1].args);
     let mut output = Vec::new();
     replay(encoded.as_slice(), &mut output).unwrap();
     assert_eq!(
@@ -84,9 +99,10 @@ fn direct_encoding_matches_owned_encoding() {
     let mut logger = Logger::new(Vec::new());
     info!("line\n{{{text:s}}} {value:#04x}", logger: logger).unwrap();
     let owned = message!("line\n{{{text:s}}} {value:#04x}");
-    let mut expected = serde_json::to_vec(&owned).unwrap();
-    expected.push(b'\n');
-    assert_eq!(logger.into_inner(), expected);
+    let direct: Message = serde_json::from_slice(&logger.into_inner()).unwrap();
+    assert_eq!(direct.args, owned.args);
+    assert_eq!(template(&direct), template(&owned));
+    assert_eq!(direct.render().unwrap(), owned.render().unwrap());
 
     let calls = Cell::new(0);
     let temporary = || {
@@ -126,21 +142,28 @@ fn oversized_records_roll_back_and_allow_reuse() {
 /// Guarantees: limits apply to the complete wire record, including framing.
 #[test]
 fn buffer_limit_includes_record_framing() {
-    const LINE: &[u8] = b"{\"msg\":\"hello\",\"args\":[]}\n";
-    let mut exact = Logger::with_buffer(Vec::new(), StackBuffer::<{ LINE.len() }>::new());
-    info!("hello", logger: exact).unwrap();
-    assert_eq!(exact.into_inner(), LINE);
+    fn emit(logger: &mut Logger<Vec<u8>>) -> io::Result<()> {
+        info!("hello", logger: logger)
+    }
+    let mut sample = Logger::new(Vec::new());
+    emit(&mut sample).unwrap();
+    let line = sample.into_inner();
+    let mut exact = Logger::with_buffer(
+        Vec::new(),
+        HeapBuffer::with_capacity_and_limit(line.len(), line.len()),
+    );
+    emit(&mut exact).unwrap();
+    assert_eq!(exact.into_inner(), line);
 
     let mut short = Logger::with_buffer(
         Vec::new(),
-        HeapBuffer::with_capacity_and_limit(LINE.len(), LINE.len() - 1),
+        HeapBuffer::with_capacity_and_limit(line.len(), line.len() - 1),
     );
     assert_eq!(
-        info!("hello", logger: short).unwrap_err().kind(),
+        emit(&mut short).unwrap_err().kind(),
         io::ErrorKind::StorageFull
     );
-    info!("hi", logger: short).unwrap();
-    assert_eq!(short.into_inner(), b"{\"msg\":\"hi\",\"args\":[]}\n");
+    assert!(short.into_inner().is_empty());
 }
 
 /// Scenario: hex widths, prefixes, and values beyond signed/float exact ranges pass through JSON.
@@ -164,34 +187,41 @@ fn hexadecimal_formatting_matches_rust() {
 /// Guarantees: playback stops with a line-numbered error instead of skipping or coercing data.
 #[test]
 fn invalid_records_fail_loudly() {
-    let cases = [
-        ("not json", "line 2"),
-        ("", "line 2"),
-        (r#"{"msg":"{v:x}","args":[]}"#, "placeholders"),
-        (r#"{"msg":"plain","args":[1]}"#, "placeholders"),
-        (r#"{"msg":"{v:x}","args":["42"]}"#, "unsigned integer"),
-        (r#"{"msg":"{v}","args":[42]}"#, "string"),
-        (r#"{"msg":"{v:x}","args":[-1]}"#, "line 2"),
-        (r#"{"msg":"{v:x}","args":[1.5]}"#, "line 2"),
-        (r#"{"msg":"{v:x}","args":[18446744073709551616]}"#, "line 2"),
-        (r#"{"msg":"{v:x}","args":[null]}"#, "line 2"),
-        (r#"{"msg":"{v:?}","args":["x"]}"#, "unsupported"),
-        (r#"{"msg":"{v:4097x}","args":[1]}"#, "width"),
-        (
-            r#"{"msg":"{v:999999999999999999999999x}","args":[1]}"#,
-            "width",
-        ),
-        (r#"{"msg":"{v:x","args":[1]}"#, "unclosed"),
-        (r#"{"msg":"{v{w:x}","args":[1]}"#, "nested"),
-        (r#"{"msg":"v}","args":[]}"#, "closing brace"),
-        (r#"{"msg":"plain"}"#, "args"),
-        (
-            r#"{"msg":"plain","args":[],"attributes":{}}"#,
-            "unknown field",
-        ),
-    ];
+    let value = 1u64;
+    let base = message!("{value:x}");
+    let key = format!("log.statement:{}", base.attrs["log.statement"]);
+    let base = serde_json::to_value(base).unwrap();
+    let mut cases = vec![("not json".into(), "line 2"), (String::new(), "line 2")];
+    for (format, args, expected) in [
+        ("{v:x}", "[]", "placeholders"),
+        ("plain", "[1]", "placeholders"),
+        ("{v:x}", r#"["42"]"#, "unsigned integer"),
+        ("{v}", "[42]", "string"),
+        ("{v:x}", "[-1]", "line 2"),
+        ("{v:x}", "[1.5]", "line 2"),
+        ("{v:x}", "[18446744073709551616]", "line 2"),
+        ("{v:x}", "[null]", "line 2"),
+        ("{v:?}", r#"["x"]"#, "unsupported"),
+        ("{v:4097x}", "[1]", "width"),
+        ("{v:999999999999999999999999x}", "[1]", "width"),
+        ("{v:x", "[1]", "unclosed"),
+        ("{v{w:x}", "[1]", "nested"),
+        ("v}", "[]", "closing brace"),
+    ] {
+        let mut bad = base.clone();
+        bad["defs"][&key]["msg"] = format.into();
+        bad["args"] = serde_json::from_str(args).unwrap();
+        cases.push((bad.to_string(), expected));
+    }
+    let mut bad = base.clone();
+    bad.as_object_mut().unwrap().remove("args");
+    cases.push((bad.to_string(), "args"));
+    let mut bad = base;
+    bad["attributes"] = serde_json::json!({});
+    cases.push((bad.to_string(), "unknown field"));
+    let first = serde_json::to_string(&message!("first")).unwrap();
     for (invalid, expected) in cases {
-        let input = format!("{{\"msg\":\"first\",\"args\":[]}}\n{invalid}\n");
+        let input = format!("{first}\n{invalid}\n");
         let mut output = Vec::new();
         let error = replay(input.as_bytes(), &mut output).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{invalid}");
@@ -206,11 +236,9 @@ fn invalid_records_fail_loudly() {
 #[test]
 fn writer_validates_before_output() {
     let mut logger = Logger::new(Vec::new());
-    let record = Message {
-        msg: "{value:x}".into(),
-        args: vec![Argument::String("not numeric".into())],
-        ..Message::default()
-    };
+    let value = 1u32;
+    let mut record = message!("{value:x}");
+    record.args[0] = Argument::String("not numeric".into());
     assert_eq!(
         logger.write(&record).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
@@ -246,7 +274,7 @@ fn io_errors_are_returned() {
         io::ErrorKind::BrokenPipe
     );
     assert_eq!(logger.flush().unwrap_err().to_string(), "flush failed");
-    let input = b"{\"msg\":\"hello\",\"args\":[]}\n";
+    let input = serde_json::to_vec(&message!("hello")).unwrap();
     let error = replay(input.as_slice(), FailWriter { fail_write: true }).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     let error = replay(input.as_slice(), FailWriter { fail_write: false }).unwrap_err();
