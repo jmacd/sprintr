@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sprintr_prototype::buffer::{HeapBuffer, StackBuffer};
-use sprintr_prototype::{Attribute, Logger, attribute, info};
+use sprintr_prototype::{Logger, attributes, entities, info};
 use std::hint::black_box;
 use std::io;
 
@@ -29,7 +29,7 @@ fn warmed_heap_recording_does_not_allocate() {
 fn warmed_stack_recording_does_not_allocate() {
     let text = "quoted \"text\"\n\\{braces}\u{03bb}";
     let value = u64::MAX;
-    let mut logger = Logger::with_buffer(io::sink(), StackBuffer::<512>::new());
+    let mut logger = Logger::with_buffer(io::sink(), StackBuffer::<2048>::new());
     let mut emit = || info!("{:s} {:04x}", logger: black_box(&mut logger), text, value).unwrap();
     emit();
     let measured = allocation_counter::measure(|| {
@@ -45,10 +45,14 @@ fn warmed_stack_recording_does_not_allocate() {
 /// Guarantees: parameter binding and statement references allocate nothing on the warm producer path.
 #[test]
 fn repeated_attribute_recording_does_not_allocate() {
-    static ACCOUNT: Attribute = attribute!("account.name", "Account name");
-    let mut logger = Logger::with_buffer(io::sink(), StackBuffer::<1024>::new());
+    attributes! {
+        /// Account name
+        account: str = "account.name";
+    }
+
+    let mut logger = Logger::with_buffer(io::sink(), StackBuffer::<2048>::new());
     let mut emit =
-        |name| info!("hello {}", logger: black_box(&mut logger), ACCOUNT = name).unwrap();
+        |name| info!("hello {}", logger: black_box(&mut logger), account = name).unwrap();
     emit("Ada");
     let measured = allocation_counter::measure(|| {
         for name in ["Grace", "Ada"].into_iter().cycle().take(128) {
@@ -57,4 +61,24 @@ fn repeated_attribute_recording_does_not_allocate() {
     });
     assert_eq!(measured.count_total, 0, "{measured:?}");
     assert_eq!(measured.bytes_total, 0, "{measured:?}");
+}
+
+/// Reusing an entity should format only its address, not serialize the object again.
+#[test]
+fn repeated_entity_reference_does_not_allocate() {
+    entities! {
+        /// Application session
+        #[anonymous]
+        session = "session";
+    }
+    let login = session.new(serde_json::json!({"account": "Ada"})).unwrap();
+    let mut logger = Logger::with_buffer(io::sink(), StackBuffer::<2048>::new());
+    let mut emit = || info!("resumed {login}", logger: black_box(&mut logger)).unwrap();
+    emit();
+    let measured = allocation_counter::measure(|| {
+        for _ in 0..128 {
+            emit();
+        }
+    });
+    assert_eq!(measured.count_total, 0, "{measured:?}");
 }

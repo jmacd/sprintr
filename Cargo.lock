@@ -9,10 +9,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
 
 [[package]]
+name = "gettid"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96d9ea5ee7dc59a2244fa486d8f00472f8d3e4c8c5f7f24a8551559ef3f3530e"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
+
+[[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "linkme"
+version = "0.3.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a4e12fd3f6b22d5bc28beccac0f53bb35db4a897c6ddb709c4a0161f72eb6e"
+dependencies = [
+ "linkme-impl",
+]
+
+[[package]]
+name = "linkme-impl"
+version = "0.3.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cd04c256b1cd686a45898c8fd150c79b801d96a3eb7bae1075f9eb3b4b85c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
 
 [[package]]
 name = "memchr"
@@ -86,6 +121,7 @@ name = "sprintr-message"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -93,6 +129,9 @@ name = "sprintr-prototype"
 version = "0.1.0"
 dependencies = [
  "allocation-counter",
+ "gettid",
+ "linkme",
+ "serde",
  "serde_json",
  "sprintr-message",
  "sprintr-prototype-macros",

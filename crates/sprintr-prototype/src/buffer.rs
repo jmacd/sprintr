@@ -73,7 +73,7 @@ impl HeapBuffer {
 
 impl Default for HeapBuffer {
     fn default() -> Self {
-        Self::with_capacity(256)
+        Self::with_capacity(2048)
     }
 }
 

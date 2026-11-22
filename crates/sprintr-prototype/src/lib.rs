@@ -6,53 +6,125 @@
 
 #![doc = include_str!("../README.md")]
 
-use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 
-mod attribute;
 pub mod buffer;
+mod declare;
+mod entity;
+mod runtime;
+pub mod schema;
 mod statement;
+mod stream;
 
 use buffer::{HeapBuffer, RecordBuffer};
-use sprintr_message::BorrowedArgument;
+use entity::BorrowedArgument;
+use runtime::{Collision, runtime};
 use statement::Statement;
+use stream::StreamState;
 
-pub use attribute::Attribute;
+pub use declare::{Attribute, Entity, Named};
+pub use entity::EntityHandle;
 pub use sprintr_message::{
-    Argument, ArgumentBinding, Definition, Level, Message, NamedEntity, RelationDefinition,
-    RelationKind, RelationType, Renderer, StatementTemplate, format::FormatError,
+    Argument, ArgumentBinding, Definition, Message, RECORD, RELATION, RELATION_PREFIX,
+    RelationDefinition, RelationKind, RelationType, Renderer, STATEMENT, STATEMENT_PREFIX,
+    StatementTemplate, THREAD, format, format::FormatError,
 };
 
 #[doc(hidden)]
 pub use sprintr_prototype_macros::{
-    attribute as __attribute, error as __error, info as __info, message as __message,
-    warn as __warn,
+    attributes as __attributes, entities as __entities, message as __message, record as __record,
 };
 
-/// Declare a string attribute with compile-time-encoded metadata.
+/// Declare attributes. Each doc comment becomes the recorded description.
+///
+/// Values are `str` or `u64`. Handles may be lowercase so that logging calls
+/// read like assignments: `info!("{}", account_name = name)`.
 ///
 /// ```
-/// use sprintr_prototype::{Attribute, attribute, message};
-/// static ACCOUNT: Attribute = attribute!("account.name", "Account name");
-/// assert_eq!(message!("{}", ACCOUNT = "Ada").render().unwrap(), "Ada\naccount.name = Ada");
+/// sprintr_prototype::attributes! {
+///     /// Account name
+///     pub account_name: str = "account.name";
+///     /// Retry attempt
+///     pub retry_count: u64 = "retry.count";
+/// }
+///
+/// use sprintr_prototype::message;
+/// let record = message!("{} try {}", account_name = "Ada", retry_count = 2u8);
+/// assert_eq!(
+///     record.render().unwrap(),
+///     "Ada try 2\naccount.name = Ada, retry.count = 2"
+/// );
 /// ```
+///
+/// Declarations are collected at link time and resolved when logging starts.
+/// Names are process-wide; dots have no scoping meaning. If two declarations
+/// of one name differ, the first keeps it and later ones are recorded under a
+/// content-derived suffix such as `account.name_1a2b3c4d`, reported in-stream
+/// when each output starts. Equal declarations in different crates share a name.
 ///
 /// Scenario: a name cannot be represented in a canonical attribute placeholder.
 /// Guarantees: invalid static names fail at compilation.
 /// ```compile_fail
-/// static BAD: sprintr_prototype::Attribute = sprintr_prototype::attribute!("bad:name", "Invalid");
+/// sprintr_prototype::attributes! {
+///     /// Invalid
+///     bad: str = "bad:name";
+/// }
+/// ```
+///
+/// Scenario: the root relation is redeclared.
+/// Guarantees: `log.relation` defines relations and cannot itself be redefined.
+/// ```compile_fail
+/// sprintr_prototype::attributes! {
+///     /// Invalid
+///     root: str = "log.relation";
+/// }
+/// ```
+///
+/// Scenario: a declaration has no description.
+/// Guarantees: every recorded relation describes itself.
+/// ```compile_fail
+/// sprintr_prototype::attributes! {
+///     account_name: str = "account.name";
+/// }
 /// ```
 #[macro_export]
-macro_rules! attribute {
-    ($($input:tt)*) => { $crate::__attribute!($crate; $($input)*) };
+macro_rules! attributes {
+    ($($input:tt)*) => { $crate::__attributes!($crate; $($input)*); };
+}
+
+/// Declare entity relations and their statically named values.
+///
+/// ```
+/// sprintr_prototype::entities! {
+///     /// Deployment environment
+///     pub environment = "deployment.environment" {
+///         /// Production traffic
+///         PRODUCTION,
+///         /// Pre-production testing
+///         STAGING,
+///     }
+/// }
+///
+/// assert_eq!(environment.name(), "deployment.environment");
+/// assert_eq!(environment::STAGING.description(), "Pre-production testing");
+/// ```
+///
+/// A relation with named values also declares a module of the same name
+/// holding them. `#[anonymous]` relations, such as [`schema::log_statement`],
+/// have no named values. Create a user-defined anonymous object with
+/// `relation.new(value)?` and pass the resulting handle to a `{}` placeholder.
+#[macro_export]
+macro_rules! entities {
+    ($($input:tt)*) => { $crate::__entities!($crate; $($input)*); };
 }
 
 /// Capture owned arguments without writing or preformatting them.
 ///
 /// This convenience API allocates an owned snapshot. Use [`info!`] to encode
 /// borrowed arguments directly without constructing this intermediate value.
-/// Conflicting static declarations panic on this infallible convenience path;
-/// [`info!`] returns the error instead.
+/// The snapshot has no level and includes every definition it needs. Statement
+/// resolution can fail only if identities are exhausted, which panics on this
+/// infallible convenience path; [`info!`] returns the error instead.
 ///
 /// ```rust
 /// use sprintr_prototype::message;
@@ -66,9 +138,11 @@ macro_rules! attribute {
 /// Both implicit local captures and explicit positional expressions work.
 /// Strings require `:s`; unsigned integers use `:x`, optionally with `#`,
 /// zero padding, and a constant width up to 4096. `{{` and `}}` are literals.
-/// Named/numbered argument overrides, debug formatting, and other specifiers
-/// are not supported. Positional expression labels containing braces or
-/// colons must instead be bound to local variables.
+/// A positional `attribute = value` argument associates the placeholder with a
+/// declared attribute, whose type also permits `{}`. Named/numbered argument
+/// overrides, debug formatting, and other specifiers are not supported.
+/// Positional expression labels containing braces or colons must instead be
+/// bound to local variables.
 ///
 /// Scenario: a string capture omits its type designation.
 /// Guarantees: unsupported implicit typing fails at compilation.
@@ -101,24 +175,47 @@ macro_rules! attribute {
 /// sprintr_prototype::message!("hello", "Ada");
 /// ```
 ///
-/// Scenario: an attribute name has not been registered or declared.
+/// Scenario: an attribute has not been declared.
 /// Guarantees: unbound attribute handles are compile errors.
 /// ```compile_fail
 /// sprintr_prototype::message!("{:s}", name = "Ada");
 /// ```
 ///
-/// Scenario: a string attribute is associated with a number.
-/// Guarantees: its declared string type is enforced even with an untyped placeholder.
-/// ```compile_fail
-/// static ACCOUNT: sprintr_prototype::Attribute = sprintr_prototype::attribute!("account.name", "Account name");
-/// sprintr_prototype::message!("{}", ACCOUNT = 42u32);
-/// ```
-///
-/// Scenario: a local attribute value would make a statement depend on runtime bindings.
+/// Scenario: a local variable is used as an attribute handle.
 /// Guarantees: statement metadata must be statically declared.
 /// ```compile_fail
-/// let account = sprintr_prototype::attribute!("account.name", "Account name");
-/// sprintr_prototype::message!("{}", account = "Ada");
+/// let account_name = "account.name";
+/// sprintr_prototype::message!("{}", account_name = "Ada");
+/// ```
+///
+/// Scenario: a string attribute is associated with a number.
+/// Guarantees: its declared type is enforced even with an untyped placeholder.
+/// ```compile_fail
+/// sprintr_prototype::attributes! {
+///     /// Account name
+///     account_name: str = "account.name";
+/// }
+/// sprintr_prototype::message!("{}", account_name = 42u32);
+/// ```
+///
+/// Scenario: an unsigned attribute uses the string specifier.
+/// Guarantees: placeholder specifiers must agree with declared types.
+/// ```compile_fail
+/// sprintr_prototype::attributes! {
+///     /// Retry attempt
+///     retry_count: u64 = "retry.count";
+/// }
+/// sprintr_prototype::message!("{:s}", retry_count = 2u8);
+/// ```
+///
+/// Scenario: a string attribute uses the hexadecimal specifier.
+/// Guarantees: placeholder specifiers must agree with declared types.
+/// ```compile_fail
+/// sprintr_prototype::attributes! {
+///     /// Account name
+///     account_name: str = "account.name";
+/// }
+/// sprintr_prototype::message!("{:x}", account_name = "Ada");
 /// ```
 ///
 /// Scenario: the source requests a format outside the prototype subset.
@@ -129,7 +226,7 @@ macro_rules! attribute {
 #[macro_export]
 macro_rules! message {
     ($($input:tt)*) => {
-        $crate::__message!($crate; $($input)*)
+        $crate::__message!($crate; []; $($input)*)
     };
 }
 
@@ -139,13 +236,16 @@ macro_rules! message {
 /// to select a caller-owned [`Logger`]. No global logger is installed.
 ///
 /// ```rust
-/// use sprintr_prototype::{Logger, info};
+/// use sprintr_prototype::{Logger, info, replay};
 /// let mut logger = Logger::new(Vec::new());
 /// let name = "Ada";
 /// let value = 42u32;
 /// info!("hello {name:s}, value {value:04x}", logger: logger)?;
-/// let record: sprintr_prototype::Message = serde_json::from_slice(&logger.into_inner())?;
-/// assert_eq!(record.render().unwrap(), "hello Ada, value 002a\nlog.level = INFO");
+/// let mut text = Vec::new();
+/// replay(logger.into_inner().as_slice(), &mut text)?;
+/// let text = String::from_utf8(text).unwrap();
+/// assert!(text.starts_with("process "));
+/// assert!(text.ends_with("hello Ada, value 002a\nlog.level = INFO\n"));
 /// # Ok::<(), std::io::Error>(())
 /// ```
 ///
@@ -153,10 +253,14 @@ macro_rules! message {
 /// Formats are checked and JSON-escaped at compile time. Arguments are borrowed
 /// in a stack array and serialized directly into the logger's reusable buffer.
 /// See [`message!`] for the supported format subset.
+///
+/// Each output begins with an `INFO` record announcing the process and the
+/// sprintr version, followed by a `WARN` record for each declaration that was
+/// renamed because of a collision. Stdout announces once per process.
 #[macro_export]
 macro_rules! info {
     ($($input:tt)*) => {
-        $crate::__info!($crate; $($input)*)
+        $crate::__record!($crate; [$crate::schema::log_level::INFO]; $($input)*)
     };
 }
 
@@ -165,7 +269,9 @@ macro_rules! info {
 /// Accepts the same format, arguments, and optional `logger:` as [`info!`].
 #[macro_export]
 macro_rules! warn {
-    ($($input:tt)*) => { $crate::__warn!($crate; $($input)*) };
+    ($($input:tt)*) => {
+        $crate::__record!($crate; [$crate::schema::log_level::WARN]; $($input)*)
+    };
 }
 
 /// Write a message whose statement has the static named level `log.level:ERROR`.
@@ -173,14 +279,16 @@ macro_rules! warn {
 /// Accepts the same format, arguments, and optional `logger:` as [`info!`].
 #[macro_export]
 macro_rules! error {
-    ($($input:tt)*) => { $crate::__error!($crate; $($input)*) };
+    ($($input:tt)*) => {
+        $crate::__record!($crate; [$crate::schema::log_level::ERROR]; $($input)*)
+    };
 }
 
 /// A synchronous, caller-owned JSON Lines writer.
 pub struct Logger<W, B = HeapBuffer> {
     writer: W,
     buffer: B,
-    definitions: StreamState,
+    state: StreamState,
 }
 
 impl<W: Write> Logger<W> {
@@ -196,7 +304,7 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
         Self {
             writer,
             buffer,
-            definitions: StreamState::default(),
+            state: StreamState::default(),
         }
     }
 
@@ -209,12 +317,15 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
         message
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        self.buffer.clear();
-        self.buffer.try_atomic(|buffer| {
-            serde_json::to_writer(&mut *buffer, message).map_err(json_error)?;
-            buffer.write_all(b"\n")
-        })?;
-        self.writer.write_all(self.buffer.as_slice())
+        if message.attrs.contains_key(RECORD) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected an unaddressed snapshot",
+            ));
+        }
+        self.start()?;
+        self.state
+            .write_snapshot(&mut self.writer, &mut self.buffer, message)
     }
 
     /// Encode trusted compiler-generated metadata and typed arguments.
@@ -224,17 +335,27 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
         statement: &'static Statement,
         arguments: &[BorrowedArgument<'_>],
     ) -> io::Result<()> {
-        let id = statement.id()?;
-        encode_compiled(
+        self.start()?;
+        self.state.write_compiled(
+            &mut self.writer,
             &mut self.buffer,
-            statement,
-            id,
+            statement.resolve()?,
             arguments,
-            &self.definitions,
-        )?;
-        self.writer.write_all(self.buffer.as_slice())?;
-        self.definitions.mark_emitted(statement, id);
-        Ok(())
+        )
+    }
+
+    /// Announce the stream before its first record.
+    fn start(&mut self) -> io::Result<()> {
+        if self.state.started {
+            return Ok(());
+        }
+        // Set first: the announcement is written through this logger.
+        self.state.started = true;
+        let result = announce(self);
+        if result.is_err() {
+            self.state.started = false;
+        }
+        result
     }
 
     /// Flush buffered output, reporting any failure.
@@ -248,66 +369,27 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
     }
 }
 
-#[derive(Default)]
-struct StreamState {
-    statements: HashSet<u64>,
-    attributes: HashSet<&'static str>,
-    levels: u8,
-}
-
-impl StreamState {
-    fn mark_emitted(&mut self, statement: &Statement, id: u64) {
-        if !self.statements.contains(&id) {
-            self.statements.insert(id);
-            if let Some(level) = statement.level {
-                self.levels |= 1 << level as u8;
-            }
-            for attribute in statement.attributes {
-                self.attributes.insert(attribute.name);
-            }
-        }
+fn announce<W: Write, B: RecordBuffer>(logger: &mut Logger<W, B>) -> io::Result<()> {
+    info!(
+        "process {} started logging with {} {}",
+        logger: logger,
+        schema::process_pid = std::process::id(),
+        schema::telemetry_sdk_name = "sprintr",
+        schema::telemetry_sdk_version = env!("CARGO_PKG_VERSION"),
+    )?;
+    for collision in &runtime().collisions {
+        let Collision {
+            kind,
+            declared,
+            description,
+            recorded,
+        } = collision;
+        warn!(
+            "{kind:s} {declared:s} ({description:s}) collides with an earlier declaration; recorded as {recorded:s}",
+            logger: logger,
+        )?;
     }
-}
-
-fn encode_compiled(
-    buffer: &mut impl RecordBuffer,
-    statement: &Statement,
-    id: u64,
-    arguments: &[BorrowedArgument<'_>],
-    definitions: &StreamState,
-) -> io::Result<()> {
-    buffer.clear();
-    buffer.try_atomic(|buffer| {
-        write!(buffer, "{{\"attrs\":{{\"log.statement\":{id}}},\"args\":")?;
-        serde_json::to_writer(&mut *buffer, arguments).map_err(json_error)?;
-        if !definitions.statements.contains(&id) {
-            buffer.write_all(b",\"defs\":{")?;
-            if definitions.statements.is_empty() {
-                buffer.write_all(b"\"log.relation:log.statement\":{\"kind\":\"entity\",\"type\":\"object\",\"desc\":\"Logging statement\",\"anonymous\":true},")?;
-            }
-            if let Some(level) = statement.level
-                && definitions.levels & (1 << level as u8) == 0
-            {
-                if definitions.levels == 0 {
-                    buffer.write_all(b"\"log.relation:log.level\":{\"kind\":\"entity\",\"type\":\"object\",\"desc\":\"Logging level\"},")?;
-                }
-                buffer.write_all(statement.level_definition)?;
-                buffer.write_all(b",")?;
-            }
-            for (index, attribute) in statement.attributes.iter().enumerate() {
-                if !definitions.attributes.contains(attribute.name)
-                    && !statement.attributes[..index].iter().any(|previous| previous.name == attribute.name)
-                {
-                    buffer.write_all(attribute.encoded_definition)?;
-                    buffer.write_all(b",")?;
-                }
-            }
-            write!(buffer, "\"log.statement:{id}\":")?;
-            buffer.write_all(statement.encoded)?;
-            buffer.write_all(b"}")?;
-        }
-        buffer.write_all(b"}\n")
-    })
+    Ok(())
 }
 
 fn json_error(error: serde_json::Error) -> io::Error {
@@ -346,11 +428,19 @@ pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
 
 #[doc(hidden)]
 pub mod __private {
-    use super::{HeapBuffer, RecordBuffer, StreamState, encode_compiled};
+    use super::{HeapBuffer, Logger, StreamState, announce};
+    pub use crate::declare::{Declaration, RelationMeta};
+    pub use crate::entity::BorrowedArgument;
     pub use crate::statement::{Statement, concatenate, encoded_len, owned_message};
-    pub use sprintr_message::{BorrowedArgument, Level};
+    pub use linkme;
     use std::cell::RefCell;
-    use std::io::{self, Write};
+    use std::io;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Every declaration in the program, collected at link time.
+    #[linkme::distributed_slice]
+    pub static DECLARATIONS: [Declaration];
 
     #[derive(Default)]
     struct StdoutState {
@@ -361,6 +451,9 @@ pub mod __private {
     thread_local! {
         static STDOUT_STATE: RefCell<StdoutState> = RefCell::new(StdoutState::default());
     }
+
+    static STDOUT_STARTED: AtomicBool = AtomicBool::new(false);
+    static STDOUT_START: Mutex<()> = Mutex::new(());
 
     mod sealed {
         pub trait Sealed {}
@@ -395,24 +488,46 @@ pub mod __private {
         value.as_u64()
     }
 
+    /// Announce stdout once per process, before any thread's first record.
+    fn start_stdout(state: &mut StdoutState) -> io::Result<()> {
+        let _guard = STDOUT_START
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if STDOUT_STARTED.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut logger = Logger {
+            writer: io::stdout(),
+            buffer: std::mem::take(&mut state.buffer),
+            state: std::mem::take(&mut state.definitions),
+        };
+        logger.state.started = true;
+        let result = announce(&mut logger);
+        state.buffer = logger.buffer;
+        state.definitions = logger.state;
+        result?;
+        STDOUT_STARTED.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub fn write_stdout(
         statement: &'static Statement,
         arguments: &[BorrowedArgument<'_>],
     ) -> io::Result<()> {
-        let id = statement.id()?;
         STDOUT_STATE
             .try_with(|state| {
                 let mut state = state
                     .try_borrow_mut()
                     .map_err(|_| io::Error::other("stdout encoding buffer is already in use"))?;
+                if !STDOUT_STARTED.load(Ordering::Acquire) {
+                    start_stdout(&mut state)?;
+                }
+                let resolved = statement.resolve()?;
                 let StdoutState {
                     buffer,
                     definitions,
                 } = &mut *state;
-                encode_compiled(buffer, statement, id, arguments, definitions)?;
-                io::stdout().lock().write_all(buffer.as_slice())?;
-                definitions.mark_emitted(statement, id);
-                Ok(())
+                definitions.write_compiled(&mut io::stdout(), buffer, resolved, arguments)
             })
             .map_err(|_| io::Error::other("stdout encoding buffer is unavailable"))?
     }

@@ -2,15 +2,19 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
-use quote::{ToTokens, quote};
+use quote::{ToTokens, format_ident, quote};
 use sprintr_message::format::{Part, Spec, parse};
-use sprintr_message::{Level, NamedEntity};
-use sprintr_message::{RelationDefinition, RelationKind, RelationType, validate_attribute_name};
+use sprintr_message::validate_relation_name;
 use syn::parse::{Parse, ParseStream};
-use syn::{Expr, Ident, LitByteStr, LitStr, Path, Token, parse_macro_input};
+use syn::punctuated::Punctuated;
+use syn::{
+    Expr, ExprLit, Ident, Lit, LitByteStr, LitStr, Meta, Path, Token, Type, Visibility,
+    parse_macro_input,
+};
 
 struct Input {
     root: Path,
+    values: Vec<Path>,
     format: LitStr,
     logger: Option<Expr>,
     arguments: Vec<Expr>,
@@ -19,6 +23,12 @@ struct Input {
 impl Parse for Input {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let root = input.parse()?;
+        input.parse::<Token![;]>()?;
+        let content;
+        syn::bracketed!(content in input);
+        let values = Punctuated::<Path, Token![,]>::parse_terminated(&content)?
+            .into_iter()
+            .collect();
         input.parse::<Token![;]>()?;
         let format = input.parse()?;
         let mut logger = None;
@@ -47,33 +57,10 @@ impl Parse for Input {
         }
         Ok(Self {
             root,
+            values,
             format,
             logger,
             arguments,
-        })
-    }
-}
-
-struct AttributeInput {
-    root: Path,
-    name: LitStr,
-    description: LitStr,
-}
-
-impl Parse for AttributeInput {
-    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let root = input.parse()?;
-        input.parse::<Token![;]>()?;
-        let name = input.parse()?;
-        input.parse::<Token![,]>()?;
-        let description = input.parse()?;
-        if input.peek(Token![,]) {
-            input.parse::<Token![,]>()?;
-        }
-        Ok(Self {
-            root,
-            name,
-            description,
         })
     }
 }
@@ -82,64 +69,355 @@ fn bytes(text: &str, span: Span) -> LitByteStr {
     LitByteStr::new(text.as_bytes(), span)
 }
 
+fn json(text: &str) -> String {
+    serde_json::to_string(text).expect("string JSON encoding")
+}
+
 fn json_content(text: &str, span: Span) -> LitByteStr {
-    let encoded = serde_json::to_string(text).expect("string JSON encoding");
+    let encoded = json(text);
     bytes(&encoded[1..encoded.len() - 1], span)
 }
 
-/// Pre-encode an immutable, statically declared string attribute.
-#[proc_macro]
-pub fn attribute(input: TokenStream) -> TokenStream {
-    let AttributeInput {
-        root,
-        name,
-        description,
-    } = parse_macro_input!(input as AttributeInput);
-    if let Err(error) = validate_attribute_name(&name.value()) {
-        return syn::Error::new(name.span(), error)
-            .into_compile_error()
-            .into();
+/// Doc comments, `#[anonymous]`, and the description derived from the docs.
+struct Documented {
+    docs: Vec<syn::Attribute>,
+    description: String,
+    anonymous: bool,
+}
+
+fn documented(attrs: Vec<syn::Attribute>, ident: &Ident) -> syn::Result<Documented> {
+    let mut docs = Vec::new();
+    let mut lines = Vec::new();
+    let mut anonymous = false;
+    for attr in attrs {
+        if attr.path().is_ident("anonymous") {
+            attr.meta.require_path_only()?;
+            anonymous = true;
+        } else if attr.path().is_ident("doc") {
+            if let Meta::NameValue(meta) = &attr.meta
+                && let Expr::Lit(ExprLit {
+                    lit: Lit::Str(text),
+                    ..
+                }) = &meta.value
+            {
+                lines.push(text.value().trim().to_string());
+            }
+            docs.push(attr);
+        } else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "only doc comments and #[anonymous] are supported here",
+            ));
+        }
     }
-    let key = serde_json::to_string(&format!("log.relation:{}", name.value()))
-        .expect("string JSON encoding");
-    let definition = RelationDefinition {
-        kind: RelationKind::Attribute,
-        value_type: RelationType::String,
-        desc: description.value(),
-        anonymous: false,
+    let description = lines.join("\n").trim().to_string();
+    if description.is_empty() {
+        return Err(syn::Error::new(
+            ident.span(),
+            "add a doc comment; it becomes the recorded description",
+        ));
+    }
+    Ok(Documented {
+        docs,
+        description,
+        anonymous,
+    })
+}
+
+fn relation_name(name: &LitStr) -> syn::Result<String> {
+    let value = name.value();
+    validate_relation_name(&value).map_err(|error| syn::Error::new(name.span(), error))?;
+    Ok(value)
+}
+
+fn register(root: &Path, declaration: Tokens) -> Tokens {
+    quote! {
+        const _: () = {
+            #[#root::__private::linkme::distributed_slice(#root::__private::DECLARATIONS)]
+            #[linkme(crate = #root::__private::linkme)]
+            static DECLARATION: #root::__private::Declaration = #declaration;
+        };
+    }
+}
+
+struct AttributeItem {
+    attrs: Vec<syn::Attribute>,
+    vis: Visibility,
+    ident: Ident,
+    ty: Type,
+    name: LitStr,
+}
+
+struct Declarations<T> {
+    root: Path,
+    items: Vec<T>,
+}
+
+impl<T: Parse> Parse for Declarations<T> {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let root = input.parse()?;
+        input.parse::<Token![;]>()?;
+        let mut items = Vec::new();
+        while !input.is_empty() {
+            items.push(input.parse()?);
+        }
+        Ok(Self { root, items })
+    }
+}
+
+impl Parse for AttributeItem {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let attrs = input.call(syn::Attribute::parse_outer)?;
+        let vis = input.parse()?;
+        let ident = input.parse()?;
+        input.parse::<Token![:]>()?;
+        let ty = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let name = input.parse()?;
+        input.parse::<Token![;]>()?;
+        Ok(Self {
+            attrs,
+            vis,
+            ident,
+            ty,
+            name,
+        })
+    }
+}
+
+/// Declare attributes whose doc comments become their recorded descriptions.
+#[proc_macro]
+pub fn attributes(input: TokenStream) -> TokenStream {
+    let Declarations { root, items } = parse_macro_input!(input as Declarations<AttributeItem>);
+    items
+        .into_iter()
+        .map(|item| attribute(&root, item))
+        .collect::<syn::Result<Tokens>>()
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn attribute(root: &Path, item: AttributeItem) -> syn::Result<Tokens> {
+    let AttributeItem {
+        attrs,
+        vis,
+        ident,
+        ty,
+        name,
+    } = item;
+    let Documented {
+        docs,
+        description,
+        anonymous,
+    } = documented(attrs, &ident)?;
+    if anonymous {
+        return Err(syn::Error::new(
+            ident.span(),
+            "attributes cannot be anonymous",
+        ));
+    }
+    let value = relation_name(&name)?;
+    let value_type = match ty.to_token_stream().to_string().as_str() {
+        "str" => quote!(#root::RelationType::String),
+        "u64" => quote!(#root::RelationType::U64),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                ty,
+                "attribute values are `str` or `u64`",
+            ));
+        }
     };
-    let definition = bytes(
-        &format!(
-            "{key}:{}",
-            serde_json::to_string(&definition).expect("relation JSON encoding")
-        ),
-        name.span(),
+    let label = json_content(&format!("@{value}"), name.span());
+    let reference = bytes(&format!("{{{}:{{\"$arg\":", json(&value)), name.span());
+    let registration = register(
+        root,
+        quote!(#root::__private::Declaration::Relation(#ident.__meta())),
     );
-    let label = json_content(&format!("@{}", name.value()), name.span());
-    let reference = bytes(
-        &format!(
-            "{{{}:{{\"$arg\":",
-            serde_json::to_string(&name.value()).expect("string JSON encoding")
-        ),
-        name.span(),
+    Ok(quote! {
+        #(#docs)*
+        #[allow(non_upper_case_globals)]
+        #vis static #ident: #root::Attribute<#ty> = #root::Attribute::__new(
+            #root::__private::RelationMeta::__new(
+                #name,
+                #root::RelationKind::Attribute,
+                #value_type,
+                false,
+                #description,
+            ),
+            #label,
+            #reference,
+        );
+        #registration
+    })
+}
+
+struct EntityItem {
+    attrs: Vec<syn::Attribute>,
+    vis: Visibility,
+    ident: Ident,
+    name: LitStr,
+    values: Option<Vec<(Vec<syn::Attribute>, Ident)>>,
+}
+
+impl Parse for EntityItem {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let attrs = input.call(syn::Attribute::parse_outer)?;
+        let vis = input.parse()?;
+        let ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let name = input.parse()?;
+        let values = if input.peek(syn::token::Brace) {
+            let content;
+            syn::braced!(content in input);
+            let mut values = Vec::new();
+            while !content.is_empty() {
+                let attrs = content.call(syn::Attribute::parse_outer)?;
+                values.push((attrs, content.parse()?));
+                if content.is_empty() {
+                    break;
+                }
+                content.parse::<Token![,]>()?;
+            }
+            if input.peek(Token![;]) {
+                input.parse::<Token![;]>()?;
+            }
+            Some(values)
+        } else {
+            input.parse::<Token![;]>()?;
+            None
+        };
+        Ok(Self {
+            attrs,
+            vis,
+            ident,
+            name,
+            values,
+        })
+    }
+}
+
+/// Declare entity relations and any statically named entities.
+#[proc_macro]
+pub fn entities(input: TokenStream) -> TokenStream {
+    let Declarations { root, items } = parse_macro_input!(input as Declarations<EntityItem>);
+    items
+        .into_iter()
+        .map(|item| entity(&root, item))
+        .collect::<syn::Result<Tokens>>()
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn entity(root: &Path, item: EntityItem) -> syn::Result<Tokens> {
+    let EntityItem {
+        attrs,
+        vis,
+        ident,
+        name,
+        values,
+    } = item;
+    let Documented {
+        docs,
+        description,
+        anonymous,
+    } = documented(attrs, &ident)?;
+    let relation = relation_name(&name)?;
+    let registration = register(
+        root,
+        quote!(#root::__private::Declaration::Relation(#ident.__meta())),
     );
-    quote! { #root::Attribute::__new(#name, #description, #definition, #label, #reference) }.into()
+    let relation_static = |vis: Tokens, ident: &Ident| {
+        quote! {
+            #[allow(non_upper_case_globals)]
+            #vis static #ident: #root::Entity<#anonymous> = #root::Entity::__new(
+                #root::__private::RelationMeta::__new(
+                    #name,
+                    #root::RelationKind::Entity,
+                    #root::RelationType::Object,
+                    #anonymous,
+                    #description,
+                ),
+            );
+        }
+    };
+    let Some(values) = values else {
+        let relation = relation_static(quote!(#vis), &ident);
+        return Ok(quote! {
+            #(#docs)*
+            #relation
+            #registration
+        });
+    };
+    {
+        if anonymous {
+            return Err(syn::Error::new(
+                ident.span(),
+                "anonymous entities cannot have named values",
+            ));
+        }
+        let mut named = Vec::new();
+        for (attrs, value) in values {
+            let Documented {
+                docs,
+                description,
+                anonymous,
+            } = documented(attrs, &value)?;
+            if anonymous {
+                return Err(syn::Error::new(
+                    value.span(),
+                    "named values cannot be anonymous",
+                ));
+            }
+            let value_name = value.to_string();
+            let fragment = bytes(
+                &format!("{}:{}", json(&relation), json(&value_name)),
+                value.span(),
+            );
+            let registration =
+                register(root, quote!(#root::__private::Declaration::Named(&#value)));
+            named.push(quote! {
+                #(#docs)*
+                #[allow(non_upper_case_globals)]
+                pub static #value: #root::Named = #root::Named::__new(
+                    &__RELATION,
+                    #value_name,
+                    #description,
+                    #fragment,
+                );
+                #registration
+            });
+        }
+        // The relation lives in the module of its values, so that they need no
+        // `super::` path, and is re-exported under the same name: modules and
+        // statics are in different namespaces. This works inside functions.
+        let relation = relation_static(quote!(pub), &format_ident!("__RELATION"));
+        Ok(quote! {
+            #(#docs)*
+            #[allow(non_snake_case)]
+            #vis mod #ident {
+                #[doc(hidden)]
+                #relation
+                #(#named)*
+            }
+            #(#docs)*
+            #vis use #ident::__RELATION as #ident;
+            #registration
+        })
+    }
 }
 
 struct Compiled {
     declaration: Tokens,
-    owned: Vec<Tokens>,
-    borrowed: Vec<Tokens>,
+    arguments: Vec<Tokens>,
 }
 
-fn compile(input: &Input, level: Option<Level>) -> syn::Result<Compiled> {
+fn compile(input: &Input) -> syn::Result<Compiled> {
     let root = &input.root;
     let span = input.format.span();
     let error = |message: &str| syn::Error::new(span, message);
     let parts = parse(&input.format.value()).map_err(|err| error(&err.to_string()))?;
-    let mut arguments = input.arguments.iter();
-    let mut owned = Vec::new();
-    let mut borrowed = Vec::new();
+    let mut positional = input.arguments.iter();
+    let mut arguments = Vec::new();
     let mut attributes = Vec::new();
     let mut message = Vec::new();
     let mut references = Vec::new();
@@ -151,14 +429,14 @@ fn compile(input: &Input, level: Option<Level>) -> syn::Result<Compiled> {
             }
             Part::Field(field) => {
                 let (label, expression, attribute) = if field.name.is_empty() {
-                    let expression = arguments
+                    let expression = positional
                         .next()
                         .ok_or_else(|| error("missing positional argument"))?;
                     if let Expr::Assign(assignment) = expression {
                         let Expr::Path(attribute) = assignment.left.as_ref() else {
                             return Err(syn::Error::new_spanned(
                                 &assignment.left,
-                                "expected a static attribute path",
+                                "expected a declared attribute path",
                             ));
                         };
                         let value = &assignment.right;
@@ -179,95 +457,78 @@ fn compile(input: &Input, level: Option<Level>) -> syn::Result<Compiled> {
                     ident.set_span(span);
                     (field.name, quote!(#ident), None)
                 };
-                if field.format.is_empty() && attribute.is_none() {
-                    return Err(error("use :s for strings or :x for unsigned integers"));
-                }
-                if attribute.is_some() && field.spec != Spec::String {
-                    return Err(error("static string attributes require {} or {:s}"));
-                }
-                let string_value = if let Some(attribute) = &attribute {
+                let suffix = if field.spec == Spec::String {
+                    String::new()
+                } else {
+                    format!(":{}", field.format)
+                };
+                if let Some(attribute) = attribute {
                     if !attributes.is_empty() {
                         references.push(quote!(b","));
                     }
-                    let index = bytes(&format!("{}}}}}", owned.len()), span);
-                    references.push(quote!((#attribute).__reference_prefix()));
+                    let index = bytes(&format!("{}}}}}", arguments.len()), span);
+                    references.push(quote!((#attribute).__reference()));
                     references.push(quote!(#index));
-                    attributes.push(quote!(&(#attribute)));
+                    attributes.push(quote!((#attribute).__meta()));
+                    let suffix = bytes(&format!("{suffix}}}"), span);
                     message.push(quote!(b"{"));
-                    message.push(quote!((#attribute).__format_name()));
-                    message.push(quote!(b"}"));
-                    quote!((#attribute).__value(&(#expression)))
+                    message.push(quote!((#attribute).__label()));
+                    message.push(quote!(#suffix));
+                    // The method's existence enforces the attribute's declared type.
+                    arguments.push(match (field.spec, field.format.is_empty()) {
+                        (Spec::String, true) => quote!((#attribute).__value(&(#expression))),
+                        (Spec::String, false) => {
+                            quote!((#attribute).__string_value(&(#expression)))
+                        }
+                        (Spec::Hex { .. }, _) => quote!((#attribute).__hex_value(&(#expression))),
+                    });
                 } else {
-                    let suffix = if field.spec == Spec::String {
-                        String::new()
-                    } else {
-                        format!(":{}", field.format)
-                    };
                     let label = json_content(&format!("{{{label}{suffix}}}"), span);
                     message.push(quote!(#label));
-                    quote!(::core::convert::AsRef::<str>::as_ref(&(#expression)))
-                };
-                owned.push(match field.spec {
-                    Spec::String => quote!(#root::Argument::String(::std::string::String::from(#string_value))),
-                    Spec::Hex { .. } => quote!(#root::Argument::Unsigned(#root::__private::unsigned(&(#expression)))),
-                });
-                borrowed.push(match field.spec {
-                    Spec::String => quote!(#root::__private::BorrowedArgument::String(#string_value)),
-                    Spec::Hex { .. } => quote!(#root::__private::BorrowedArgument::Unsigned(#root::__private::unsigned(&(#expression)))),
-                });
+                    arguments.push(match (field.spec, field.format.is_empty()) {
+                        (Spec::String, true) => {
+                            quote!(#root::__private::BorrowedArgument::Entity(&(#expression)))
+                        }
+                        (Spec::String, false) => quote!(#root::__private::BorrowedArgument::String(
+                            ::core::convert::AsRef::<str>::as_ref(&(#expression))
+                        )),
+                        (Spec::Hex { .. }, _) => {
+                            quote!(#root::__private::BorrowedArgument::Unsigned(
+                                #root::__private::unsigned(&(#expression))
+                            ))
+                        }
+                    });
+                }
             }
         }
     }
-    if let Some(extra) = arguments.next() {
+    if let Some(extra) = positional.next() {
         return Err(syn::Error::new_spanned(extra, "unused positional argument"));
     }
-    let (prefix, level_value, level_definition) = if let Some(level) = level {
-        let variant = match level {
-            Level::Info => quote!(#root::__private::Level::Info),
-            Level::Warn => quote!(#root::__private::Level::Warn),
-            Level::Error => quote!(#root::__private::Level::Error),
-        };
-        let definition = NamedEntity {
-            desc: level.description().into(),
-        };
-        (
-            bytes(
-                &format!(
-                    "{{\"attrs\":{{\"log.level\":\"{}\"}},\"refs\":[",
-                    level.name()
-                ),
-                span,
-            ),
-            quote!(::core::option::Option::Some(#variant)),
-            bytes(
-                &format!(
-                    "\"log.level:{}\":{}",
-                    level.name(),
-                    serde_json::to_string(&definition).expect("named level JSON encoding")
-                ),
-                span,
-            ),
-        )
-    } else {
-        (
-            bytes("{\"attrs\":{},\"refs\":[", span),
-            quote!(::core::option::Option::None),
-            bytes("", span),
-        )
-    };
+    let mut fragments = Vec::new();
+    for (index, value) in input.values.iter().enumerate() {
+        if index > 0 {
+            fragments.push(quote!(b","));
+        }
+        fragments.push(quote!((#value).__fragment()));
+    }
+    let values = &input.values;
     let declaration = quote! {
         const __PARTS: &[&[u8]] = &[
-            #prefix, #(#references,)* b"],\"msg\":\"", #(#message,)* b"\"}",
+            b"{\"attrs\":{", #(#fragments,)* b"},\"refs\":[", #(#references,)*
+            b"],\"msg\":\"", #(#message,)* b"\"}",
         ];
         static __ENCODED: [u8; #root::__private::encoded_len(__PARTS)] =
             #root::__private::concatenate(__PARTS);
-        static __STATEMENT: #root::__private::Statement =
-            #root::__private::Statement::new(&__ENCODED, &[#(#attributes),*], #level_value, #level_definition);
+        static __STATEMENT: #root::__private::Statement = #root::__private::Statement::new(
+            &__ENCODED,
+            &[#(#attributes),*],
+            &[#(&#values),*],
+        );
     };
     Ok(Compiled {
         declaration,
-        owned,
-        borrowed,
+        arguments,
     })
 }
 
@@ -280,39 +541,26 @@ pub fn message(input: TokenStream) -> TokenStream {
             "message! constructs a record; use info! for logger output",
         ))
     } else {
-        compile(&input, None).map(|compiled| {
+        compile(&input).map(|compiled| {
             let root = &input.root;
             let declaration = compiled.declaration;
-            let arguments = compiled.owned;
+            let arguments = compiled.arguments;
             quote! {{
                 #declaration
-                #root::__private::owned_message(&__STATEMENT, ::std::vec![#(#arguments),*])
+                #root::__private::owned_message(&__STATEMENT, &[#(#arguments),*])
             }}
         })
     };
     result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
+/// Write a statement whose template carries the given static named values.
 #[proc_macro]
-pub fn info(input: TokenStream) -> TokenStream {
-    record(input, Level::Info)
-}
-
-#[proc_macro]
-pub fn warn(input: TokenStream) -> TokenStream {
-    record(input, Level::Warn)
-}
-
-#[proc_macro]
-pub fn error(input: TokenStream) -> TokenStream {
-    record(input, Level::Error)
-}
-
-fn record(input: TokenStream, level: Level) -> TokenStream {
+pub fn record(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as Input);
-    let result = compile(&input, Some(level)).map(|compiled| {
+    let result = compile(&input).map(|compiled| {
         let declaration = compiled.declaration;
-        let arguments = compiled.borrowed;
+        let arguments = compiled.arguments;
         let call = if let Some(logger) = input.logger {
             quote!((#logger).__write_compiled(&__STATEMENT, &[#(#arguments),*]))
         } else {

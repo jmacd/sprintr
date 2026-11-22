@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared helpers. Every output stream begins with a startup announcement.
+
+#![allow(dead_code)]
+
+use sprintr_prototype::{
+    Argument, Definition, Message, RECORD, STATEMENT_PREFIX, StatementTemplate, THREAD, replay,
+};
+
+pub fn template(record: &Message) -> &StatementTemplate {
+    let key = format!("{STATEMENT_PREFIX}{}", record.attrs["log.statement"]);
+    let Definition::Statement(template) = &record.defs[&key] else {
+        panic!("statement definition")
+    };
+    template
+}
+
+/// Every record in a JSON Lines stream.
+pub fn lines(encoded: &[u8]) -> Vec<Message> {
+    encoded
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
+}
+
+pub fn assert_startup(record: &Message) {
+    let thread = record.attrs[THREAD];
+    assert!(thread > 0 && record.attrs.contains_key(RECORD));
+    assert!(record.defs.contains_key(&format!("log.thread:{thread}")));
+    assert_eq!(
+        template(record).msg,
+        "process {@process.pid} started logging with {@telemetry.sdk.name} {@telemetry.sdk.version}"
+    );
+    assert_eq!(
+        record.args,
+        [
+            Argument::Unsigned(std::process::id().into()),
+            Argument::String("sprintr".into()),
+            Argument::String(env!("CARGO_PKG_VERSION").into()),
+        ]
+    );
+}
+
+/// Records after the stream's startup announcement, which is checked.
+pub fn records(encoded: &[u8]) -> Vec<Message> {
+    let mut records = lines(encoded);
+    assert_startup(&records.remove(0));
+    records
+}
+
+/// The rendered startup announcement.
+pub fn startup_text() -> String {
+    let (pid, version) = (std::process::id(), env!("CARGO_PKG_VERSION"));
+    format!(
+        "process {pid} started logging with sprintr {version}\nlog.level = INFO, \
+         process.pid = {pid}, telemetry.sdk.name = sprintr, telemetry.sdk.version = {version}\n"
+    )
+}
+
+/// Playback of a stream, without its checked startup announcement.
+pub fn replayed(encoded: &[u8]) -> String {
+    let mut output = Vec::new();
+    replay(encoded, &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    text.strip_prefix(&startup_text())
+        .unwrap_or_else(|| panic!("missing startup announcement: {text}"))
+        .to_string()
+}
+
+/// Lift a primitive-argument event out of its delivery context as a snapshot.
+pub fn standalone(encoded: &[u8]) -> Message {
+    let mut records = lines(encoded);
+    let mut last = records.pop().unwrap();
+    for record in records {
+        for (key, definition) in record.defs {
+            if !key.starts_with(STATEMENT_PREFIX) {
+                last.defs.entry(key).or_insert(definition);
+            }
+        }
+    }
+    last.attrs.remove(RECORD);
+    last.attrs.remove(THREAD);
+    last.defs.retain(|key, _| !key.starts_with("log.thread:"));
+    last
+}

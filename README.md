@@ -18,9 +18,11 @@ There is no Tokio, tracing, or OpenTelemetry SDK dependency.
 cargo run --quiet -p sprintr-prototype --example json_lines -- record
 ```
 
+After the startup announcement:
+
 ```json
-{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:log.level":{"kind":"entity","type":"object","desc":"Logging level"},"log.level:INFO":{"desc":"Informational event"},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
-{"attrs":{"log.statement":1},"args":["Grace",42]}
+{"seq":1,"stmt":2,"thread":88888,"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
+{"seq":2,"stmt":2,"thread":88888,"args":["Grace",42]}
 ```
 
 ```sh
@@ -29,6 +31,8 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record \
 ```
 
 ```text
+process 50316 started logging with sprintr 0.1.0
+log.level = INFO, process.pid = 50316, telemetry.sdk.name = sprintr, telemetry.sdk.version = 0.1.0
 hello Ada, value 002a
 log.level = INFO, account.name = Ada
 hello Grace, value 002a
@@ -36,8 +40,8 @@ log.level = INFO, account.name = Grace
 ```
 
 See the [prototype API and format subset](crates/sprintr-prototype/README.md)
-for implicit captures, positional expressions, caller-owned writers, and
-stack-backed encoding.
+for anonymous application objects, implicit captures, positional expressions,
+caller-owned writers, and stack-backed encoding.
 
 ## Workspace
 
@@ -47,7 +51,7 @@ stack-backed encoding.
 | `sprintr-prototype-macros` | Compile-time format parsing and typed argument capture |
 | `sprintr-prototype` | Public macros, direct JSON recording, reusable buffers, and playback |
 
-Generic entities, additional attribute types, graph navigation, and binary
+Runtime named entities, additional attribute types, graph navigation, and binary
 encoding are future work. The old tracing/OTLP runtime, adapters, and examples have been
 removed rather than maintained as a second implementation.
 
@@ -58,13 +62,13 @@ arguments. It writes directly into reusable heap or fixed stack storage,
 without constructing an owned message or reparsing the format on the producer
 path. Successful steady-state recording makes zero library heap allocations
 once storage and definition bookkeeping are initialized. Repeated events emit
-only `attrs.log.statement` and `args`, without re-encoding templates or taking
+only `seq`, `stmt`, `thread` and `args`, without re-encoding templates or taking
 the schema registry lock. First use may allocate even with stack-backed storage.
 Caller expressions, output sinks, initialization/growth, and
 error reporting are outside that allocation budget.
 
-The planned entity API must capture and encode a snapshot once, then emit
-references on repeated use. JSON versus binary encoding is secondary to
+The anonymous entity API captures a snapshot once, then emits references on
+repeated use. JSON versus binary encoding is secondary to
 preserving direct encoding, reuse, and low per-event overhead. Allocation
 counts, throughput, latency, contention, and retained memory all matter.
 The current allocation assertions do not establish production readiness.

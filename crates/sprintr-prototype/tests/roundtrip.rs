@@ -1,19 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod common;
+
+use common::{lines, records, replayed, template};
 use sprintr_prototype::buffer::{HeapBuffer, RecordBuffer, StackBuffer};
-use sprintr_prototype::{
-    Argument, Definition, Logger, Message, StatementTemplate, info, message, replay,
-};
+use sprintr_prototype::{Argument, Logger, Message, info, message, replay};
 use std::cell::Cell;
 use std::io::{self, Write};
-
-fn template(record: &Message) -> &StatementTemplate {
-    let key = format!("log.statement:{}", record.attrs["log.statement"]);
-    let Definition::Statement(template) = &record.defs[&key] else {
-        panic!("statement definition")
-    };
-    template
-}
 
 /// Scenario: explicit positional expressions and implicit captures describe the same message.
 /// Guarantees: the documented JSON retains native values and playback needs no source or tracing.
@@ -26,11 +19,7 @@ fn positional_and_captured_roundtrip() {
     info!("hello {name:s}, value {value:04x}", logger: logger).unwrap();
     logger.flush().unwrap();
     let encoded = logger.into_inner();
-    let records: Vec<Message> = encoded
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap())
-        .collect();
+    let records = records(&encoded);
     assert_eq!(template(&records[0]), template(&records[1]));
     assert_eq!(template(&records[0]).msg, "hello {name}, value {value:04x}");
     assert_eq!(
@@ -38,10 +27,8 @@ fn positional_and_captured_roundtrip() {
         [Argument::String("Ada".into()), Argument::Unsigned(42)]
     );
     assert_eq!(records[0].args, records[1].args);
-    let mut output = Vec::new();
-    replay(encoded.as_slice(), &mut output).unwrap();
     assert_eq!(
-        String::from_utf8(output).unwrap(),
+        replayed(&encoded),
         "hello Ada, value 002a\nlog.level = INFO\nhello Ada, value 002a\nlog.level = INFO\n"
     );
     assert_eq!(name, "Ada");
@@ -82,10 +69,11 @@ fn escaped_literals_and_string_data() {
     let mut logger = Logger::new(Vec::new());
     logger.write(&record).unwrap();
     let encoded = logger.into_inner();
-    assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 1);
-    let decoded: Message = serde_json::from_slice(&encoded).unwrap();
-    assert_eq!(decoded, record);
-    assert_eq!(decoded.render().unwrap(), format!("{{{text}}} {text}"));
+    assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 2);
+    let decoded = records(&encoded).remove(0);
+    assert_eq!(decoded.args, record.args);
+    assert_eq!(template(&decoded), template(&record));
+    assert_eq!(replayed(&encoded), format!("{{{text}}} {text}\n"));
     assert_eq!(message!("{{literal}}").render().unwrap(), "{literal}");
     assert_eq!(message!("").render().unwrap(), "");
 }
@@ -99,13 +87,14 @@ fn direct_encoding_matches_owned_encoding() {
     let mut logger = Logger::new(Vec::new());
     info!("line\n{{{text:s}}} {value:#04x}", logger: logger).unwrap();
     let owned = message!("line\n{{{text:s}}} {value:#04x}");
-    let direct: Message = serde_json::from_slice(&logger.into_inner()).unwrap();
+    let encoded = logger.into_inner();
+    let direct = &records(&encoded)[0];
     assert_eq!(direct.args, owned.args);
-    assert_eq!(template(&direct).msg, template(&owned).msg);
-    assert_eq!(template(&direct).refs, template(&owned).refs);
+    assert_eq!(template(direct).msg, template(&owned).msg);
+    assert_eq!(template(direct).refs, template(&owned).refs);
     assert_eq!(
-        direct.render().unwrap(),
-        format!("{}\nlog.level = INFO", owned.render().unwrap())
+        replayed(&encoded),
+        format!("{}\nlog.level = INFO\n", owned.render().unwrap())
     );
 
     let calls = Cell::new(0);
@@ -115,10 +104,11 @@ fn direct_encoding_matches_owned_encoding() {
     };
     let mut logger = Logger::new(Vec::new());
     info!("hello {:s}", logger: logger, temporary()).unwrap();
-    let mut output = Vec::new();
-    replay(logger.into_inner().as_slice(), &mut output).unwrap();
     assert_eq!(calls.get(), 1);
-    assert_eq!(output, b"hello temporary\nlog.level = INFO\n");
+    assert_eq!(
+        replayed(&logger.into_inner()),
+        "hello temporary\nlog.level = INFO\n"
+    );
 }
 
 /// Scenario: escaped argument data exceeds a bounded buffer between two successful writes.
@@ -128,25 +118,23 @@ fn oversized_records_roll_back_and_allow_reuse() {
     fn check(buffer: impl RecordBuffer) {
         let mut logger = Logger::with_buffer(Vec::new(), buffer);
         info!("before", logger: logger).unwrap();
-        let text = "\n".repeat(300);
+        let text = "\n".repeat(1100);
         assert_eq!(
             info!("{text:s}", logger: logger).unwrap_err().kind(),
             io::ErrorKind::StorageFull
         );
         info!("after", logger: logger).unwrap();
-        let mut output = Vec::new();
-        replay(logger.into_inner().as_slice(), &mut output).unwrap();
         assert_eq!(
-            output,
-            b"before\nlog.level = INFO\nafter\nlog.level = INFO\n"
+            replayed(&logger.into_inner()),
+            "before\nlog.level = INFO\nafter\nlog.level = INFO\n"
         );
     }
-    check(HeapBuffer::with_capacity_and_limit(16, 512));
-    check(StackBuffer::<512>::new());
+    check(HeapBuffer::with_capacity_and_limit(16, 2048));
+    check(StackBuffer::<2048>::new());
 }
 
-/// Scenario: an encoded record exactly fills storage, or lacks room for its final newline.
-/// Guarantees: limits apply to the complete wire record, including framing.
+/// Scenario: the startup record exactly fills storage, or lacks room for its final newline.
+/// Guarantees: limits apply to the complete wire record, including framing; nothing partial is written.
 #[test]
 fn buffer_limit_includes_record_framing() {
     fn emit(logger: &mut Logger<Vec<u8>>) -> io::Result<()> {
@@ -154,17 +142,28 @@ fn buffer_limit_includes_record_framing() {
     }
     let mut sample = Logger::new(Vec::new());
     emit(&mut sample).unwrap();
-    let line = sample.into_inner();
+    let output = sample.into_inner();
+    let startup = output.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    assert_eq!(lines(&output).len(), 2);
+    assert!(
+        output.len() - startup < startup,
+        "startup is the largest record"
+    );
     let mut exact = Logger::with_buffer(
         Vec::new(),
-        HeapBuffer::with_capacity_and_limit(line.len(), line.len()),
+        HeapBuffer::with_capacity_and_limit(startup, startup),
     );
     emit(&mut exact).unwrap();
-    assert_eq!(exact.into_inner(), line);
+    let exact = exact.into_inner();
+    assert_eq!(
+        exact.iter().position(|byte| *byte == b'\n').unwrap() + 1,
+        startup
+    );
+    assert_eq!(replayed(&exact), replayed(&output));
 
     let mut short = Logger::with_buffer(
         Vec::new(),
-        HeapBuffer::with_capacity_and_limit(line.len(), line.len() - 1),
+        HeapBuffer::with_capacity_and_limit(startup, startup - 1),
     );
     assert_eq!(
         emit(&mut short).unwrap_err().kind(),

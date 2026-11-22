@@ -1,29 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod common;
+
+use common::{lines, records, replayed, standalone, template};
 use sprintr_prototype::buffer::{RecordBuffer, StackBuffer};
 use sprintr_prototype::{
-    Attribute, Definition, Logger, Message, Renderer, StatementTemplate, attribute, info, message,
-    replay,
+    Definition, Logger, Message, RECORD, Renderer, THREAD, attributes, info, message, replay,
 };
 use std::io::{self, Write};
 
-static ACCT_NAME: Attribute = attribute!("account.name", "Account name");
-
-fn template(record: &Message) -> &StatementTemplate {
-    let key = format!("log.statement:{}", record.attrs["log.statement"]);
-    let Definition::Statement(template) = &record.defs[&key] else {
-        panic!("statement definition")
-    };
-    template
+attributes! {
+    /// Account name
+    account_name: str = "account.name";
+    /// Retry attempt
+    retry_count: u64 = "retry.count";
 }
 
 fn log_name<W: Write, B: RecordBuffer>(logger: &mut Logger<W, B>, name: &str) -> io::Result<()> {
     let value = 42u32;
-    info!("hello {}, value {value:04x}", logger: logger, ACCT_NAME = name)
+    info!("hello {}, value {value:04x}", logger: logger, account_name = name)
 }
 
 /// Scenario: one callsite logs different values, including into an independent stream.
-/// Guarantees: definitions accompany first use only; later events contain only attrs and args.
+/// Guarantees: definitions accompany first use only; later events carry only IDs and arguments.
 #[test]
 fn first_record_bootstraps_statement_and_later_records_reuse_it() {
     let mut logger = Logger::new(Vec::new());
@@ -31,15 +30,20 @@ fn first_record_bootstraps_statement_and_later_records_reuse_it() {
         log_name(&mut logger, name).unwrap();
     }
     let encoded = logger.into_inner();
-    let records: Vec<serde_json::Value> = encoded
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap())
-        .collect();
-    let first: Message = serde_json::from_value(records[0].clone()).unwrap();
-    let id = first.attrs["log.statement"];
+    let startup = &lines(&encoded)[0];
     assert_eq!(
-        serde_json::to_value(template(&first)).unwrap(),
+        serde_json::to_value(&startup.defs["log.relation:log.statement"]).unwrap(),
+        serde_json::json!({
+            "kind": "entity", "type": "object", "desc": "Logging statement", "anonymous": true
+        })
+    );
+    let records = records(&encoded);
+    let first = &records[0];
+    let id = first.attrs["log.statement"];
+    let thread = first.attrs[THREAD];
+    let seq = first.attrs[RECORD];
+    assert_eq!(
+        serde_json::to_value(template(first)).unwrap(),
         serde_json::json!({
             "attrs": {"log.level": "INFO"},
             "refs": [{"account.name": {"$arg": 0}}],
@@ -47,83 +51,88 @@ fn first_record_bootstraps_statement_and_later_records_reuse_it() {
         })
     );
     assert_eq!(
-        records[0]["defs"]["log.relation:log.statement"],
+        first.defs.keys().collect::<Vec<_>>(),
+        ["log.relation:account.name", &format!("log.statement:{id}")]
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(encoded.split(|&b| b == b'\n').nth(2).unwrap())
+            .unwrap(),
         serde_json::json!({
-            "kind": "entity", "type": "object", "desc": "Logging statement", "anonymous": true
+            "seq": seq + 1, "stmt": id, "thread": thread, "args": ["Grace", 42]
         })
     );
     assert_eq!(
-        records[1],
-        serde_json::json!({
-            "attrs": {"log.statement": id}, "args": ["Grace", 42]
-        })
+        replayed(&encoded),
+        "hello Ada, value 002a\nlog.level = INFO, account.name = Ada\n\
+         hello Grace, value 002a\nlog.level = INFO, account.name = Grace\n"
     );
-    let mut output = Vec::new();
-    replay(encoded.as_slice(), &mut output).unwrap();
-    assert_eq!(output, b"hello Ada, value 002a\nlog.level = INFO, account.name = Ada\nhello Grace, value 002a\nlog.level = INFO, account.name = Grace\n");
 
     let mut another = Logger::new(Vec::new());
     log_name(&mut another, "Ada").unwrap();
-    let record: Message = serde_json::from_slice(&another.into_inner()).unwrap();
-    assert_eq!(record, first);
+    let another = common::records(&another.into_inner()).remove(0);
+    assert_eq!(another.defs, first.defs);
+    assert_eq!(another.args, first.args);
+    assert_eq!(another.attrs[THREAD], thread);
+    assert!(another.attrs[RECORD] > seq + 1);
 }
 
 /// Scenario: two static declarations agree and multiple callsites use the same canonical attribute.
 /// Guarantees: aliases never leak into formats, attributes deduplicate, and callsites have distinct identities.
 #[test]
 fn static_aliases_and_multiple_positions() {
-    static AGAIN: Attribute = attribute!("account.name", "Account name");
-    use crate::ACCT_NAME as local_alias;
+    attributes! {
+        /// Account name
+        again: str = "account.name";
+    }
+    use crate::account_name as local_alias;
     let mut logger = Logger::new(Vec::new());
     let before = 7u32;
-    info!("{before:x} {} {}", logger: logger, local_alias = "Ada", AGAIN = "Grace").unwrap();
-    info!("{}", logger: logger, AGAIN = "Ada").unwrap();
-    let encoded = String::from_utf8(logger.into_inner()).unwrap();
-    assert_eq!(encoded.matches("\"log.relation:account.name\"").count(), 1);
-    let mut records = encoded
-        .lines()
-        .map(|line| serde_json::from_str::<Message>(line).unwrap());
-    let first = records.next().unwrap();
-    let second = records.next().unwrap();
+    info!("{before:x} {} {}", logger: logger, local_alias = "Ada", again = "Grace").unwrap();
+    info!("{}", logger: logger, again = "Ada").unwrap();
+    let encoded = logger.into_inner();
+    let text = String::from_utf8(encoded.clone()).unwrap();
+    assert_eq!(text.matches("\"log.relation:account.name\"").count(), 1);
+    let records = records(&encoded);
+    let (first, second) = (&records[0], &records[1]);
     assert_ne!(first.attrs, second.attrs);
     assert_eq!(second.defs.len(), 1);
     assert_eq!(
-        serde_json::to_value(&template(&first).refs).unwrap(),
+        serde_json::to_value(&template(first).refs).unwrap(),
         serde_json::json!([
             {"account.name": {"$arg": 1}}, {"account.name": {"$arg": 2}}
         ])
     );
     assert_eq!(
-        template(&first).msg,
+        template(first).msg,
         "{before:x} {@account.name} {@account.name}"
     );
-    let owned = message!("{before:x} {} {}", ACCT_NAME = "Ada", AGAIN = "Grace");
-    assert_eq!(template(&owned).msg, template(&first).msg);
-    assert_eq!(template(&owned).refs, template(&first).refs);
+    let owned = message!("{before:x} {} {}", account_name = "Ada", again = "Grace");
+    assert_eq!(template(&owned).msg, template(first).msg);
+    assert_eq!(template(&owned).refs, template(first).refs);
     assert_eq!(
         owned.render().unwrap(),
         "7 Ada Grace\naccount.name = Ada, account.name = Grace"
     );
 }
 
-/// Scenario: separately compiled static declarations disagree about a process-wide name.
-/// Guarantees: first use rejects the conflicting schema without writing an event.
+/// Scenario: an unsigned attribute is formatted in decimal and hexadecimal.
+/// Guarantees: untyped placeholders follow the declared type; associations show decimal values.
 #[test]
-fn static_conflicts_fail_before_output() {
-    static ORIGINAL: Attribute = attribute!("tests.conflict", "Original");
-    static CONFLICT: Attribute = attribute!("tests.conflict", "Different");
+fn unsigned_attributes_render_decimal_and_hex() {
     let mut logger = Logger::new(Vec::new());
-    info!("{}", logger: logger, ORIGINAL = "Ada").unwrap();
+    info!("try {} ({:#x})", logger: logger, retry_count = 10u8, retry_count = 255u64).unwrap();
+    let encoded = logger.into_inner();
     assert_eq!(
-        info!("{}", logger: logger, CONFLICT = "Ada")
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
+        serde_json::to_value(&records(&encoded)[0].defs["log.relation:retry.count"]).unwrap(),
+        serde_json::json!({"kind": "attribute", "type": "u64", "desc": "Retry attempt"})
     );
-    let record: Message = serde_json::from_slice(&logger.into_inner()).unwrap();
     assert_eq!(
-        record.render().unwrap(),
-        "Ada\nlog.level = INFO, tests.conflict = Ada"
+        template(&records(&encoded)[0]).msg,
+        "try {@retry.count} ({@retry.count:#x})"
+    );
+    assert_eq!(
+        replayed(&encoded),
+        "try 10 (0xff)\nlog.level = INFO, retry.count = 10, retry.count = 255\n"
     );
 }
 
@@ -131,29 +140,31 @@ fn static_conflicts_fail_before_output() {
 /// Guarantees: encoding rollback preserves all first-use definitions for the retry.
 #[test]
 fn overflow_does_not_consume_first_definition() {
-    let mut logger = Logger::with_buffer(Vec::new(), StackBuffer::<1024>::new());
+    let mut logger = Logger::with_buffer(Vec::new(), StackBuffer::<2048>::new());
     assert_eq!(
-        log_name(&mut logger, &"x".repeat(1024)).unwrap_err().kind(),
+        log_name(&mut logger, &"x".repeat(2048)).unwrap_err().kind(),
         io::ErrorKind::StorageFull
     );
     log_name(&mut logger, "Ada").unwrap();
-    let record: Message = serde_json::from_slice(&logger.into_inner()).unwrap();
-    assert_eq!(record.defs.len(), 5);
+    let encoded = logger.into_inner();
+    assert_eq!(records(&encoded)[0].defs.len(), 2);
     assert_eq!(
-        record.render().unwrap(),
-        "hello Ada, value 002a\nlog.level = INFO, account.name = Ada"
+        replayed(&encoded),
+        "hello Ada, value 002a\nlog.level = INFO, account.name = Ada\n"
     );
 }
 
-struct FailOnce {
-    failed: bool,
+/// Fails only the given write; each record is written with one call.
+struct FailNth {
+    fail: usize,
+    writes: usize,
     output: Vec<u8>,
 }
 
-impl Write for FailOnce {
+impl Write for FailNth {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if !self.failed {
-            self.failed = true;
+        self.writes += 1;
+        if self.writes - 1 == self.fail {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         self.output.write(bytes)
@@ -163,31 +174,33 @@ impl Write for FailOnce {
     }
 }
 
-/// Scenario: the sink rejects the first occurrence and accepts a retry.
-/// Guarantees: output failure cannot suppress definitions needed by the first accepted event.
+/// Scenario: the sink rejects the startup announcement or the first occurrence, then accepts a retry.
+/// Guarantees: output failure cannot suppress the announcement or definitions needed by the first accepted event.
 #[test]
 fn failed_output_does_not_consume_first_definition() {
-    let mut logger = Logger::new(FailOnce {
-        failed: false,
-        output: Vec::new(),
-    });
-    assert_eq!(
-        log_name(&mut logger, "Ada").unwrap_err().kind(),
-        io::ErrorKind::BrokenPipe
-    );
-    log_name(&mut logger, "Ada").unwrap();
-    let record: Message = serde_json::from_slice(&logger.into_inner().output).unwrap();
-    assert_eq!(
-        record.render().unwrap(),
-        "hello Ada, value 002a\nlog.level = INFO, account.name = Ada"
-    );
+    for fail in [0, 1] {
+        let mut logger = Logger::new(FailNth {
+            fail,
+            writes: 0,
+            output: Vec::new(),
+        });
+        assert_eq!(
+            log_name(&mut logger, "Ada").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        log_name(&mut logger, "Ada").unwrap();
+        assert_eq!(
+            replayed(&logger.into_inner().output),
+            "hello Ada, value 002a\nlog.level = INFO, account.name = Ada\n"
+        );
+    }
 }
 
 /// Scenario: wire input contains malformed parameters, unknown relations, or invalid statement shapes.
 /// Guarantees: parameters are explicit, bounded, and typed; pointers are not silently reinterpreted.
 #[test]
 fn playback_rejects_bad_templates() {
-    let valid = message!("{}", ACCT_NAME = "Ada");
+    let valid = message!("{}", account_name = "Ada");
     let key = format!("log.statement:{}", valid.attrs["log.statement"]);
     let base = serde_json::to_value(valid).unwrap();
     let mut cases = Vec::new();
@@ -215,10 +228,10 @@ fn playback_rejects_bad_templates() {
         cases.push(bad);
     }
     let mut missing = base.clone();
-    missing["attrs"]["log.statement"] = serde_json::json!(u64::MAX);
+    missing["stmt"] = serde_json::json!(u64::MAX);
     cases.push(missing);
     let mut zero = base.clone();
-    zero["attrs"]["log.statement"] = 0.into();
+    zero["stmt"] = 0.into();
     cases.push(zero);
     let first = serde_json::to_string(&message!("first")).unwrap();
     for bad in cases {
@@ -234,7 +247,7 @@ fn playback_rejects_bad_templates() {
 /// Guarantees: failed records do not install definitions or corrupt previously compiled templates.
 #[test]
 fn renderer_updates_are_transactional() {
-    let valid = message!("{}", ACCT_NAME = "Ada");
+    let valid = message!("{}", account_name = "Ada");
     let mut subsequent = valid.clone();
     subsequent.defs.clear();
     let mut renderer = Renderer::default();
@@ -277,22 +290,30 @@ fn renderer_updates_are_transactional() {
 /// Guarantees: pre-encoded templates roundtrip and value expressions execute once without ownership transfer.
 #[test]
 fn escaped_names_and_temporary_values_roundtrip() {
-    static ESCAPED: Attribute = attribute!("tests.name/~\"\\\n", "A \"description\"");
+    attributes! {
+        /// A "description"
+        escaped: str = "tests.name/~\"\\\n";
+    }
     let mut calls = 0;
     let mut logger = Logger::new(Vec::new());
-    info!("{}", logger: logger, ESCAPED = {
+    info!("{}", logger: logger, escaped = {
         calls += 1;
         String::from("Ada\t\"name\"")
     })
     .unwrap();
     assert_eq!(calls, 1);
-    let record: Message = serde_json::from_slice(&logger.into_inner()).unwrap();
-    assert_eq!(template(&record).msg, format!("{{@{}}}", ESCAPED.name()));
+    let record = standalone(&logger.into_inner());
+    assert_eq!(template(&record).msg, format!("{{@{}}}", escaped.name()));
+    let Definition::Relation(relation) = &record.defs[&format!("log.relation:{}", escaped.name())]
+    else {
+        panic!("relation definition")
+    };
+    assert_eq!(relation.desc, "A \"description\"");
     assert_eq!(
         record.render().unwrap(),
         format!(
             "Ada\t\"name\"\nlog.level = INFO, {} = {}",
-            ESCAPED.name().escape_debug(),
+            escaped.name().escape_debug(),
             "Ada\t\"name\"".escape_debug()
         )
     );
@@ -304,8 +325,8 @@ fn escaped_names_and_temporary_values_roundtrip() {
 fn concurrent_first_use_has_one_identity() {
     fn record() -> Message {
         let mut logger = Logger::new(Vec::new());
-        info!("{}", logger: logger, ACCT_NAME = "Ada").unwrap();
-        serde_json::from_slice(&logger.into_inner()).unwrap()
+        info!("{}", logger: logger, account_name = "Ada").unwrap();
+        standalone(&logger.into_inner())
     }
     let threads: Vec<_> = (0..4).map(|_| std::thread::spawn(record)).collect();
     let records: Vec<_> = threads

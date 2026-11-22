@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod common;
+
+use common::{lines, records, replayed, standalone};
 use sprintr_prototype::{
-    Definition, Logger, Message, Renderer, buffer::StackBuffer, error, info, message, replay, warn,
+    Definition, Logger, Renderer, buffer::StackBuffer, error, info, message, replay, warn,
 };
 use std::io;
 
@@ -28,10 +31,20 @@ fn named_levels_are_static_and_deduplicated() {
     }
     info!("another", logger: logger).unwrap();
     let encoded = logger.into_inner();
-    let records: Vec<serde_json::Value> = encoded
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap())
+    let startup = serde_json::to_value(&lines(&encoded)[0]).unwrap();
+    assert_eq!(
+        startup["defs"]["log.relation:log.level"],
+        serde_json::json!({
+            "kind": "entity", "type": "object", "desc": "Logging level"
+        })
+    );
+    assert_eq!(
+        startup["defs"]["log.level:INFO"],
+        serde_json::json!({"desc": "Informational event"})
+    );
+    let records: Vec<serde_json::Value> = records(&encoded)
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap())
         .collect();
     for (index, (level, description)) in [
         ("INFO", "Informational event"),
@@ -42,7 +55,9 @@ fn named_levels_are_static_and_deduplicated() {
     .enumerate()
     {
         let first = &records[index * 2];
-        let id = first["attrs"]["log.statement"].as_u64().unwrap();
+        let id = first["stmt"].as_u64().unwrap();
+        let thread = &first["thread"];
+        let seq = first["seq"].as_u64().unwrap();
         let template = &first["defs"][format!("log.statement:{id}")];
         assert_eq!(
             template,
@@ -51,32 +66,31 @@ fn named_levels_are_static_and_deduplicated() {
             })
         );
         assert_eq!(
-            first["defs"][format!("log.level:{level}")],
-            serde_json::json!({"desc": description})
-        );
-        assert_eq!(
             records[index * 2 + 1],
-            serde_json::json!({"attrs": {"log.statement": id}, "args": []})
+            serde_json::json!({"seq": seq + 1, "stmt": id, "thread": thread, "args": []})
         );
-        if index != 0 {
-            assert!(first["defs"].get("log.relation:log.level").is_none());
+        assert!(first["defs"].get("log.relation:log.level").is_none());
+        if index == 0 {
+            assert_eq!(first["defs"].as_object().unwrap().len(), 1);
+        } else {
+            assert_eq!(
+                first["defs"][format!("log.level:{level}")],
+                serde_json::json!({"desc": description})
+            );
             assert_eq!(first["defs"].as_object().unwrap().len(), 2);
         }
     }
-    assert_eq!(
-        records[0]["defs"]["log.relation:log.level"],
-        serde_json::json!({
-            "kind": "entity", "type": "object", "desc": "Logging level"
-        })
-    );
     assert_eq!(records[6]["defs"].as_object().unwrap().len(), 1);
-    let mut output = Vec::new();
-    replay(encoded.as_slice(), &mut output).unwrap();
-    assert_eq!(output, b"event\nlog.level = INFO\nevent\nlog.level = INFO\nevent\nlog.level = WARN\nevent\nlog.level = WARN\nevent\nlog.level = ERROR\nevent\nlog.level = ERROR\nanother\nlog.level = INFO\n");
+    assert_eq!(
+        replayed(&encoded),
+        "event\nlog.level = INFO\nevent\nlog.level = INFO\nevent\nlog.level = WARN\n\
+         event\nlog.level = WARN\nevent\nlog.level = ERROR\nevent\nlog.level = ERROR\n\
+         another\nlog.level = INFO\n"
+    );
 
     let mut independent = Logger::new(Vec::new());
     error_record(&mut independent);
-    let first: Message = serde_json::from_slice(&independent.into_inner()).unwrap();
+    let first = standalone(&independent.into_inner());
     assert_eq!(first.render().unwrap(), "event\nlog.level = ERROR");
 }
 
@@ -84,10 +98,10 @@ fn named_levels_are_static_and_deduplicated() {
 /// Guarantees: failed encoding does not consume the new named value's definition.
 #[test]
 fn new_level_definition_survives_overflow() {
-    fn emit(logger: &mut Logger<Vec<u8>, StackBuffer<1024>>, text: &str) -> io::Result<()> {
+    fn emit(logger: &mut Logger<Vec<u8>, StackBuffer<2048>>, text: &str) -> io::Result<()> {
         warn!("{text:s}", logger: logger)
     }
-    let mut logger = Logger::with_buffer(Vec::new(), StackBuffer::<1024>::new());
+    let mut logger = Logger::with_buffer(Vec::new(), StackBuffer::<2048>::new());
     info!("first", logger: logger).unwrap();
     assert_eq!(
         emit(&mut logger, &"x".repeat(2048)).unwrap_err().kind(),
@@ -95,15 +109,12 @@ fn new_level_definition_survives_overflow() {
     );
     emit(&mut logger, "retry").unwrap();
     let encoded = logger.into_inner();
-    let last: Message =
-        serde_json::from_slice(encoded.split(|byte| *byte == b'\n').nth(1).unwrap()).unwrap();
+    let last = &records(&encoded)[1];
     assert!(last.defs.contains_key("log.level:WARN"));
     assert!(!last.defs.contains_key("log.relation:log.level"));
-    let mut output = Vec::new();
-    replay(encoded.as_slice(), &mut output).unwrap();
     assert_eq!(
-        output,
-        b"first\nlog.level = INFO\nretry\nlog.level = WARN\n"
+        replayed(&encoded),
+        "first\nlog.level = INFO\nretry\nlog.level = WARN\n"
     );
 }
 
@@ -113,8 +124,8 @@ fn new_level_definition_survives_overflow() {
 fn invalid_level_definitions_and_references_are_rejected() {
     let mut logger = Logger::new(Vec::new());
     info_record(&mut logger);
-    let base: serde_json::Value = serde_json::from_slice(&logger.into_inner()).unwrap();
-    let key = format!("log.statement:{}", base["attrs"]["log.statement"]);
+    let base = serde_json::to_value(standalone(&logger.into_inner())).unwrap();
+    let key = format!("log.statement:{}", base["stmt"]);
     let mut cases = Vec::new();
     for attrs in [
         serde_json::json!({"log.level": "MISSING"}),
@@ -155,7 +166,7 @@ fn invalid_level_definitions_and_references_are_rejected() {
 fn named_level_definitions_are_transactional_and_immutable() {
     let mut logger = Logger::new(Vec::new());
     info_record(&mut logger);
-    let valid: Message = serde_json::from_slice(&logger.into_inner()).unwrap();
+    let valid = standalone(&logger.into_inner());
     let mut invalid = valid.clone();
     invalid
         .args
@@ -174,11 +185,10 @@ fn named_level_definitions_are_transactional_and_immutable() {
     assert_eq!(renderer.render(&valid).unwrap(), "event\nlog.level = INFO");
     assert_eq!(renderer.render(&valid).unwrap(), "event\nlog.level = INFO");
     let mut conflicting = valid.clone();
-    let Definition::NamedEntity(entity) = conflicting.defs.get_mut("log.level:INFO").unwrap()
-    else {
+    let Definition::Entity(entity) = conflicting.defs.get_mut("log.level:INFO").unwrap() else {
         unreachable!()
     };
-    entity.desc = "Incompatible description".into();
+    entity.insert("desc".into(), "Incompatible description".into());
     assert!(
         renderer
             .render(&conflicting)
@@ -192,4 +202,29 @@ fn named_level_definitions_are_transactional_and_immutable() {
         renderer.render(&subsequent).unwrap(),
         "event\nlog.level = INFO"
     );
+}
+
+/// Scenario: a stream defines its own entity relation with a named value used by a statement.
+/// Guarantees: the reader treats every named entity generically, not only `log.level`.
+#[test]
+fn custom_named_entities_render_generically() {
+    let record = serde_json::json!({
+        "attrs": {"log.statement": 1},
+        "args": [],
+        "defs": {
+            "log.relation:log.statement": {
+                "kind": "entity", "type": "object", "desc": "Logging statement", "anonymous": true
+            },
+            "log.relation:deployment.environment": {
+                "kind": "entity", "type": "object", "desc": "Deployment environment"
+            },
+            "deployment.environment:PRODUCTION": {"desc": "Production traffic"},
+            "log.statement:1": {
+                "attrs": {"deployment.environment": "PRODUCTION"}, "refs": [], "msg": "deployed"
+            }
+        }
+    });
+    let mut output = Vec::new();
+    replay(format!("{record}\n").as_bytes(), &mut output).unwrap();
+    assert_eq!(output, b"deployed\ndeployment.environment = PRODUCTION\n");
 }

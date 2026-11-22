@@ -120,12 +120,16 @@ separate namespaces. Scopes neither shadow names nor change their
 meaning. Definitions may appear in multiple records or scopes, provided
 their values agree.
 
-Named definitions are immutable within a process. Conflicting
-definitions of the same name must cause an explicit failure. Agreement
+Named definitions are immutable within a process. A conflicting
+definition cannot replace an existing name, and readers reject
+conflicting definitions of one name. Because a logging library must not
+prevent its process from starting, the producer instead records a later,
+different declaration under a distinct name and reports the collision
+explicitly in the log stream; see [Startup](#startup). Agreement
 means semantic equality, not identical encoded bytes: serialization
 order or references to different records containing the same entity
 must not alone cause a conflict. The comparison mechanism remains to
-be specified.
+be specified; the prototype compares decoded definitions structurally.
 
 Value types include references to entities described by a particular
 relation, not only primitive values. For example, `log.level` describes
@@ -248,9 +252,10 @@ fill one in:
 ```rust
 use super::entity::{my_session};
 
-let handle = my_session.new(<expression>);
+let handle = my_session.new(session_data)?;
 
-info!("new session {}", handle);
+info!("new session {}", handle)?;
+info!("resumed {}", handle)?;
 ```
 
 Logging entity values has the effect of placing a reference to the
@@ -276,32 +281,29 @@ the body, as a list.
 
 ## References
 
-When an entity handle is used, its value is recorded in the log record
-body for future reference. The entity handle retains the identifier of
-the log record where it was defined. Records are sequenced within a
-local logging scope. A globally qualified record identifier must
-distinguish the process execution and scope as well as the sequence
-number; its exact representation remains to be specified. Thread names
-are entity data, not a sufficient basis for record identity. The
-process's identifying information is recorded during startup.
+The handle holds an immutable snapshot. On first use, the writer puts its
+value in `defs["<relation>:<identity>"]` and remembers the location **for that
+output and thread**, only after the write succeeds. Reusing the handle in a
+different output or thread introduces a new local definition of the same
+identity. The handle need not be mutated or locked.
 
-Entity handles store the record identifier where their definition
-appears. The entry definition will include the entity key:value
-expression and associated structured value, like `{
-"my_thing:thing_name": <expression-value> }`. Note that an
-`<expression-value>` may itself contain entity references.
-
-References will be logged at least once. This requires entity handles
-to contain inner mutability via a `Cell` or otherwise idiomatic Rust,
-so as to be able to update the log record identifier. (If a shared
-entity handle is required, an `Arc<Mutex<_>>` or `OnceLock` may be
-required; however, this is not initially required.)
+Each emitted record carries `thread` (the OS-assigned `log.thread` ID) and
+`seq` (the `log.record` ID within that thread, starting at zero). The first record on
+each output from that thread defines `log.thread:<id>`; a name, if available,
+is descriptive data, not identity. `log.record` names the containing record
+itself, so it needs no second copy in `defs`. Sequence numbers are shared
+across outputs on a thread. They increase but need not be contiguous within
+any one output. The writer does not disambiguate recycled OS thread IDs.
+Repeated addresses are errors, not a second incarnation of the same record.
 
 An inline entity reference will appear using the "$ref" key (like JSON
 Schema). For example, when logging a reference using an entity handle,
 the value will appear as a reference like `{ "$ref":
 "<record_id>#/defs/my_thing:thing_name" }`, in addition to being
-defined at least once.
+defined at least once. In the prototype, `<record_id>` is the decimal sequence
+on the referencing record's thread. For instance, `2#/defs/session:1` selects
+the `session:1` definition **in record 2**, not simply the most recent object
+with that name. A standalone snapshot uses `#/defs/session:1` in its own body.
 
 The `refs` section of the body is an array of single-entry maps.
 Ordinary references have the form `{ "<attribute-or-entity-name>": "<fragment>" }`. Each entry
@@ -402,8 +404,12 @@ with a ref embedded in `my_thing:thing_name`.
 ## JSON Structure
 
 To stay compatible with OTLP log structure, the `body` field contains
-the fields described above, including `defs`, `refs`, `seq`, `args`,
-and `msg`. Log attributes, scope attributes, and resource attributes
+the fields described above, including `attrs`, `defs`, `refs`, `args`,
+and `msg`. In JSON Lines, the top-level `seq`, `stmt`, and `thread` fields abbreviate
+`attrs["log.record"]`, `attrs["log.statement"]`, and `attrs["log.thread"]`. They have the same
+meaning as the expanded associations and must not also appear in `attrs`
+under their full names. A snapshot without a delivery address omits `seq` and `thread`.
+Log attributes, scope attributes, and resource attributes
 are encoded in the appropriate level of OTLP structure.
 
 ## Paths and graph reconstruction
@@ -422,16 +428,23 @@ The resulting pointer is then URI-fragment encoded, using UTF-8 and
 percent-encoding where required. For example, the entity name
 `file:/tmp/a` is addressed by `#/defs/file:~1tmp~1a`.
 
-A qualified reference has the form `<record_id>#/<pointer-path>`:
-the record identifier selects a record in the global collection, and
-the pointer selects a node within its body. The URI representation of
-record identifiers remains to be specified. A fragment-only reference
+A record-relative reference has the form `<seq>#/<pointer-path>`:
+the sequence selects a record on the current thread, and the pointer
+selects a node within its body. A fragment-only reference
 implicitly selects the containing record. Ordinary entries in `refs` use local
 fragments targeting `args` or `defs`; inline `$ref` values may also
 identify targets in other records. A statement's `{ "$arg": n }` binding
 is a distinct template parameter, not a JSON Pointer. It associates a name
 with argument `n` of each event using the template. The resulting graph
 edges connect to event argument values, never to nonexistent template arguments.
+
+For exchange between processes, the intended **graph** address of a record is
+`#/<global_attr>/<global_value>/log.thread/<thread_id>/log.record/<seq>`.
+The first pair must uniquely identify the process execution; a PID alone is
+not enough. An RPC peer could exchange the address of a start record and
+link to the corresponding end records using ordinary entities and attributes.
+This global index and span linkage are not implemented. The thread and record
+components are the same ones used for local references.
 
 Log records collectively describe a directed graph. Loading resolves
 reference targets into graph edges, preserving shared nodes and cycles
@@ -461,12 +474,26 @@ its wire representation remain to be specified.
 
 ## Startup
 
-The initial log record contains the definitions of all relations and
-entities referenced initially, bootstrapping the graph from the
-presumed understanding of `log.relation`. Registered attributes and
-entity types are described there. The schema can emerge as the program
-starts, with conflicting named definitions rejected. Later definitions
-extend the same process-wide namespace; repeated definitions must agree.
+The initial log record of each output announces the process and the
+logging library, and contains the definitions of the relations and
+entities it references, bootstrapping the graph from the presumed
+understanding of `log.relation`. Later records reuse those definitions.
+Only `log.relation` is built into the wire format. `log.statement`,
+`log.level`, and the announcement's attributes are declared like any
+other relation, although readers recognize the built-in meaning of
+`log.statement` when formatting.
+
+Attributes and entity relations are declared in code with readable
+declarators, and each declaration's documentation is its description.
+Declarations are collected at link time and resolved once, when logging
+first starts. The library's own schema resolves first, then other
+declarations in link order. Equal declarations share a name. A later,
+different declaration of an existing name is recorded under a
+content-derived name, such as `account.name_1a2b3c4d`, and statements
+using it refer to that name. Each rename is announced in a `WARN` record
+immediately after the startup record, so collisions are visible without
+preventing the process from starting. Later definitions extend the same
+process-wide namespace; repeated definitions must agree.
 
 Common definitions can be generated from external schema files,
 including the Weaver definitions described above. A more restrictive
@@ -608,16 +635,20 @@ matching records. Those features are outside this first milestone.
 
 ## Static attributes and statement-template extension
 
-The next slice declares a string attribute statically and pre-encodes a
+The next slice declares an attribute statically and pre-encodes a
 statement template with its canonical name. Declaration emits no record:
 
 ```rust
-use sprintr_prototype::{Attribute, attribute, info};
+use sprintr_prototype::{attributes, info};
 
-static ACCT_NAME: Attribute = attribute!("account.name", "Account name");
+attributes! {
+    /// Account name
+    account_name: str = "account.name";
+}
+
 let value = 42u32;
 for name in ["Ada", "Grace"] {
-    info!("hello {}, value {value:04x}", ACCT_NAME = name)?;
+    info!("hello {}, value {value:04x}", account_name = name)?;
 }
 ```
 
@@ -633,18 +664,21 @@ contains only static `attrs`, argument bindings in `refs`, and `msg`:
 `log.relation:log.statement` describes anonymous object entities;
 `log.relation:account.name` describes the named string attribute. A template
 contains neither dynamic `args` nor nested `defs`. Its `attrs` contains a
-static reference to the named `log.level:INFO` entity. The first event bootstraps all required
-definitions; subsequent events only reference the statement:
+static reference to the named `log.level:INFO` entity. The startup record
+already defined `log.statement`, `log.level`, and `log.level:INFO`, so the
+first event bootstraps only the remaining definitions. The next event carries
+its own address but reuses the statement:
 
 ```json
-{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:log.level":{"kind":"entity","type":"object","desc":"Logging level"},"log.level:INFO":{"desc":"Informational event"},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
-{"attrs":{"log.statement":1},"args":["Grace",42]}
+{"seq":1,"stmt":2,"thread":88888,"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
+{"seq":2,"stmt":2,"thread":88888,"args":["Grace",42]}
 ```
 
-`attrs.log.statement` is a typed reference to `defs["log.statement:1"]`.
+`"stmt":2` is a typed reference to `defs["log.statement:2"]`.
 The nonzero integer identity is assigned on first use and is process-local,
-not a globally qualified reference. Each callsite has its own identity,
-even when its template is equal to another's. Rendering produces:
+not a globally qualified reference; the startup announcement used `1`. Each
+callsite has its own identity, even when its template is equal to another's.
+After the announcement, rendering produces:
 
 ```text
 hello Ada, value 002a
@@ -653,9 +687,10 @@ hello Grace, value 002a
 log.level = INFO, account.name = Grace
 ```
 
-Definitions are immutable and process-wide. Equal static declarations may
-appear in multiple modules; first-use validation rejects conflicts across
-compilation units. Static attribute and statement values are encoded during
+Definitions are immutable and process-wide. Equal declarations may appear
+in multiple modules; a different declaration of an existing name is renamed
+and announced at startup rather than failing. Static attribute and statement
+values are encoded during
 compilation, not lazily encoded on the first event. Runtime work assigns
 statement identities and tracks which definitions each output has accepted.
 Stdout keeps this bookkeeping per thread, allowing equal repeated definitions
@@ -671,11 +706,12 @@ independently. `message!` captures an unlevelled snapshot; `info!`, `warn!`,
 and `error!` bake `INFO`, `WARN`, or `ERROR` into their statement templates.
 The named values carry the descriptions "Informational event", "Warning
 condition", and "Error condition". Each output emits a level definition only
-when first needed, and reuses it across statements. All non-positional
-attributes are static for now; thread-local injection is a later step.
-The current extension supports string attributes, statement and level
-entities, and `$arg` bindings; generic entities, JSON Pointer graph linking,
-filtering, and graph navigation remain future work.
+when first needed, and reuses it across statements. Application-defined
+thread-local attribute injection is a later step.
+The current extension supports string and `u64` attributes, statically named
+entities, anonymous runtime objects, anonymous statements, `$arg` bindings,
+and record-relative references to whole object definitions. Runtime named
+entities, general graph linking, filtering, and graph navigation remain future work.
 
 ## Additional context
 

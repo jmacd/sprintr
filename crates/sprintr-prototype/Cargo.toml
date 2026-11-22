@@ -9,6 +9,9 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+gettid = "0.1.4"
+linkme = "0.3"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sprintr-message = { path = "../sprintr-message" }
 sprintr-prototype-macros = { path = "../sprintr-prototype-macros" }
@@ -17,7 +20,7 @@ sprintr-prototype-macros = { path = "../sprintr-prototype-macros" }
 allocation-counter = "0.8"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.rustdoc]
 broken_intra_doc_links = "deny"

@@ -143,3 +143,31 @@ pub fn parse(input: &str) -> Result<Vec<Part>, FormatError> {
     }
     Ok(parts)
 }
+
+/// Re-encode parsed parts as a stored format, escaping literal braces.
+pub fn unparse(parts: &[Part]) -> String {
+    let mut output = String::new();
+    for part in parts {
+        match part {
+            Part::Literal(text) => {
+                for ch in text.chars() {
+                    match ch {
+                        '{' => output.push_str("{{"),
+                        '}' => output.push_str("}}"),
+                        other => output.push(other),
+                    }
+                }
+            }
+            Part::Field(field) => {
+                output.push('{');
+                output.push_str(&field.name);
+                if !field.format.is_empty() {
+                    output.push(':');
+                    output.push_str(&field.format);
+                }
+                output.push('}');
+            }
+        }
+    }
+    output
+}

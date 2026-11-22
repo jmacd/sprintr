@@ -1,9 +1,10 @@
 # Standalone sprintr prototype
 
 This non-production prototype captures a message format and typed positional
-arguments, records JSON Lines, and replays plain-text messages. Static
-string attributes, named level entities, and anonymous statements supply self-describing metadata.
-There are no generic entities, thread-local attribute injection, filtering, or binary encoding yet.
+arguments, records JSON Lines, and replays plain-text messages. Declared
+attributes, statically named entities such as levels, and anonymous objects
+supply self-describing metadata. There is no thread-local application
+attribute injection, filtering, or binary encoding yet.
 There is no dependency on Tokio, tracing, or an OpenTelemetry runtime.
 
 ## Run the example
@@ -14,9 +15,11 @@ From the repository root:
 cargo run --quiet -p sprintr-prototype --example json_lines -- record
 ```
 
+After the [startup announcement](#startup-announcement):
+
 ```json
-{"attrs":{"log.statement":1},"args":["Ada",42],"defs":{"log.relation:log.statement":{"kind":"entity","type":"object","desc":"Logging statement","anonymous":true},"log.relation:log.level":{"kind":"entity","type":"object","desc":"Logging level"},"log.level:INFO":{"desc":"Informational event"},"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:1":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
-{"attrs":{"log.statement":1},"args":["Grace",42]}
+{"seq":1,"stmt":2,"thread":88888,"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
+{"seq":2,"stmt":2,"thread":88888,"args":["Grace",42]}
 ```
 
 Replay from stdin:
@@ -27,11 +30,16 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record \
 ```
 
 ```text
+process 50316 started logging with sprintr 0.1.0
+log.level = INFO, process.pid = 50316, telemetry.sdk.name = sprintr, telemetry.sdk.version = 0.1.0
 hello Ada, value 002a
 log.level = INFO, account.name = Ada
 hello Grace, value 002a
 log.level = INFO, account.name = Grace
 ```
+
+For a tour that prints each record followed by its rendering, run
+`cargo run --quiet -p sprintr-prototype --example tour`.
 
 The reader requires only the recorded JSON, not the original application.
 Every malformed record or unsupported format stops playback with its input
@@ -63,8 +71,8 @@ assert_eq!(record.render()?, "hello Ada, value 0x2a");
 directly without requiring `Display` or allocating intermediate owned arguments.
 The caller retains ownership. Expressions are evaluated once per placeholder
 occurrence. `message!` is a separate, allocating API for unlevelled owned snapshots.
-Its snapshots include their definitions; conflicting static declarations panic
-on this infallible convenience path. `info!` returns schema conflicts as errors.
+Its snapshots include their definitions and are not preceded by an announcement.
+It panics only if statement identities are exhausted; `info!` returns that error.
 Writers are synchronous, and I/O failure may leave a partially written line.
 Call `Logger::flush` explicitly for buffered output.
 
@@ -94,43 +102,130 @@ typed reference to `defs["log.level:INFO"]`, whose value supplies its descriptio
 | `log.level:ERROR` | Error condition |
 
 The relation and each used named value are emitted once per output stream,
-alongside the first statement that needs them. Unused levels are not emitted.
-Another statement at the same level reuses its definition, and subsequent
-occurrences still contain only a statement reference and arguments.
-Definitions are immutable; missing or conflicting named values fail playback.
+alongside the first statement that needs them; the startup announcement already
+carries `log.level:INFO`. Unused levels are not emitted. Another statement at
+the same level reuses its definition, and subsequent occurrences still contain
+only the address, statement reference, and arguments. Definitions are immutable; missing
+or conflicting named values fail playback.
 
-All non-positional attributes currently come from static statement metadata.
-There is no dynamic override, filtering, or thread-local injection yet.
+The levels are declared with [`entities!`](#declaring-attributes-and-entities)
+in `sprintr_prototype::schema`, like any other relation. Playback recognizes
+named entities generically, not only levels.
+
+The level comes from static statement metadata. There is no dynamic override,
+filtering, or thread-local application attribute injection yet.
 Positional `$arg` associations still bind to each event's argument values.
 Playback includes the level first on the association line, for example
 `log.level = INFO, account.name = Ada`.
 
-## Static string attributes
+## Declaring attributes and entities
 
 ```rust
-use sprintr_prototype::{Attribute, attribute, info};
+use sprintr_prototype::{attributes, entities, info};
 
-static ACCT_NAME: Attribute = attribute!("account.name", "Account name");
+attributes! {
+    /// Account name
+    pub account_name: str = "account.name";
+    /// Retry attempt
+    pub retry_count: u64 = "retry.count";
+}
+
+entities! {
+    /// Deployment environment
+    pub environment = "deployment.environment" {
+        /// Production traffic
+        PRODUCTION,
+        /// Pre-production testing
+        STAGING,
+    }
+}
+
 let name = "Ada";
-let value = 42u32;
-info!("hello {}, value {value:04x}", ACCT_NAME = name)?;
+info!("hello {}, attempt {}", account_name = name, retry_count = 2u8)?;
+assert_eq!(environment::STAGING.description(), "Pre-production testing");
 # Ok::<(), std::io::Error>(())
 ```
 
-`ACCT_NAME = name` associates the next positional placeholder with a declared
-attribute; it is not a named formatting argument or an assignment to the handle.
-The handle supplies the string type, so `{}` or `{:s}` is accepted. The stored
-placeholder is `{@account.name}` regardless of the Rust variable or import alias.
-Canonical names cannot be empty, reserved (`log.relation`, `log.statement`, `log.level`), or
-contain braces/colons, which would conflict with placeholder syntax.
+Each doc comment is the recorded description and is required. Attribute values
+are `str` or `u64`. Entity relations hold object values; statically named values
+such as `log.level:INFO` are the unusual case.
+`#[anonymous]` marks a relation whose values have no names, such as
+`log.statement`. A relation with named values also declares a module of the
+same name holding them.
 
-Use `static` or `const` handles, not runtime locals. `attribute!` pre-encodes the
-relation definition and canonical-name fragments. The earlier runtime
-`register_attribute` API has been replaced rather than maintained as a second
-metadata path. Names are process-wide, not namespaced; dots have no scoping
-meaning. Equal declarations may appear in multiple modules. First use checks
-cross-module conflicts before output; the compiler cannot check declarations
-across independently compiled modules. The current API supports only strings.
+`account_name = name` associates the next positional placeholder with a declared
+attribute; it is not a named formatting argument or an assignment to the handle.
+The handle supplies the type, so a string attribute accepts `{}` or `{:s}` and
+an unsigned one accepts `{}` (decimal) or `{:x}`. The stored placeholder is
+`{@account.name}` regardless of the Rust variable or import alias. Canonical
+names cannot be empty, be `log.relation`, or contain braces/colons, which would
+conflict with placeholder syntax. Handles must be declared statics, not locals.
+
+Declarations are pre-encoded at compile time and collected at link time. They
+emit nothing by themselves. Names are process-wide, not namespaced; dots have
+no scoping meaning, and equal declarations in different crates share a name.
+sprintr's own relations (`log.statement`, `log.level`, `process.pid`,
+`telemetry.sdk.*`) are declared the same way in `sprintr_prototype::schema`;
+only `log.relation`, the relation of relations, is built into the wire format.
+
+### Defining and reusing an anonymous object
+
+```rust
+use serde::Serialize;
+use sprintr_prototype::{entities, info};
+
+entities! {
+    /// A user session; its values have identities, not names
+    #[anonymous]
+    session = "session";
+}
+
+#[derive(Serialize)]
+struct Login<'a> { account: &'a str, method: &'a str }
+
+let login = session.new(Login { account: "Ada", method: "passkey" })?;
+info!("opened {}", login)?;
+info!("resumed {}", login)?;
+# Ok::<(), std::io::Error>(())
+```
+
+`new` snapshots a serializable **object** and assigns an identity. It does not
+log. For example, if `session:1` first appears in record 1, the `opened` event
+includes `"session:1":{"account":"Ada","method":"passkey"}` in `defs`.
+Both events have `"args":[{"$ref":"1#/defs/session:1"}]`. The number before
+`#` selects record 1 **on the event's thread**; the fragment selects that
+record's definition. Playback displays the resolved object, not the pointer.
+Another output or thread defines the object on first use there, so a short
+reference never needs another stream. An owned `message!` snapshot has no
+delivery address and uses `#/defs/session:1` within its own definitions.
+
+### Collisions
+
+The compiler cannot check declarations across independently compiled crates,
+and a name collision does not stop the process. When logging first starts, all
+declarations are resolved once. sprintr's schema is resolved first; afterwards,
+the first declaration of a name keeps it, in link order, which is unspecified.
+A later, different declaration is recorded under a content-derived name such as
+`account.name_1a2b3c4d`, and its statements use that name. Each output stream
+announces every rename in a `WARN` record right after startup:
+
+```text
+attribute account.name (Legal name of the account holder) collides with an earlier declaration; recorded as account.name_1a2b3c4d
+log.level = WARN
+```
+
+## Startup announcement
+
+Each caller-owned `Logger` begins its output with an `INFO` record announcing
+the process and the library, followed by any collision warnings. Stdout announces
+once per process. Every emitted event has `thread` (the native unsigned thread
+ID) and `seq` (the record ID within that thread). A thread's first record is
+`seq:0` and defines `log.thread:<id>`. All outputs on the thread share one
+counter; another output introduces the thread again without restarting at zero.
+The writer does not track OS ID reuse. Playback reports a repeated or
+decreasing record number for the same thread rather than silently linking it.
+Sequence numbers may have gaps; a failed write cannot leave a later reference
+pointing at an unaccepted definition.
 
 ## Statement templates and events
 
@@ -151,13 +246,18 @@ record. Ordinary JSON Pointer semantics are unchanged. Repeated associations
 remain separate `refs` entries. Named level references live in static template
 `attrs`; `message!` omits the level and keeps that map empty.
 
-First use assigns a process-local nonzero `u64` identity. `attrs.log.statement`
+`seq`, `stmt`, and `thread` are wire shorthand for `attrs["log.record"]`,
+`attrs["log.statement"]`, and `attrs["log.thread"]`. Readers accept either spelling, but reject records
+that supply both for the same value. In memory, `Message::attrs` uses the full
+names. A snapshot has `stmt` but gets `thread` and `seq` only when written to a stream.
+
+First use assigns a process-local nonzero `u64` statement identity. `stmt`
 is a typed reference to that entity, resolved through `defs["log.statement:<id>"]`.
 IDs are not globally qualified references and must not be conflated across
 processes. Distinct callsites have distinct identities even for equal templates.
-Declarations alone emit nothing. The first occurrence carries its statement,
-attribute, and required relation/level definitions in the same event. Later
-occurrences contain only `attrs` and `args`. New callsites introduce their own
+The first occurrence carries its statement, attribute, and required
+relation/level definitions not already sent in the same stream. Later
+occurrences with no new definitions contain only `seq`, `stmt`, `thread`, and `args`. New callsites introduce their own
 statement definitions but need not repeat already-emitted relations or levels.
 
 Each caller-owned logger tracks first use independently. Stdout tracks it per
@@ -172,7 +272,8 @@ It binds each occurrence without copying an expanded record. Playback renders th
 association line (`log.level = INFO, account.name = Ada`), with multiple associations separated
 by commas. The association line escapes control characters. Unknown relations,
 conflicting definitions, type mismatches, and invalid bindings stop playback.
-The prototype implements `$arg` bindings, not generic entity pointers yet.
+The prototype implements `$arg` bindings and references to whole anonymous
+objects in `defs`, not arbitrary pointer traversal or cross-process lookup.
 The earlier per-record `msg`/`refs` wire format is no longer accepted.
 
 ## Producer allocation profile
@@ -183,22 +284,25 @@ JSON directly into reusable storage. It does not construct an owned `Message`,
 copy strings into temporary allocations, or parse the format again at runtime.
 
 Storage and rollback are adapted from the original direct OTLP implementation.
-`Logger::new` preallocates 256 bytes and retains its buffer between records.
-Larger records can grow it; once sufficient capacity and first-use definition
-bookkeeping are available, successful recording performs zero library heap
-allocations. First use validates the static schema and assigns the statement's
-identity once; subsequent recording neither locks the registry nor re-encodes
-definitions. By default stdout uses the
+`Logger::new` preallocates 2 KB, enough for the startup announcement, and
+retains its buffer between records. Larger records can grow it; once sufficient
+capacity and first-use definition bookkeeping are available, successful
+recording performs zero library heap allocations. Declarations are resolved
+once per process, and first use assigns the statement's identity once;
+subsequent recording neither locks the registry nor re-encodes definitions.
+By default stdout uses the
 same approach with a per-thread scratch buffer, without global logger setup.
 Encoding happens before acquiring the stdout lock.
 
 Fixed stack storage avoids the initial heap-buffer allocation, but first-use
-definition tracking can still allocate:
+definition tracking can still allocate. Bounded storage must fit the startup
+announcement; 2 KB is sufficient, and a smaller buffer fails loudly with
+`StorageFull` on the first record:
 
 ```rust
 use sprintr_prototype::{Logger, buffer::StackBuffer, info};
 
-let mut logger = Logger::with_buffer(std::io::sink(), StackBuffer::<512>::new());
+let mut logger = Logger::with_buffer(std::io::sink(), StackBuffer::<2048>::new());
 let name = "Ada";
 let value = 42u32;
 info!("hello {name:s}, value {value:04x}", logger: logger)?;
@@ -222,8 +326,11 @@ contention, and retained-memory policies still need production evaluation.
 ## Format subset
 
 - `:s` captures an `AsRef<str>` value. Its stored placeholder omits `:s`.
-- `{}` also captures strings when the positional argument uses a static
-  attribute handle, such as `ACCT_NAME = name`; its stored label is `@account.name`.
+- A bare `{}` or `{login}` borrows an anonymous object handle. The argument
+  on the wire is a reference; playback displays the resolved object as JSON.
+- `{}` also captures a value when the positional argument uses a declared
+  attribute handle, such as `account_name = name`; its stored label is
+  `@account.name`. Unsigned attributes render `{}` in decimal.
 - `:x` captures a `u8`, `u16`, `u32`, or `u64` value without formatting it first.
   `#` includes `0x`, `0` enables zero padding, and a constant width specifies
   the minimum width including any prefix. For example, `:04x` renders `002a`
