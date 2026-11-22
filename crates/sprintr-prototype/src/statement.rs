@@ -8,64 +8,9 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Default number of caller PCs, excluding the static statement location.
-pub const DEFAULT_STACK_DEPTH: usize = 10;
-/// Capacity of the stack-local capture buffer used by the macros.
-pub const MAX_STACK_DEPTH: usize = 64;
-static STACK_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_STACK_DEPTH);
-
-/// Set the process-wide limit on caller PCs per event. Zero skips unwinding.
-pub fn set_stack_limit(limit: usize) -> io::Result<()> {
-    if limit > MAX_STACK_DEPTH {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("stack limit {limit} exceeds {MAX_STACK_DEPTH}"),
-        ));
-    }
-    STACK_LIMIT.store(limit, Ordering::Relaxed);
-    Ok(())
-}
-
-/// Called directly at the macro invocation, before entering the logger.
-#[doc(hidden)]
-#[inline(never)]
-pub fn capture_stack(pcs: &mut [u64; MAX_STACK_DEPTH]) -> io::Result<&[u64]> {
-    let limit = STACK_LIMIT.load(Ordering::Relaxed);
-    if limit == 0 {
-        return Ok(&[]);
-    }
-    let marker = 0u8;
-    let boundary = std::ptr::from_ref(std::hint::black_box(&marker)).addr();
-    let mut len = 0;
-    let mut past_capture = false;
-    let mut saw_callsite = false;
-    backtrace::trace(|frame| {
-        // Native stacks grow down. If the backend lacks SPs, use the function
-        // boundary instead. Neither check requires debug-symbol lookup.
-        let sp = frame.sp().addr();
-        if (sp > boundary || past_capture) && !frame.ip().is_null() {
-            if saw_callsite {
-                pcs[len] = frame.ip().addr() as u64;
-                len += 1;
-            } else {
-                saw_callsite = true; // frame zero is already in the statement
-            }
-        } else if sp == 0 && frame.symbol_address().addr() == capture_stack as *const () as usize {
-            past_capture = true;
-        }
-        len < limit
-    });
-    if !saw_callsite {
-        return Err(io::Error::other(
-            "unwinder could not locate the logging callsite",
-        ));
-    }
-    Ok(&pcs[..len])
-}
 
 /// Compiler-generated anonymous entity, unique to a macro callsite.
 #[doc(hidden)]

@@ -287,7 +287,11 @@ The earlier per-record `msg`/`refs` wire format is no longer accepted.
 the message format. It needs no debug information or runtime lookup.
 
 `attrs["log.stack"]` starts at **frame 1**: up to 10 native caller PCs by
-default, innermost first. To disable unwinding process-wide, call
+default on macOS and glibc Linux, innermost first. The producer calls libc's
+`backtrace()` directly into a stack-local buffer; it takes no SDK-wide lock
+and looks up no symbols. Other targets retain frame zero and emit an empty
+caller list; requesting a positive limit there returns `Unsupported`.
+To disable unwinding process-wide, call
 `sprintr_prototype::set_stack_limit(0)?;`. The event then carries `[]` and
 the statement keeps its source. Limits from 0 to 64 fit the producer's
 fixed-size capture buffer.

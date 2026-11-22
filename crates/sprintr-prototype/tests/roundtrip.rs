@@ -24,17 +24,25 @@ fn repeated_statement_captures_the_current_call_path() {
     let mut logger = Logger::new(Vec::new());
     emit(&mut logger);
     via_caller(&mut logger);
+    via_caller(&mut logger);
     let events = records(&logger.into_inner());
-    let (a, b) = (&events[0], &events[1]);
+    let (a, b, c) = (&events[0], &events[1], &events[2]);
     assert_eq!(a.attrs["log.statement"], b.attrs["log.statement"]);
     assert!(b.defs.is_empty());
-    for event in [a, b] {
+    if sprintr_prototype::DEFAULT_STACK_DEPTH == 0 {
+        assert!(events.iter().all(|e| e.stack.is_empty()));
+        return;
+    }
+    for event in [a, b, c] {
         assert!((1..=10).contains(&event.stack.len()));
         assert!(!event.stack.contains(&0));
     }
     // Both events executed the same info! instruction. The first dynamic PC
     // differs because it belongs to its caller, not to that instruction.
     assert_ne!(a.stack[0], b.stack[0]);
+    // The two via_caller invocations differ one frame further out, but
+    // their call to emit is at exactly the same instruction.
+    assert_eq!(b.stack[0], c.stack[0]);
 }
 
 /// Scenario: explicit positional expressions and implicit captures describe the same message.

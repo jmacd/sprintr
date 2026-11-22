@@ -14,6 +14,7 @@ mod declare;
 mod entity;
 mod runtime;
 pub mod schema;
+mod stack;
 mod statement;
 mod stream;
 pub mod symbols;
@@ -32,7 +33,7 @@ pub use sprintr_message::{
     STATEMENT_PREFIX, StatementSource, StatementTemplate, THREAD, format, format::FormatError,
 };
 
-pub use statement::{DEFAULT_STACK_DEPTH, MAX_STACK_DEPTH, set_stack_limit};
+pub use stack::{DEFAULT_STACK_DEPTH, MAX_STACK_DEPTH, set_stack_limit};
 
 #[doc(hidden)]
 pub use sprintr_prototype_macros::{
@@ -395,9 +396,8 @@ pub mod __private {
     use super::{HeapBuffer, Logger, StreamState, announce};
     pub use crate::declare::{Declaration, RelationMeta};
     pub use crate::entity::BorrowedArgument;
-    pub use crate::statement::{
-        Statement, capture_stack, concatenate, encoded_len, json_string, json_string_len,
-    };
+    pub use crate::stack::capture_stack;
+    pub use crate::statement::{Statement, concatenate, encoded_len, json_string, json_string_len};
     pub use linkme;
     use std::cell::RefCell;
     use std::io;

@@ -245,6 +245,7 @@ dependencies = [
  "backtrace",
  "findshlibs",
  "gettid",
+ "libc",
  "linkme",
  "serde",
  "serde_json",

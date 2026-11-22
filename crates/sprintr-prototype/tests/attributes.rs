@@ -43,7 +43,7 @@ fn first_record_bootstraps_statement_and_later_records_reuse_it() {
     let thread = first.attrs[THREAD];
     let seq = first.attrs[RECORD];
     let pcs = &first.stack;
-    assert!((1..=10).contains(&pcs.len()) && !pcs.contains(&0));
+    assert!(pcs.len() <= sprintr_prototype::DEFAULT_STACK_DEPTH && !pcs.contains(&0));
     assert!(startup.defs.contains_key("log.relation:log.source"));
     assert!(startup.defs.contains_key("log.relation:log.stack"));
     assert_eq!(

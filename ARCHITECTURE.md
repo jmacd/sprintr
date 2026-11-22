@@ -37,12 +37,10 @@ sinks. It must not require constructing an owned value tree per event.
 Parsing formats, copying argument strings into intermediate objects,
 and allocating argument collections do not belong on this path.
 
-Entity construction pays for capturing and encoding an immutable
-snapshot once. Subsequent uses emit references, rather than evaluating
-or encoding the entity value again. Re-emitting a definition should
-reuse its encoded chunks, with deferred references and framing assembled
-as needed. Reference bookkeeping must not introduce per-use allocations
-on the steady-state path.
+Entity construction pays once to encode the immutable fields. The first
+accepted definition replaces those bytes with its record address and pointer;
+subsequent uses emit references. Reference bookkeeping must not introduce
+per-use allocations on the steady-state path.
 
 The original direct OTLP implementation provides the performance model:
 borrowed values, static metadata, direct writes, reusable storage, and
@@ -279,13 +277,56 @@ the body, as a list.
 }
 ```
 
+### Next milestone: structured arguments
+
+Building on [open-telemetry/otel-arrow#4450](https://github.com/open-telemetry/otel-arrow/pull/4450),
+a Rust struct should be able to hold entity handles and implement a formatting
+trait. Its implementation can describe a value with `structured!`-style
+formatting: positional arguments, optionally bound to declared attributes,
+just as in a logging statement. A positional argument can itself be another
+structured value. The reader needs both the typed fields and their formatting
+instructions; producing a formatted string during capture loses the fields.
+The Rust API and the encoding of nested formatting instructions are still open.
+
+The outer record owns `refs` and `defs` for the whole traversal. `args` holds
+the application data; attribute and entity associations point into it rather
+than wrapping each field in metadata. An inline `$ref` stands in for a value
+when expanding it would close a cycle. For example, a node whose `next` is
+itself can be encoded like this (record excerpt):
+
+```json
+{
+  "args": [{"name": "root", "next": {"$ref": "#/args/0"}}],
+  "refs": [{"node:7": "#/args/0"}, {"node.name": "#/args/0/name"}]
+}
+```
+
+For this to terminate, the encoder must know a node's identity and intended
+location **before** descending into its children. The recursive formatting API
+must expose such edges to the encoder; it cannot detect a cycle inside opaque
+user code that recurses on its own. The pointer above targets the occurrence
+in this record. Publishing that location to other records waits for acceptance.
+
 ## References
 
-The handle holds an immutable snapshot. On first use, the writer puts its
-value in `defs["<relation>:<identity>"]` and remembers the location **for that
-output and thread**, only after the write succeeds. Reusing the handle in a
-different output or thread introduces a new local definition of the same
-identity. The handle need not be mutated or locked.
+The intended default handle is thread-local (`Rc`). It starts with encoded
+bytes and any deferred nested references. On first use, the originating thread
+emits the definition. Once the output accepts the record, all local clones see
+the recorded location and the handle releases the payload. A rejected write
+leaves the payload available; it creates no reference target.
+
+Sharing is explicit. Exporting an already recorded handle produces an `Arc`
+containing the origin reference. For a pending handle, the preferred design
+is to emit a dedicated entity-creation statement on the originating thread
+before exporting. The receiving threads then need neither the bytes nor a
+mutex to decide who defines the entity. The reference must identify the
+originating log, thread, record, and location within that record; a bare
+sequence on the receiving thread would select the wrong record. The export
+API and qualified wire spelling remain to be designed.
+
+The current JSON prototype instead defines an entity on first use per output
+and thread, and retains those locations in the writer. Explicit export and
+nested structured arguments are design goals, not current wire behavior.
 
 Each emitted record carries `thread` (the OS-assigned `log.thread` ID) and
 `seq` (the `log.record` ID within that thread, starting at zero). The first record on
@@ -357,17 +398,21 @@ interface's `should_sample` method returns true. A rejected log record
 does not assign definition locations or mark entities as defined;
 eager construction-time encoding is independent of this decision.
 
-The initial design assumes reliable delivery of emitted records; it
-does not require a durable-delivery acknowledgment protocol for
-definitions. Record loss is nevertheless tolerated: references to a
-lost definition may remain explicitly unresolved without preventing
-the rest of the graph from being loaded.
+A reader may cache definitions on the assumption that it can retrieve an
+older record by its address: the originating log or process execution, the
+thread ID, and the record sequence number. On a cache miss it can fetch that
+exact record and apply the reference fragment. Delivery is imperfect: the
+address identifies what to fetch, but the record may never have arrived.
+In that case the graph reference remains unresolved. The current JSON Lines
+reader keeps definitions in memory and reports missing targets during playback.
 
-Entity definitions may be repeated periodically to limit the impact
-of loss on later references that target the repeated definitions.
-Repetition in a new record does not by itself repair references to a
-missing earlier record. The repetition policy and recovery of those
-earlier references are left for future work.
+Future recovery options include storing definitions durably for out-of-band
+retrieval through a telemetry agent, or repeating a definition when its
+entity is used again after a configured interval. Later references can point
+to the new record; existing references still select the original one.
+Repeating a definition after its handle has released the bytes would require
+retrieving the payload from storage or choosing a separate retention policy.
+Storage, retrieval, and repetition policies are outside the current milestone.
 
 ```
 {

@@ -17,7 +17,16 @@ fn static_invocation_survives_disabling_caller_capture() {
     set_stack_limit(0).unwrap();
     let mut logger = Logger::new(Vec::new());
     let line = emit(&mut logger);
-    set_stack_limit(1).unwrap();
+    let callers = if sprintr_prototype::DEFAULT_STACK_DEPTH == 0 {
+        assert_eq!(
+            set_stack_limit(1).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        0
+    } else {
+        set_stack_limit(1).unwrap();
+        1
+    };
     emit(&mut logger);
     let records = common::lines(&logger.into_inner());
     let mut reader = Renderer::default();
@@ -31,7 +40,7 @@ fn static_invocation_survives_disabling_caller_capture() {
     assert_eq!(source.file, file!());
     assert_eq!(source.line, line);
     assert_eq!(source.column, 9); // the 'i' in info!, not the format literal
-    assert_eq!(records[2].stack.len(), 1);
+    assert_eq!(records[2].stack.len(), callers);
     assert!(records[2].defs.is_empty());
     assert_eq!(
         reader.statement_source(records[2].attrs["log.statement"]),
