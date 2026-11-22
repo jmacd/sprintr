@@ -6,14 +6,15 @@
 //! cargo run --quiet -p sprintr-prototype --example tour
 //! ```
 //!
-//! Each recorded JSON line is printed followed by its rendering.
+//! Each JSON record is followed immediately by its indented rendering.
 
 use serde::Serialize;
 use sprintr_prototype::buffer::StackBuffer;
+use sprintr_prototype::symbols::LocalSymbols;
 use sprintr_prototype::{
     Logger, Message, Renderer, attributes, entities, error, info, message, replay, warn,
 };
-use std::io;
+use std::io::{self, BufWriter, Write};
 
 // Attributes are declared once, with doc comments as their recorded
 // descriptions. Handles are lowercase so that log calls read like assignments.
@@ -107,9 +108,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `message!` captures an owned, unlevelled snapshot that carries all of
     // its definitions, renders independently, and can be written later.
     let snapshot = message!("snapshot of {} at {value:#x}", account_name = name);
-    assert_eq!(
-        snapshot.render()?,
-        "snapshot of Ada at 0x2a\naccount.name = Ada"
+    assert!(
+        snapshot
+            .render()?
+            .ends_with("Z snapshot of Ada at 0x2a\naccount.name = Ada")
     );
     logger.write(&snapshot)?;
 
@@ -118,32 +120,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A reader needs only the recorded JSON. `Renderer` retains definitions
     // across records; `replay` does the same for a whole stream.
+    let mut out = BufWriter::new(io::stdout().lock());
     let mut renderer = Renderer::default();
-    let mut rendered = String::new();
-    for line in String::from_utf8(encoded.clone())?.lines() {
+    let mut rendered = Vec::new();
+    let mut symbols = LocalSymbols::current_process()?;
+    for line in std::str::from_utf8(&encoded)?.lines() {
         let record: Message = serde_json::from_str(line)?;
         let text = renderer.render(&record)?;
-        println!("{line}");
+        writeln!(out, "{line}")?;
         for line in text.lines() {
-            println!("    {line}");
+            writeln!(out, "    {line}")?;
         }
-        println!();
-        rendered.push_str(&text);
-        rendered.push('\n');
+        let site = renderer
+            .statement_source(record.attrs["log.statement"])
+            .expect("rendered statement");
+        writeln!(out, "    log.stack =\n        {site}")?;
+        // Only callers need symbolization; frame zero came from the compiler.
+        for &pc in &record.stack {
+            writeln!(out, "        {}", symbols.format_frame(pc))?;
+        }
+        writeln!(out)?;
+        out.flush()?;
+        writeln!(rendered, "{text}")?;
     }
     let mut replayed = Vec::new();
     replay(encoded.as_slice(), &mut replayed)?;
-    assert_eq!(String::from_utf8(replayed)?, rendered);
+    assert_eq!(replayed, rendered);
 
     // Declarations are ordinary statics with their metadata.
     let staging = &environment::STAGING;
-    println!("{}: {}", environment.name(), environment.description());
-    println!("  {}: {}", staging.name(), staging.description());
-
-    // Without `logger:`, records go to stdout, which announces once per
-    // process and keeps first-use definitions per thread.
-    println!();
-    info!("written to stdout by default")?;
-    info!("again, without another announcement")?;
+    writeln!(out, "{}: {}", environment.name(), environment.description())?;
+    writeln!(out, "  {}: {}", staging.name(), staging.description())?;
+    out.flush()?;
     Ok(())
 }

@@ -9,9 +9,64 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Default number of caller PCs, excluding the static statement location.
+pub const DEFAULT_STACK_DEPTH: usize = 10;
+/// Capacity of the stack-local capture buffer used by the macros.
+pub const MAX_STACK_DEPTH: usize = 64;
+static STACK_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_STACK_DEPTH);
+
+/// Set the process-wide limit on caller PCs per event. Zero skips unwinding.
+pub fn set_stack_limit(limit: usize) -> io::Result<()> {
+    if limit > MAX_STACK_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("stack limit {limit} exceeds {MAX_STACK_DEPTH}"),
+        ));
+    }
+    STACK_LIMIT.store(limit, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Called directly at the macro invocation, before entering the logger.
+#[doc(hidden)]
+#[inline(never)]
+pub fn capture_stack(pcs: &mut [u64; MAX_STACK_DEPTH]) -> io::Result<&[u64]> {
+    let limit = STACK_LIMIT.load(Ordering::Relaxed);
+    if limit == 0 {
+        return Ok(&[]);
+    }
+    let marker = 0u8;
+    let boundary = std::ptr::from_ref(std::hint::black_box(&marker)).addr();
+    let mut len = 0;
+    let mut past_capture = false;
+    let mut saw_callsite = false;
+    backtrace::trace(|frame| {
+        // Native stacks grow down. If the backend lacks SPs, use the function
+        // boundary instead. Neither check requires debug-symbol lookup.
+        let sp = frame.sp().addr();
+        if (sp > boundary || past_capture) && !frame.ip().is_null() {
+            if saw_callsite {
+                pcs[len] = frame.ip().addr() as u64;
+                len += 1;
+            } else {
+                saw_callsite = true; // frame zero is already in the statement
+            }
+        } else if sp == 0 && frame.symbol_address().addr() == capture_stack as *const () as usize {
+            past_capture = true;
+        }
+        len < limit
+    });
+    if !saw_callsite {
+        return Err(io::Error::other(
+            "unwinder could not locate the logging callsite",
+        ));
+    }
+    Ok(&pcs[..len])
+}
 
 /// Compiler-generated anonymous entity, unique to a macro callsite.
 #[doc(hidden)]
@@ -60,6 +115,8 @@ impl Statement {
             }
         };
         add(runtime.relation(crate::schema::log_statement.__meta())?);
+        add(runtime.relation(crate::schema::log_stack.__meta())?);
+        add(runtime.relation(crate::schema::log_source.__meta())?);
         let mut renamed = false;
         let mut attrs = BTreeMap::new();
         for value in self.values {
@@ -146,6 +203,56 @@ pub const fn encoded_len(parts: &[&[u8]]) -> usize {
     length
 }
 
+// Compiler-provided file and module strings are UTF-8 but are not JSON literals
+// (e.g. backslashes in a Windows path). Escape them during const evaluation.
+const fn json_escape_len(b: u8) -> usize {
+    match b {
+        b'"' | b'\\' => 2,
+        0..=31 => 6,
+        _ => 1,
+    }
+}
+
+#[doc(hidden)]
+pub const fn json_string_len(text: &str) -> usize {
+    let mut len = 2;
+    let mut i = 0;
+    while i < text.len() {
+        len += json_escape_len(text.as_bytes()[i]);
+        i += 1;
+    }
+    len
+}
+
+#[doc(hidden)]
+pub const fn json_string<const N: usize>(text: &str) -> [u8; N] {
+    let mut out = [b'"'; N];
+    let (mut i, mut pos) = (0, 1);
+    let hex = b"0123456789abcdef";
+    while i < text.len() {
+        let b = text.as_bytes()[i];
+        match b {
+            b'"' | b'\\' => {
+                out[pos] = b'\\';
+                out[pos + 1] = b;
+            }
+            0..=31 => {
+                out[pos] = b'\\';
+                out[pos + 1] = b'u';
+                out[pos + 2] = b'0';
+                out[pos + 3] = b'0';
+                out[pos + 4] = hex[(b >> 4) as usize];
+                out[pos + 5] = hex[(b & 15) as usize];
+            }
+            _ => out[pos] = b,
+        }
+        pos += json_escape_len(b);
+        i += 1;
+    }
+    assert!(pos + 1 == N);
+    out
+}
+
 #[doc(hidden)]
 pub const fn concatenate<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
     let mut output = [0; N];
@@ -165,7 +272,13 @@ pub const fn concatenate<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
 }
 
 #[doc(hidden)]
-pub fn owned_message(statement: &'static Statement, args: &[BorrowedArgument<'_>]) -> Message {
+pub fn owned_message(
+    statement: &'static Statement,
+    stack: io::Result<&[u64]>,
+    args: &[BorrowedArgument<'_>],
+) -> Message {
+    let stack = stack.expect("cannot capture logging snapshot stack");
+    let timestamp = crate::timestamp_now().expect("cannot timestamp logging snapshot");
     let resolved = statement
         .resolve()
         .unwrap_or_else(|error| panic!("cannot resolve logging statement: {error}"));
@@ -194,6 +307,8 @@ pub fn owned_message(statement: &'static Statement, args: &[BorrowedArgument<'_>
         }
     }
     Message {
+        timestamp,
+        stack: stack.to_vec(),
         attrs: BTreeMap::from([(STATEMENT.into(), resolved.id)]),
         args: args.iter().map(|argument| argument.snapshot()).collect(),
         defs,

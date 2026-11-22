@@ -18,8 +18,8 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record
 After the [startup announcement](#startup-announcement):
 
 ```json
-{"seq":1,"stmt":2,"thread":88888,"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
-{"seq":2,"stmt":2,"thread":88888,"args":["Grace",42]}
+{"seq":1,"stmt":2,"thread":88888,"ts":1704067200123456789,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}}}}
+{"seq":2,"stmt":2,"thread":88888,"ts":1704067200124567890,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Grace",42]}
 ```
 
 Replay from stdin:
@@ -30,15 +30,16 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record \
 ```
 
 ```text
-process 50316 started logging with sprintr 0.1.0
+2024-01-01T00:00:00.122Z process 50316 started logging with sprintr 0.1.0
 log.level = INFO, process.pid = 50316, telemetry.sdk.name = sprintr, telemetry.sdk.version = 0.1.0
-hello Ada, value 002a
+2024-01-01T00:00:00.123Z hello Ada, value 002a
 log.level = INFO, account.name = Ada
-hello Grace, value 002a
+2024-01-01T00:00:00.124Z hello Grace, value 002a
 log.level = INFO, account.name = Grace
 ```
 
-For a tour that prints each record followed by its rendering, run
+For a tour that prints each JSON record immediately followed by its indented
+rendering, run
 `cargo run --quiet -p sprintr-prototype --example tour`.
 
 The reader requires only the recorded JSON, not the original application.
@@ -63,7 +64,7 @@ logger.flush()?;
 
 // Capture and rendering are independent of delivery.
 let record = message!("hello {name:s}, value {value:#04x}");
-assert_eq!(record.render()?, "hello Ada, value 0x2a");
+assert!(record.render()?.ends_with("Z hello Ada, value 0x2a"));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -72,7 +73,8 @@ directly without requiring `Display` or allocating intermediate owned arguments.
 The caller retains ownership. Expressions are evaluated once per placeholder
 occurrence. `message!` is a separate, allocating API for unlevelled owned snapshots.
 Its snapshots include their definitions and are not preceded by an announcement.
-It panics only if statement identities are exhausted; `info!` returns that error.
+It panics if statement identities are exhausted or the clock is outside the
+representable range; `info!` returns the error instead.
 Writers are synchronous, and I/O failure may leave a partially written line.
 Call `Logger::flush` explicitly for buffered output.
 
@@ -230,13 +232,14 @@ pointing at an unaccepted definition.
 ## Statement templates and events
 
 Every `info!`, `warn!`, `error!`, or `message!` callsite has a static anonymous `log.statement`
-entity. Its complete JSON value is assembled during Rust constant evaluation:
+entity. Its static fields are pre-encoded:
 
 ```json
 {
   "attrs": {"log.level": "INFO"},
   "refs": [{"account.name": {"$arg": 0}}],
-  "msg": "hello {@account.name}, value {value:04x}"
+  "msg": "hello {@account.name}, value {value:04x}",
+  "source": {"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}
 }
 ```
 
@@ -244,12 +247,17 @@ The template contains no `args` or nested `defs`. `{"$arg": 0}` binds to the
 first argument of each event using it; it is not a pointer into the template's
 record. Ordinary JSON Pointer semantics are unchanged. Repeated associations
 remain separate `refs` entries. Named level references live in static template
-`attrs`; `message!` omits the level and keeps that map empty.
+`attrs`; `message!` omits the level but still captures the event's stack.
 
 `seq`, `stmt`, and `thread` are wire shorthand for `attrs["log.record"]`,
 `attrs["log.statement"]`, and `attrs["log.thread"]`. Readers accept either spelling, but reject records
 that supply both for the same value. In memory, `Message::attrs` uses the full
 names. A snapshot has `stmt` but gets `thread` and `seq` only when written to a stream.
+
+Each record also carries `ts`, the wall-clock capture time as a `u64`
+count of Unix nanoseconds. Playback displays UTC to milliseconds, truncating
+sub-millisecond digits only for display. `message!` retains its original
+timestamp when written later. Use `seq`, not wall-clock time, for ordering.
 
 First use assigns a process-local nonzero `u64` statement identity. `stmt`
 is a typed reference to that entity, resolved through `defs["log.statement:<id>"]`.
@@ -257,7 +265,7 @@ IDs are not globally qualified references and must not be conflated across
 processes. Distinct callsites have distinct identities even for equal templates.
 The first occurrence carries its statement, attribute, and required
 relation/level definitions not already sent in the same stream. Later
-occurrences with no new definitions contain only `seq`, `stmt`, `thread`, and `args`. New callsites introduce their own
+occurrences with no new definitions contain only `seq`, `stmt`, `thread`, `ts`, `attrs`, and `args`. New callsites introduce their own
 statement definitions but need not repeat already-emitted relations or levels.
 
 Each caller-owned logger tracks first use independently. Stdout tracks it per
@@ -275,6 +283,49 @@ conflicting definitions, type mismatches, and invalid bindings stop playback.
 The prototype implements `$arg` bindings and references to whole anonymous
 objects in `defs`, not arbitrary pointer traversal or cross-process lookup.
 The earlier per-record `msg`/`refs` wire format is no longer accepted.
+
+### Call stacks and symbols
+
+**Frame 0** is the statement's `source`: Rust's `module_path!()`, `file!()`,
+`line!()`, and `column!()` at the logging macro invocation, pre-encoded with
+the message format. It needs no debug information or runtime lookup.
+
+`attrs["log.stack"]` starts at **frame 1**: up to 10 native caller PCs by
+default, innermost first. To disable unwinding process-wide, call
+`sprintr_prototype::set_stack_limit(0)?;`. The event then carries `[]` and
+the statement keeps its source. Limits from 0 to 64 fit the producer's
+fixed-size capture buffer.
+Each PC identifies an anonymous `log.source` in that process; there are no
+`log.source:<pc>` records. Reaching the same statement through a different
+caller can change the stack without changing `stmt`. A `message!` snapshot
+keeps its capture stack when written later.
+
+The `tour` example decodes a record before asking `symbols::LocalSymbols` for
+module, demangled function, source file, and line. Its `log.stack =` display
+uses `at call_once (src/ops/function.rs:250)` without generic arguments.
+Paths start at the nearest `crates/` or `src/` directory, then drop whole
+leading components to fit 32 characters; a long filename stays intact.
+Lookup is cached by PC and
+may include inlined frames. Plain replay does not load symbols. For line
+information, keep the exact binary and its debug info (e.g. the matching dSYM
+on macOS); for release builds use `CARGO_PROFILE_RELEASE_DEBUG=1`. Missing
+debug information leaves the PC intact.
+
+For **offline** playback, save the originating process's loaded modules in
+one optional sidecar, not one symbol entry per address:
+
+```sh
+cargo run --quiet -p sprintr-prototype --example json_lines -- record modules.json > records.jsonl
+cargo run --quiet -p sprintr-prototype --example json_lines -- replay modules.json < records.jsonl
+```
+
+This prints the module and its linked call-instruction address for each PC
+on each event. Pass that address to `llvm-symbolizer
+--obj=<matching-binary> <linked-address>` for names and lines. The sidecar
+contains executable segment ranges, their link-time addresses and debug IDs
+where available, not the debug sections themselves. Use the map from the
+**same run**: ASLR changes addresses even for identical binaries. Take the
+snapshot while the images are loaded; dynamic unload/reload is not tracked.
 
 ## Producer allocation profile
 

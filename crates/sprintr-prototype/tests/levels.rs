@@ -62,12 +62,12 @@ fn named_levels_are_static_and_deduplicated() {
         assert_eq!(
             template,
             &serde_json::json!({
-                "attrs": {"log.level": level}, "refs": [], "msg": "event"
+                "attrs": {"log.level": level}, "refs": [], "msg": "event", "source": template["source"]
             })
         );
         assert_eq!(
             records[index * 2 + 1],
-            serde_json::json!({"seq": seq + 1, "stmt": id, "thread": thread, "args": []})
+            serde_json::json!({"seq": seq + 1, "stmt": id, "thread": thread, "ts":records[index * 2 + 1]["ts"], "attrs":{"log.stack": records[index * 2 + 1]["attrs"]["log.stack"]}, "args": []})
         );
         assert!(first["defs"].get("log.relation:log.level").is_none());
         if index == 0 {
@@ -91,7 +91,10 @@ fn named_levels_are_static_and_deduplicated() {
     let mut independent = Logger::new(Vec::new());
     error_record(&mut independent);
     let first = standalone(&independent.into_inner());
-    assert_eq!(first.render().unwrap(), "event\nlog.level = ERROR");
+    assert_eq!(
+        common::body(&first.render().unwrap()),
+        "event\nlog.level = ERROR"
+    );
 }
 
 /// Scenario: a WARN first-use overflows after INFO has already been accepted.
@@ -156,7 +159,10 @@ fn invalid_level_definitions_and_references_are_rejected() {
         let error = replay(format!("{first}\n{bad}\n").as_bytes(), &mut output).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("line 2"), "{error}");
-        assert_eq!(output, b"first\n");
+        assert_eq!(
+            common::body(std::str::from_utf8(&output).unwrap()),
+            "first\n"
+        );
     }
 }
 
@@ -182,8 +188,14 @@ fn named_level_definitions_are_transactional_and_immutable() {
             .to_string()
             .contains("unknown entity")
     );
-    assert_eq!(renderer.render(&valid).unwrap(), "event\nlog.level = INFO");
-    assert_eq!(renderer.render(&valid).unwrap(), "event\nlog.level = INFO");
+    assert_eq!(
+        common::body(&renderer.render(&valid).unwrap()),
+        "event\nlog.level = INFO"
+    );
+    assert_eq!(
+        common::body(&renderer.render(&valid).unwrap()),
+        "event\nlog.level = INFO"
+    );
     let mut conflicting = valid.clone();
     let Definition::Entity(entity) = conflicting.defs.get_mut("log.level:INFO").unwrap() else {
         unreachable!()
@@ -199,7 +211,7 @@ fn named_level_definitions_are_transactional_and_immutable() {
     let mut subsequent = valid;
     subsequent.defs.clear();
     assert_eq!(
-        renderer.render(&subsequent).unwrap(),
+        common::body(&renderer.render(&subsequent).unwrap()),
         "event\nlog.level = INFO"
     );
 }
@@ -209,9 +221,12 @@ fn named_level_definitions_are_transactional_and_immutable() {
 #[test]
 fn custom_named_entities_render_generically() {
     let record = serde_json::json!({
-        "attrs": {"log.statement": 1},
+        "ts": 0,
+        "attrs": {"log.statement": 1, "log.stack":[42]},
         "args": [],
         "defs": {
+            "log.relation:log.stack": {"kind":"attribute","type":"[u64]","desc":"Stack"},
+            "log.relation:log.source": {"kind":"entity","type":"object","desc":"Source","anonymous":true},
             "log.relation:log.statement": {
                 "kind": "entity", "type": "object", "desc": "Logging statement", "anonymous": true
             },
@@ -220,11 +235,15 @@ fn custom_named_entities_render_generically() {
             },
             "deployment.environment:PRODUCTION": {"desc": "Production traffic"},
             "log.statement:1": {
-                "attrs": {"deployment.environment": "PRODUCTION"}, "refs": [], "msg": "deployed"
+                "attrs": {"deployment.environment": "PRODUCTION"}, "refs": [], "msg": "deployed",
+                "source": {"mod":"app","file":"src/main.rs","line":12,"column":5}
             }
         }
     });
     let mut output = Vec::new();
     replay(format!("{record}\n").as_bytes(), &mut output).unwrap();
-    assert_eq!(output, b"deployed\ndeployment.environment = PRODUCTION\n");
+    assert_eq!(
+        output,
+        b"1970-01-01T00:00:00.000Z deployed\ndeployment.environment = PRODUCTION\n"
+    );
 }

@@ -409,6 +409,8 @@ and `msg`. In JSON Lines, the top-level `seq`, `stmt`, and `thread` fields abbre
 `attrs["log.record"]`, `attrs["log.statement"]`, and `attrs["log.thread"]`. They have the same
 meaning as the expanded associations and must not also appear in `attrs`
 under their full names. A snapshot without a delivery address omits `seq` and `thread`.
+The required `ts` field is the capture time in unsigned Unix nanoseconds.
+It is not part of the record address. Text playback shows UTC to milliseconds.
 Log attributes, scope attributes, and resource attributes
 are encoded in the appropriate level of OTLP structure.
 
@@ -516,8 +518,15 @@ scopes.
 Threads are entities described by the `log.thread` relation. A thread
 instance records its details and is distinct from the definition of its
 entity type. Callsites are anonymous `log.statement` entities; stack
-frames are entities, and callstacks are composed of references to frame
-entities. Each concept is described through a relation rooted in
+frames are anonymous `log.source` entities identified by native program
+counter. Frame zero is the macro invocation's module, file, line, and column,
+pre-encoded in the statement's `source` beside `msg`. Each event's `log.stack`
+contains only its callers, starting with frame one, up to ten PCs by default.
+A limit of zero bypasses unwinding without losing the static frame. Later events
+reuse the statement template but capture their own stacks. No source objects
+are emitted per PC: the reader can look up module, function, file, and line
+locally after recording, or relocate the PCs with a bulk module map and
+matching debug artifacts from that run. Each concept is described through a relation rooted in
 `log.relation`. Placement of this context in OTel resources is deferred.
 
 ## Application
@@ -655,10 +664,10 @@ for name in ["Ada", "Grace"] {
 The handle specifies the argument type, allowing a bare `{}`. Attributed
 placeholders use canonical names prefixed with `@`, not Rust variable names.
 Each callsite defines an anonymous `log.statement` entity whose value
-contains only static `attrs`, argument bindings in `refs`, and `msg`:
+contains static `attrs`, argument bindings in `refs`, `msg`, and `source`:
 
 ```json
-{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}
+{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}}
 ```
 
 `log.relation:log.statement` describes anonymous object entities;
@@ -670,8 +679,8 @@ first event bootstraps only the remaining definitions. The next event carries
 its own address but reuses the statement:
 
 ```json
-{"seq":1,"stmt":2,"thread":88888,"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
-{"seq":2,"stmt":2,"thread":88888,"args":["Grace",42]}
+{"seq":1,"stmt":2,"thread":88888,"ts":1704067200123456789,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}}}}
+{"seq":2,"stmt":2,"thread":88888,"ts":1704067200124567890,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Grace",42]}
 ```
 
 `"stmt":2` is a typed reference to `defs["log.statement:2"]`.
@@ -681,9 +690,9 @@ callsite has its own identity, even when its template is equal to another's.
 After the announcement, rendering produces:
 
 ```text
-hello Ada, value 002a
+2024-01-01T00:00:00.123Z hello Ada, value 002a
 log.level = INFO, account.name = Ada
-hello Grace, value 002a
+2024-01-01T00:00:00.124Z hello Grace, value 002a
 log.level = INFO, account.name = Grace
 ```
 

@@ -52,7 +52,7 @@ impl RelationMeta {
 
 /// A typed attribute declared with [`crate::attributes!`].
 ///
-/// `T` is `str` or `u64`. Logging macros check argument types against `T`.
+/// Positional arguments support `str` and `u64`; `[u64]` describes stack metadata.
 pub struct Attribute<T: ?Sized> {
     meta: RelationMeta,
     label: &'static [u8],

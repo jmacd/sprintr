@@ -12,9 +12,11 @@ pub use reference::definition_fragment;
 use format::{FormatError, Part, Spec};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
+use std::time::{Duration, UNIX_EPOCH};
 
 /// The root of self-description. Every other relation, including
 /// `log.statement` and `log.level`, is defined by an entity of this relation.
@@ -28,6 +30,8 @@ pub const STATEMENT: &str = "log.statement";
 pub const THREAD: &str = "log.thread";
 /// The record itself, identified on its thread by the wire field `seq`.
 pub const RECORD: &str = "log.record";
+pub const SOURCE: &str = "log.source";
+pub const STACK: &str = "log.stack";
 pub const RELATION_PREFIX: &str = "log.relation:";
 pub const STATEMENT_PREFIX: &str = "log.statement:";
 
@@ -50,6 +54,8 @@ pub enum RelationKind {
 pub enum RelationType {
     String,
     U64,
+    #[serde(rename = "[u64]")]
+    U64Array,
     Object,
 }
 
@@ -69,24 +75,32 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl RelationDefinition {
-    /// Attributes hold strings or unsigned integers; entities hold objects.
+    /// Attributes describe scalar values or arrays of unsigned integers; entities hold objects.
     pub fn validate(&self, name: &str) -> Result<(), FormatError> {
         validate_relation_name(name)?;
         let supported = match self.kind {
             RelationKind::Attribute => {
                 !self.anonymous
-                    && matches!(self.value_type, RelationType::String | RelationType::U64)
+                    && matches!(
+                        self.value_type,
+                        RelationType::String | RelationType::U64 | RelationType::U64Array
+                    )
             }
             RelationKind::Entity => self.value_type == RelationType::Object,
         };
         if !supported {
             return Err(FormatError(format!("unsupported relation {name:?}")));
         }
-        if matches!(name, STATEMENT | THREAD | RECORD)
+        if matches!(name, STATEMENT | THREAD | RECORD | SOURCE)
             && !(self.kind == RelationKind::Entity && self.anonymous)
         {
             return Err(FormatError(format!(
                 "{name} must describe anonymous object entities"
+            )));
+        }
+        if name == STACK && self.value_type != RelationType::U64Array {
+            return Err(FormatError(format!(
+                "{STACK} must describe a [u64] attribute"
             )));
         }
         Ok(())
@@ -148,6 +162,60 @@ pub struct StatementTemplate {
     pub attrs: BTreeMap<String, String>,
     pub refs: Vec<BTreeMap<String, ArgumentBinding>>,
     pub msg: String,
+    /// Frame zero, recorded by the compiler at the logging macro invocation.
+    pub source: StatementSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatementSource {
+    #[serde(rename = "mod")]
+    pub module: String,
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// Start at the nearest `crates/` or `src/`, then keep whole trailing components
+/// within 32 characters. Never split the filename itself.
+pub fn short_path(path: &str) -> Cow<'_, str> {
+    let separators = ['/', '\\'];
+    let mut rooted = path;
+    let mut offset = 0;
+    for part in path.split_inclusive(separators) {
+        if matches!(part, "crates/" | "src/" | "crates\\" | "src\\") {
+            rooted = &path[offset..];
+        }
+        offset += part.len();
+    }
+
+    let mut tail = rooted;
+    while tail.chars().nth(32).is_some() {
+        let Some((_, rest)) = tail.split_once(separators) else {
+            break;
+        };
+        if rest.is_empty() {
+            break;
+        }
+        tail = rest;
+    }
+    if tail.len() == rooted.len() {
+        tail.into()
+    } else {
+        format!(".../{tail}").into()
+    }
+}
+
+impl fmt::Display for StatementSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "at {} ({}:{})",
+            self.module,
+            short_path(&self.file),
+            self.line
+        )
+    }
 }
 
 /// A definition's key in [`Message::defs`], not the object's shape, determines
@@ -206,7 +274,11 @@ fn deserialize_definitions<'de, D: Deserializer<'de>>(
 #[serde(try_from = "WireEvent")]
 #[must_use = "a captured message must be recorded or rendered"]
 pub struct Message {
-    /// Canonical associations, including `log.statement` and, on delivery, `log.thread` and `log.record`.
+    /// Wall-clock capture time in nanoseconds since the Unix epoch (`ts` on the wire).
+    pub timestamp: u64,
+    /// Caller PCs starting at frame one; empty when disabled or there are no callers.
+    pub stack: Vec<u64>,
+    /// Scalar associations, including `log.statement` and, on delivery, `log.thread` and `log.record`.
     pub attrs: BTreeMap<String, u64>,
     pub args: Vec<Argument>,
     pub defs: BTreeMap<String, Definition>,
@@ -221,11 +293,19 @@ struct WireEvent {
     stmt: Option<u64>,
     #[serde(default, deserialize_with = "present_u64")]
     thread: Option<u64>,
-    #[serde(default)]
-    attrs: BTreeMap<String, u64>,
+    ts: u64,
+    attrs: WireAttrs,
     args: Vec<Argument>,
     #[serde(default, deserialize_with = "deserialize_definitions")]
     defs: BTreeMap<String, Definition>,
+}
+
+#[derive(Deserialize)]
+struct WireAttrs {
+    #[serde(rename = "log.stack")]
+    stack: Vec<u64>,
+    #[serde(flatten)]
+    scalars: BTreeMap<String, u64>,
 }
 
 // Missing is allowed (a snapshot or longhand); an explicit null is not a number.
@@ -243,7 +323,7 @@ impl TryFrom<WireEvent> for Message {
             ("thread", THREAD, wire.thread),
         ] {
             if let Some(value) = value
-                && wire.attrs.insert(name.into(), value).is_some()
+                && wire.attrs.scalars.insert(name.into(), value).is_some()
             {
                 return Err(FormatError(format!(
                     "both {short} and attrs[{name:?}] specified"
@@ -251,7 +331,9 @@ impl TryFrom<WireEvent> for Message {
             }
         }
         Ok(Self {
-            attrs: wire.attrs,
+            timestamp: wire.ts,
+            stack: wire.attrs.stack,
+            attrs: wire.attrs.scalars,
             args: wire.args,
             defs: wire.defs,
         })
@@ -274,19 +356,24 @@ impl Serialize for Message {
         if let Some(thread) = thread {
             wire.serialize_entry("thread", thread)?;
         }
-        if self.attrs.len() > 1 + usize::from(seq.is_some()) + usize::from(thread.is_some()) {
-            struct RemainingAttrs<'a>(&'a BTreeMap<String, u64>);
-            impl Serialize for RemainingAttrs<'_> {
-                fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                    serializer.collect_map(
-                        self.0
-                            .iter()
-                            .filter(|(k, _)| !matches!(k.as_str(), STATEMENT | RECORD | THREAD)),
-                    )
+        wire.serialize_entry("ts", &self.timestamp)?;
+        struct EventAttrs<'a>(&'a Message);
+        impl Serialize for EventAttrs<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut attrs = serializer.serialize_map(None)?;
+                attrs.serialize_entry(STACK, &self.0.stack)?;
+                for (key, value) in &self.0.attrs {
+                    if key == STACK {
+                        return Err(serde::ser::Error::custom("log.stack must be an array"));
+                    }
+                    if !matches!(key.as_str(), STATEMENT | RECORD | THREAD) {
+                        attrs.serialize_entry(key, value)?;
+                    }
                 }
+                attrs.end()
             }
-            wire.serialize_entry("attrs", &RemainingAttrs(&self.attrs))?;
         }
+        wire.serialize_entry("attrs", &EventAttrs(self))?;
         wire.serialize_entry("args", &self.args)?;
         if !self.defs.is_empty() {
             wire.serialize_entry("defs", &self.defs)?;
@@ -402,6 +489,7 @@ impl CompiledStatement {
 
     fn render<'a>(
         &self,
+        timestamp: u64,
         args: &[Argument],
         resolve: impl Fn(&str) -> Result<&'a Map<String, Value>, FormatError>,
     ) -> Result<String, FormatError> {
@@ -425,7 +513,14 @@ impl CompiledStatement {
             }
         }
         let mut arguments = args.iter().enumerate();
-        let mut output = String::new();
+        let instant = UNIX_EPOCH
+            .checked_add(Duration::from_nanos(timestamp))
+            .ok_or_else(|| {
+                FormatError(format!(
+                    "timestamp {timestamp} is outside the platform time range"
+                ))
+            })?;
+        let mut output = format!("{} ", humantime::format_rfc3339_millis(instant));
         for part in &self.parts {
             match part {
                 Part::Literal(text) => output.push_str(text),
@@ -547,6 +642,11 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Static frame zero for a statement already accepted by this reader.
+    pub fn statement_source(&self, id: u64) -> Option<&StatementSource> {
+        self.statements.get(&id).map(|s| &s.template.source)
+    }
+
     /// Invalid records never install definitions or advance a thread's sequence.
     pub fn render(&mut self, message: &Message) -> Result<String, FormatError> {
         let (id, address) = event_identity(&message.attrs)?;
@@ -581,8 +681,15 @@ impl Renderer {
             }
         }
         let relation = |name: &str| relations.get(name).or_else(|| self.relations.get(name));
-        if relation(STATEMENT).is_none() {
-            return Err(FormatError(format!("unknown relation {STATEMENT:?}")));
+        for name in [STATEMENT, STACK, SOURCE] {
+            if relation(name).is_none() {
+                return Err(FormatError(format!("unknown relation {name:?}")));
+            }
+        }
+        if message.stack.contains(&0) {
+            return Err(FormatError(format!(
+                "{STACK} requires nonzero program counters"
+            )));
         }
         for (key, definition) in &message.defs {
             if key.starts_with(RELATION_PREFIX) || key.starts_with(STATEMENT_PREFIX) {
@@ -668,7 +775,7 @@ impl Renderer {
             .get(&id)
             .or_else(|| self.statements.get(&id))
             .ok_or_else(|| FormatError(format!("unknown statement {id}")))?;
-        let output = statement.render(&message.args, |target| {
+        let output = statement.render(message.timestamp, &message.args, |target| {
             self.resolve(target, address, message)
         })?;
         self.relations.extend(relations);

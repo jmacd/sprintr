@@ -42,12 +42,17 @@ fn first_record_bootstraps_statement_and_later_records_reuse_it() {
     let id = first.attrs["log.statement"];
     let thread = first.attrs[THREAD];
     let seq = first.attrs[RECORD];
+    let pcs = &first.stack;
+    assert!((1..=10).contains(&pcs.len()) && !pcs.contains(&0));
+    assert!(startup.defs.contains_key("log.relation:log.source"));
+    assert!(startup.defs.contains_key("log.relation:log.stack"));
     assert_eq!(
         serde_json::to_value(template(first)).unwrap(),
         serde_json::json!({
             "attrs": {"log.level": "INFO"},
             "refs": [{"account.name": {"$arg": 0}}],
-            "msg": "hello {@account.name}, value {value:04x}"
+            "msg": "hello {@account.name}, value {value:04x}",
+            "source": template(first).source
         })
     );
     assert_eq!(
@@ -58,7 +63,7 @@ fn first_record_bootstraps_statement_and_later_records_reuse_it() {
         serde_json::from_slice::<serde_json::Value>(encoded.split(|&b| b == b'\n').nth(2).unwrap())
             .unwrap(),
         serde_json::json!({
-            "seq": seq + 1, "stmt": id, "thread": thread, "args": ["Grace", 42]
+            "seq": seq + 1, "stmt": id, "thread": thread, "ts": records[1].timestamp, "attrs": {"log.stack": records[1].stack}, "args": ["Grace", 42]
         })
     );
     assert_eq!(
@@ -110,7 +115,7 @@ fn static_aliases_and_multiple_positions() {
     assert_eq!(template(&owned).msg, template(first).msg);
     assert_eq!(template(&owned).refs, template(first).refs);
     assert_eq!(
-        owned.render().unwrap(),
+        common::body(&owned.render().unwrap()),
         "7 Ada Grace\naccount.name = Ada, account.name = Grace"
     );
 }
@@ -239,7 +244,10 @@ fn playback_rejects_bad_templates() {
         let error = replay(format!("{first}\n{bad}\n").as_bytes(), &mut output).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("line 2"), "{error}");
-        assert_eq!(output, b"first\n");
+        assert_eq!(
+            common::body(std::str::from_utf8(&output).unwrap()),
+            "first\n"
+        );
     }
 }
 
@@ -280,7 +288,7 @@ fn renderer_updates_are_transactional() {
                 .contains("conflicting")
         );
         assert_eq!(
-            renderer.render(&subsequent).unwrap(),
+            common::body(&renderer.render(&subsequent).unwrap()),
             "Ada\naccount.name = Ada"
         );
     }
@@ -310,7 +318,7 @@ fn escaped_names_and_temporary_values_roundtrip() {
     };
     assert_eq!(relation.desc, "A \"description\"");
     assert_eq!(
-        record.render().unwrap(),
+        common::body(&record.render().unwrap()),
         format!(
             "Ada\t\"name\"\nlog.level = INFO, {} = {}",
             escaped.name().escape_debug(),
@@ -333,9 +341,13 @@ fn concurrent_first_use_has_one_identity() {
         .into_iter()
         .map(|thread| thread.join().unwrap())
         .collect();
-    assert!(records.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(
+        records
+            .windows(2)
+            .all(|pair| pair[0].attrs == pair[1].attrs && pair[0].defs == pair[1].defs)
+    );
     assert_eq!(
-        records[0].render().unwrap(),
+        common::body(&records[0].render().unwrap()),
         "Ada\nlog.level = INFO, account.name = Ada"
     );
 }

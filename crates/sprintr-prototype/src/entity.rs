@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::runtime::runtime;
-use crate::{Argument, Entity, RECORD, STATEMENT, THREAD, schema};
+use crate::{Argument, Entity, RECORD, SOURCE, STATEMENT, THREAD, schema};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::cell::Cell;
@@ -26,7 +26,7 @@ impl Entity<true> {
         let invalid = |msg| io::Error::new(io::ErrorKind::InvalidInput, msg);
         let relation = runtime.relation(self.__meta()).map_err(invalid)?;
         let name = &runtime.definitions[relation].name;
-        if matches!(name.as_str(), STATEMENT | RECORD | THREAD) {
+        if matches!(name.as_str(), STATEMENT | RECORD | THREAD | SOURCE) {
             return Err(invalid(format!("{name} values are created by the logger")));
         }
         let Value::Object(object) = serde_json::to_value(value).map_err(crate::json_error)? else {

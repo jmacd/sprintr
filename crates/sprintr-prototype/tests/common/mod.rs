@@ -59,11 +59,27 @@ pub fn startup_text() -> String {
     )
 }
 
+/// Ignore the clock prefix in assertions about the message body.
+pub fn body(text: &str) -> &str {
+    assert_eq!(text.get(23..25), Some("Z "), "{text:?}");
+    &text[25..]
+}
+
 /// Playback of a stream, without its checked startup announcement.
 pub fn replayed(encoded: &[u8]) -> String {
     let mut output = Vec::new();
     replay(encoded, &mut output).unwrap();
     let text = String::from_utf8(output).unwrap();
+    let text: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.get(23..25) == Some("Z ") {
+                body(line)
+            } else {
+                line
+            }
+        })
+        .collect();
     text.strip_prefix(&startup_text())
         .unwrap_or_else(|| panic!("missing startup announcement: {text}"))
         .to_string()

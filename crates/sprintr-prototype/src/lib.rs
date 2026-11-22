@@ -7,6 +7,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::io::{self, BufRead, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod buffer;
 mod declare;
@@ -15,6 +16,7 @@ mod runtime;
 pub mod schema;
 mod statement;
 mod stream;
+pub mod symbols;
 
 use buffer::{HeapBuffer, RecordBuffer};
 use entity::BorrowedArgument;
@@ -26,9 +28,11 @@ pub use declare::{Attribute, Entity, Named};
 pub use entity::EntityHandle;
 pub use sprintr_message::{
     Argument, ArgumentBinding, Definition, Message, RECORD, RELATION, RELATION_PREFIX,
-    RelationDefinition, RelationKind, RelationType, Renderer, STATEMENT, STATEMENT_PREFIX,
-    StatementTemplate, THREAD, format, format::FormatError,
+    RelationDefinition, RelationKind, RelationType, Renderer, SOURCE, STACK, STATEMENT,
+    STATEMENT_PREFIX, StatementSource, StatementTemplate, THREAD, format, format::FormatError,
 };
+
+pub use statement::{DEFAULT_STACK_DEPTH, MAX_STACK_DEPTH, set_stack_limit};
 
 #[doc(hidden)]
 pub use sprintr_prototype_macros::{
@@ -50,10 +54,7 @@ pub use sprintr_prototype_macros::{
 ///
 /// use sprintr_prototype::message;
 /// let record = message!("{} try {}", account_name = "Ada", retry_count = 2u8);
-/// assert_eq!(
-///     record.render().unwrap(),
-///     "Ada try 2\naccount.name = Ada, retry.count = 2"
-/// );
+/// assert!(record.render().unwrap().ends_with("Z Ada try 2\naccount.name = Ada, retry.count = 2"));
 /// ```
 ///
 /// Declarations are collected at link time and resolved when logging starts.
@@ -122,16 +123,16 @@ macro_rules! entities {
 ///
 /// This convenience API allocates an owned snapshot. Use [`info!`] to encode
 /// borrowed arguments directly without constructing this intermediate value.
-/// The snapshot has no level and includes every definition it needs. Statement
-/// resolution can fail only if identities are exhausted, which panics on this
-/// infallible convenience path; [`info!`] returns the error instead.
+/// The snapshot keeps its capture timestamp, has no level, and includes every
+/// definition it needs. An unrepresentable clock value or exhausted statement
+/// identities panic on this convenience path; [`info!`] returns an error instead.
 ///
 /// ```rust
 /// use sprintr_prototype::message;
 /// let name = String::from("Ada");
 /// let value = 42u32;
 /// let record = message!("hello {name:s}, value {value:04x}");
-/// assert_eq!(record.render().unwrap(), "hello Ada, value 002a");
+/// assert!(record.render().unwrap().ends_with("Z hello Ada, value 002a"));
 /// assert_eq!(name, "Ada");
 /// ```
 ///
@@ -244,7 +245,7 @@ macro_rules! message {
 /// let mut text = Vec::new();
 /// replay(logger.into_inner().as_slice(), &mut text)?;
 /// let text = String::from_utf8(text).unwrap();
-/// assert!(text.starts_with("process "));
+/// assert!(text.lines().next().unwrap().contains("Z process "));
 /// assert!(text.ends_with("hello Ada, value 002a\nlog.level = INFO\n"));
 /// # Ok::<(), std::io::Error>(())
 /// ```
@@ -333,13 +334,16 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
     pub fn __write_compiled(
         &mut self,
         statement: &'static Statement,
+        stack: io::Result<&[u64]>,
         arguments: &[BorrowedArgument<'_>],
     ) -> io::Result<()> {
+        let stack = stack?;
         self.start()?;
         self.state.write_compiled(
             &mut self.writer,
             &mut self.buffer,
             statement.resolve()?,
+            stack,
             arguments,
         )
     }
@@ -399,6 +403,14 @@ fn json_error(error: serde_json::Error) -> io::Error {
     )
 }
 
+fn timestamp_now() -> io::Result<u64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    u64::try_from(elapsed.as_nanos())
+        .map_err(|_| io::Error::other("Unix timestamp exceeds u64 nanoseconds"))
+}
+
 /// Read JSON Lines and write formatted messages without their structured envelope.
 ///
 /// Invalid records report their one-based input line. Processing stops on the
@@ -431,7 +443,10 @@ pub mod __private {
     use super::{HeapBuffer, Logger, StreamState, announce};
     pub use crate::declare::{Declaration, RelationMeta};
     pub use crate::entity::BorrowedArgument;
-    pub use crate::statement::{Statement, concatenate, encoded_len, owned_message};
+    pub use crate::statement::{
+        Statement, capture_stack, concatenate, encoded_len, json_string, json_string_len,
+        owned_message,
+    };
     pub use linkme;
     use std::cell::RefCell;
     use std::io;
@@ -512,8 +527,10 @@ pub mod __private {
 
     pub fn write_stdout(
         statement: &'static Statement,
+        stack: io::Result<&[u64]>,
         arguments: &[BorrowedArgument<'_>],
     ) -> io::Result<()> {
+        let stack = stack?;
         STDOUT_STATE
             .try_with(|state| {
                 let mut state = state
@@ -527,7 +544,7 @@ pub mod __private {
                     buffer,
                     definitions,
                 } = &mut *state;
-                definitions.write_compiled(&mut io::stdout(), buffer, resolved, arguments)
+                definitions.write_compiled(&mut io::stdout(), buffer, resolved, stack, arguments)
             })
             .map_err(|_| io::Error::other("stdout encoding buffer is unavailable"))?
     }

@@ -9,6 +9,8 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+backtrace = "0.3"
+findshlibs = "0.10"
 gettid = "0.1.4"
 linkme = "0.3"
 serde = { version = "1", features = ["derive"] }

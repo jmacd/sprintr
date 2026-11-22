@@ -8,6 +8,35 @@ use sprintr_prototype::{Argument, Logger, Message, info, message, replay};
 use std::cell::Cell;
 use std::io::{self, Write};
 
+/// One statement reached directly and via a caller shares its template, not its stack.
+#[test]
+fn repeated_statement_captures_the_current_call_path() {
+    #[inline(never)]
+    fn emit(logger: &mut Logger<Vec<u8>>) {
+        info!("same statement", logger: logger).unwrap();
+    }
+    #[inline(never)]
+    fn via_caller(logger: &mut Logger<Vec<u8>>) {
+        emit(logger);
+        std::hint::black_box(logger);
+    }
+
+    let mut logger = Logger::new(Vec::new());
+    emit(&mut logger);
+    via_caller(&mut logger);
+    let events = records(&logger.into_inner());
+    let (a, b) = (&events[0], &events[1]);
+    assert_eq!(a.attrs["log.statement"], b.attrs["log.statement"]);
+    assert!(b.defs.is_empty());
+    for event in [a, b] {
+        assert!((1..=10).contains(&event.stack.len()));
+        assert!(!event.stack.contains(&0));
+    }
+    // Both events executed the same info! instruction. The first dynamic PC
+    // differs because it belongs to its caller, not to that instruction.
+    assert_ne!(a.stack[0], b.stack[0]);
+}
+
 /// Scenario: explicit positional expressions and implicit captures describe the same message.
 /// Guarantees: the documented JSON retains native values and playback needs no source or tracing.
 #[test]
@@ -20,7 +49,9 @@ fn positional_and_captured_roundtrip() {
     logger.flush().unwrap();
     let encoded = logger.into_inner();
     let records = records(&encoded);
-    assert_eq!(template(&records[0]), template(&records[1]));
+    let (a, b) = (template(&records[0]), template(&records[1]));
+    assert_eq!((&a.msg, &a.refs, &a.attrs), (&b.msg, &b.refs, &b.attrs));
+    assert_ne!(a.source.line, b.source.line);
     assert_eq!(template(&records[0]).msg, "hello {name}, value {value:04x}");
     assert_eq!(
         records[0].args,
@@ -57,7 +88,10 @@ fn capture_is_typed_borrowed_and_evaluated_once() {
         record.args,
         [Argument::String("Ada".into()), Argument::Unsigned(42)]
     );
-    assert_eq!(record.render().unwrap(), "hello Ada, value 002a");
+    assert_eq!(
+        common::body(&record.render().unwrap()),
+        "hello Ada, value 002a"
+    );
 }
 
 /// Scenario: raw literals, escaped braces, repeated captures, and JSON-sensitive string data are logged.
@@ -72,10 +106,15 @@ fn escaped_literals_and_string_data() {
     assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 2);
     let decoded = records(&encoded).remove(0);
     assert_eq!(decoded.args, record.args);
+    assert_eq!(decoded.timestamp, record.timestamp);
+    assert_eq!(decoded.stack, record.stack);
     assert_eq!(template(&decoded), template(&record));
     assert_eq!(replayed(&encoded), format!("{{{text}}} {text}\n"));
-    assert_eq!(message!("{{literal}}").render().unwrap(), "{literal}");
-    assert_eq!(message!("").render().unwrap(), "");
+    assert_eq!(
+        common::body(&message!("{{literal}}").render().unwrap()),
+        "{literal}"
+    );
+    assert_eq!(common::body(&message!("").render().unwrap()), "");
 }
 
 /// Scenario: direct encoding includes escaped format text, Unicode, braces, and a temporary argument.
@@ -94,7 +133,10 @@ fn direct_encoding_matches_owned_encoding() {
     assert_eq!(template(direct).refs, template(&owned).refs);
     assert_eq!(
         replayed(&encoded),
-        format!("{}\nlog.level = INFO\n", owned.render().unwrap())
+        format!(
+            "{}\nlog.level = INFO\n",
+            common::body(&owned.render().unwrap())
+        )
     );
 
     let calls = Cell::new(0);
@@ -182,7 +224,7 @@ fn hexadecimal_formatting_matches_rust() {
         let json = serde_json::to_string(&record).unwrap();
         let decoded: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            decoded.render().unwrap(),
+            common::body(&decoded.render().unwrap()),
             format!("{value:x}|{value:04x}|{value:#04x}|{value:8x}|{value:#08x}|{value:#x}")
         );
         assert_eq!(decoded.args[0], Argument::Unsigned(value));
@@ -233,7 +275,10 @@ fn invalid_records_fail_loudly() {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{invalid}");
         assert!(error.to_string().contains("line 2"), "{error}");
         assert!(error.to_string().contains(expected), "{invalid}: {error}");
-        assert_eq!(output, b"first\n");
+        assert_eq!(
+            common::body(std::str::from_utf8(&output).unwrap()),
+            "first\n"
+        );
     }
 }
 
@@ -297,5 +342,5 @@ fn macro_paths_are_hygienic() {
     let name = "Ada";
     let value = 42u8;
     let record = renamed::message!("{name:s} {value:04x}");
-    assert_eq!(record.render().unwrap(), "Ada 002a");
+    assert_eq!(common::body(&record.render().unwrap()), "Ada 002a");
 }

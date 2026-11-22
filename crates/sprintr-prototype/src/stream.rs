@@ -4,7 +4,7 @@ use crate::buffer::RecordBuffer;
 use crate::entity::{BorrowedArgument, EntityHandle, Record, with_record};
 use crate::runtime::runtime;
 use crate::statement::Resolved;
-use crate::{Definition, Message, RECORD, STATEMENT_PREFIX, THREAD, json_error};
+use crate::{Definition, Message, RECORD, STACK, STATEMENT_PREFIX, THREAD, json_error};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
@@ -63,8 +63,10 @@ impl StreamState {
         writer: &mut impl Write,
         buffer: &mut impl RecordBuffer,
         statement: &Resolved,
+        stack: &[u64],
         args: &[BorrowedArgument<'_>],
     ) -> io::Result<()> {
+        let timestamp = crate::timestamp_now()?;
         with_record(|record| {
             let first = !self.statements.contains(&statement.id);
             let mut pending = Pending::default();
@@ -85,9 +87,11 @@ impl StreamState {
             buffer.try_atomic(|buf| {
                 write!(
                     buf,
-                    "{{\"seq\":{},\"stmt\":{},\"thread\":{thread},\"args\":[",
+                    "{{\"seq\":{},\"stmt\":{},\"thread\":{thread},\"ts\":{timestamp},\"attrs\":{{\"{STACK}\":",
                     record.seq, statement.id
                 )?;
+                serde_json::to_writer(&mut *buf, stack).map_err(json_error)?;
+                buf.write_all(b"},\"args\":[")?;
                 for (i, arg) in args.iter().enumerate() {
                     if i != 0 {
                         buf.write_all(b",")?;

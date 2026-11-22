@@ -75,7 +75,10 @@ fn defines_and_reuses_application_values() {
     let expected = snapshot.render().unwrap();
     let mut logger = Logger::new(Vec::new());
     logger.write(&snapshot).unwrap();
-    assert_eq!(replayed(&logger.into_inner()), format!("{expected}\n"));
+    assert_eq!(
+        replayed(&logger.into_inner()),
+        format!("{}\n", common::body(&expected))
+    );
 }
 
 /// A short pointer must resolve even after moving a logger or changing sinks.

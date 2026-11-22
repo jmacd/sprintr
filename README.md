@@ -21,8 +21,8 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record
 After the startup announcement:
 
 ```json
-{"seq":1,"stmt":2,"thread":88888,"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}"}}}
-{"seq":2,"stmt":2,"thread":88888,"args":["Grace",42]}
+{"seq":1,"stmt":2,"thread":88888,"ts":1704067200123456789,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}}}}
+{"seq":2,"stmt":2,"thread":88888,"ts":1704067200124567890,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Grace",42]}
 ```
 
 ```sh
@@ -31,17 +31,17 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record \
 ```
 
 ```text
-process 50316 started logging with sprintr 0.1.0
+2024-01-01T00:00:00.122Z process 50316 started logging with sprintr 0.1.0
 log.level = INFO, process.pid = 50316, telemetry.sdk.name = sprintr, telemetry.sdk.version = 0.1.0
-hello Ada, value 002a
+2024-01-01T00:00:00.123Z hello Ada, value 002a
 log.level = INFO, account.name = Ada
-hello Grace, value 002a
+2024-01-01T00:00:00.124Z hello Grace, value 002a
 log.level = INFO, account.name = Grace
 ```
 
 See the [prototype API and format subset](crates/sprintr-prototype/README.md)
 for anonymous application objects, implicit captures, positional expressions,
-caller-owned writers, and stack-backed encoding.
+caller-owned writers, and [deferred call-stack symbolization](crates/sprintr-prototype/README.md#call-stacks-and-symbols).
 
 ## Workspace
 
@@ -62,7 +62,7 @@ arguments. It writes directly into reusable heap or fixed stack storage,
 without constructing an owned message or reparsing the format on the producer
 path. Successful steady-state recording makes zero library heap allocations
 once storage and definition bookkeeping are initialized. Repeated events emit
-only `seq`, `stmt`, `thread` and `args`, without re-encoding templates or taking
+only `seq`, `stmt`, `thread`, `ts`, the event stack in `attrs`, and `args`, without re-encoding templates or taking
 the schema registry lock. First use may allocate even with stack-backed storage.
 Caller expressions, output sinks, initialization/growth, and
 error reporting are outside that allocation budget.

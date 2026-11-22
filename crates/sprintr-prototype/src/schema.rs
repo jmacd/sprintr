@@ -16,6 +16,10 @@ crate::entities! {
     #[anonymous]
     pub log_statement = "log.statement";
 
+    /// Native source location identified by its program counter in this process
+    #[anonymous]
+    pub log_source = "log.source";
+
     /// Logging thread identified by its native operating-system thread ID
     #[anonymous]
     pub log_thread = "log.thread";
@@ -36,6 +40,8 @@ crate::entities! {
 }
 
 crate::attributes! {
+    /// Caller PCs after the statement's static frame zero, innermost first; each u64 identifies a log.source
+    pub log_stack: [u64] = "log.stack";
     /// Process identifier (PID)
     pub process_pid: u64 = "process.pid";
     /// Name of the telemetry SDK
@@ -45,8 +51,10 @@ crate::attributes! {
 }
 
 /// Resolution order for sprintr's own declarations; not a reservation.
-pub(crate) static DECLARATIONS: [Declaration; 10] = [
+pub(crate) static DECLARATIONS: [Declaration; 12] = [
     Declaration::Relation(log_statement.__meta()),
+    Declaration::Relation(log_stack.__meta()),
+    Declaration::Relation(log_source.__meta()),
     Declaration::Relation(log_thread.__meta()),
     Declaration::Relation(log_record.__meta()),
     Declaration::Relation(log_level.__meta()),

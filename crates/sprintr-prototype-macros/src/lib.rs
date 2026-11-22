@@ -220,10 +220,11 @@ fn attribute(root: &Path, item: AttributeItem) -> syn::Result<Tokens> {
     let value_type = match ty.to_token_stream().to_string().as_str() {
         "str" => quote!(#root::RelationType::String),
         "u64" => quote!(#root::RelationType::U64),
+        "[u64]" => quote!(#root::RelationType::U64Array),
         _ => {
             return Err(syn::Error::new_spanned(
                 ty,
-                "attribute values are `str` or `u64`",
+                "attribute types are `str`, `u64`, or `[u64]`",
             ));
         }
     };
@@ -408,6 +409,7 @@ fn entity(root: &Path, item: EntityItem) -> syn::Result<Tokens> {
 
 struct Compiled {
     declaration: Tokens,
+    stack: Tokens,
     arguments: Vec<Tokens>,
 }
 
@@ -514,9 +516,15 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
     }
     let values = &input.values;
     let declaration = quote! {
+        const __MODULE: &str = ::core::module_path!();
+        const __FILE: &str = ::core::file!();
         const __PARTS: &[&[u8]] = &[
             b"{\"attrs\":{", #(#fragments,)* b"},\"refs\":[", #(#references,)*
-            b"],\"msg\":\"", #(#message,)* b"\"}",
+            b"],\"msg\":\"", #(#message,)* b"\",\"source\":{\"mod\":",
+            &#root::__private::json_string::<{#root::__private::json_string_len(__MODULE)}>(__MODULE),
+            b",\"file\":",
+            &#root::__private::json_string::<{#root::__private::json_string_len(__FILE)}>(__FILE),
+            ::core::concat!(",\"line\":", ::core::line!(), ",\"column\":", ::core::column!(), "}}").as_bytes(),
         ];
         static __ENCODED: [u8; #root::__private::encoded_len(__PARTS)] =
             #root::__private::concatenate(__PARTS);
@@ -526,8 +534,13 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
             &[#(&#values),*],
         );
     };
+    // Capture each invocation before entering the logger.
+    let stack = quote! {
+        #root::__private::capture_stack(&mut [0u64; #root::MAX_STACK_DEPTH])
+    };
     Ok(Compiled {
         declaration,
+        stack,
         arguments,
     })
 }
@@ -544,10 +557,11 @@ pub fn message(input: TokenStream) -> TokenStream {
         compile(&input).map(|compiled| {
             let root = &input.root;
             let declaration = compiled.declaration;
+            let stack = compiled.stack;
             let arguments = compiled.arguments;
             quote! {{
                 #declaration
-                #root::__private::owned_message(&__STATEMENT, &[#(#arguments),*])
+                #root::__private::owned_message(&__STATEMENT, #stack, &[#(#arguments),*])
             }}
         })
     };
@@ -560,12 +574,13 @@ pub fn record(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as Input);
     let result = compile(&input).map(|compiled| {
         let declaration = compiled.declaration;
+        let stack = compiled.stack;
         let arguments = compiled.arguments;
         let call = if let Some(logger) = input.logger {
-            quote!((#logger).__write_compiled(&__STATEMENT, &[#(#arguments),*]))
+            quote!((#logger).__write_compiled(&__STATEMENT, #stack, &[#(#arguments),*]))
         } else {
             let root = input.root;
-            quote!(#root::__private::write_stdout(&__STATEMENT, &[#(#arguments),*]))
+            quote!(#root::__private::write_stdout(&__STATEMENT, #stack, &[#(#arguments),*]))
         };
         quote! {{ #declaration #call }}
     });
