@@ -7,7 +7,6 @@ use serde_json::json;
 use sprintr_prototype::buffer::StackBuffer;
 use sprintr_prototype::{
     Argument, Definition, EntityHandle, Logger, Message, RECORD, Renderer, THREAD, entities, info,
-    message,
 };
 use std::io::{self, Write};
 
@@ -69,16 +68,6 @@ fn defines_and_reuses_application_values() {
     };
     assert!(renderer.render(&bad).is_err());
     assert!(renderer.render(reuse).is_ok());
-
-    let snapshot = message!("captured {login}");
-    assert_eq!(target(&snapshot), format!("#/defs/{key}"));
-    let expected = snapshot.render().unwrap();
-    let mut logger = Logger::new(Vec::new());
-    logger.write(&snapshot).unwrap();
-    assert_eq!(
-        replayed(&logger.into_inner()),
-        format!("{}\n", common::body(&expected))
-    );
 }
 
 /// A short pointer must resolve even after moving a logger or changing sinks.

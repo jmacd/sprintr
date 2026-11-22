@@ -545,29 +545,6 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
     })
 }
 
-#[proc_macro]
-pub fn message(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as Input);
-    let result = if let Some(logger) = &input.logger {
-        Err(syn::Error::new_spanned(
-            logger,
-            "message! constructs a record; use info! for logger output",
-        ))
-    } else {
-        compile(&input).map(|compiled| {
-            let root = &input.root;
-            let declaration = compiled.declaration;
-            let stack = compiled.stack;
-            let arguments = compiled.arguments;
-            quote! {{
-                #declaration
-                #root::__private::owned_message(&__STATEMENT, #stack, &[#(#arguments),*])
-            }}
-        })
-    };
-    result.unwrap_or_else(syn::Error::into_compile_error).into()
-}
-
 /// Write a statement whose template carries the given static named values.
 #[proc_macro]
 pub fn record(input: TokenStream) -> TokenStream {

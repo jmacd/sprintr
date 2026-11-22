@@ -8,7 +8,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and planned entity model.
 The current milestone is a standalone JSON Lines logger and plain-text reader.
 It pre-encodes statement templates and statically declared string attributes.
 `info!`, `warn!`, and `error!` attach named levels to those static templates.
-Events carry a statement reference and typed arguments; first-use definitions
+Logging calls deliver each event to the SDK as it is created. Events carry
+a statement reference and typed arguments; first-use definitions
 bootstrap the reader. Playback executes the stored formatting. It is not production-ready.
 There is no Tokio, tracing, or OpenTelemetry SDK dependency.
 

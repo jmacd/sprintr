@@ -36,7 +36,7 @@ pub use statement::{DEFAULT_STACK_DEPTH, MAX_STACK_DEPTH, set_stack_limit};
 
 #[doc(hidden)]
 pub use sprintr_prototype_macros::{
-    attributes as __attributes, entities as __entities, message as __message, record as __record,
+    attributes as __attributes, entities as __entities, record as __record,
 };
 
 /// Declare attributes. Each doc comment becomes the recorded description.
@@ -52,9 +52,8 @@ pub use sprintr_prototype_macros::{
 ///     pub retry_count: u64 = "retry.count";
 /// }
 ///
-/// use sprintr_prototype::message;
-/// let record = message!("{} try {}", account_name = "Ada", retry_count = 2u8);
-/// assert!(record.render().unwrap().ends_with("Z Ada try 2\naccount.name = Ada, retry.count = 2"));
+/// sprintr_prototype::info!("{} try {}", account_name = "Ada", retry_count = 2u8)?;
+/// # Ok::<(), std::io::Error>(())
 /// ```
 ///
 /// Declarations are collected at link time and resolved when logging starts.
@@ -119,22 +118,29 @@ macro_rules! entities {
     ($($input:tt)*) => { $crate::__entities!($crate; $($input)*); };
 }
 
-/// Capture owned arguments without writing or preformatting them.
+/// Record an INFO event as one JSON line, returning any output error.
 ///
-/// This convenience API allocates an owned snapshot. Use [`info!`] to encode
-/// borrowed arguments directly without constructing this intermediate value.
-/// The snapshot keeps its capture timestamp, has no level, and includes every
-/// definition it needs. An unrepresentable clock value or exhausted statement
-/// identities panic on this convenience path; [`info!`] returns an error instead.
+/// Defaults to stdout. Pass `logger: expression` immediately after the format
+/// to select a caller-owned [`Logger`].
 ///
 /// ```rust
-/// use sprintr_prototype::message;
+/// use sprintr_prototype::{Logger, info, replay};
+/// let mut logger = Logger::new(Vec::new());
 /// let name = String::from("Ada");
 /// let value = 42u32;
-/// let record = message!("hello {name:s}, value {value:04x}");
-/// assert!(record.render().unwrap().ends_with("Z hello Ada, value 002a"));
-/// assert_eq!(name, "Ada");
+/// info!("hello {name:s}, value {value:04x}", logger: logger)?;
+/// let mut text = Vec::new();
+/// replay(logger.into_inner().as_slice(), &mut text)?;
+/// let text = String::from_utf8(text).unwrap();
+/// assert!(text.ends_with("hello Ada, value 002a\nlog.level = INFO\n"));
+/// # Ok::<(), std::io::Error>(())
 /// ```
+///
+/// The macro borrows arguments in a stack array and encodes them directly into
+/// the logger's reusable buffer. The statement has a static `log.level:INFO`.
+/// Each output begins with an `INFO` record announcing the process and version,
+/// followed by a `WARN` for each declaration renamed because of a collision.
+/// Stdout announces once per process.
 ///
 /// Both implicit local captures and explicit positional expressions work.
 /// Strings require `:s`; unsigned integers use `:x`, optionally with `#`,
@@ -149,44 +155,44 @@ macro_rules! entities {
 /// Guarantees: unsupported implicit typing fails at compilation.
 /// ```compile_fail
 /// let name = "Ada";
-/// sprintr_prototype::message!("hello {name}");
+/// sprintr_prototype::info!("hello {name}");
 /// ```
 ///
 /// Scenario: a numeric value is supplied for string encoding.
 /// Guarantees: capture requires `AsRef<str>`, not eager Display formatting.
 /// ```compile_fail
-/// sprintr_prototype::message!("{:s}", 42u32);
+/// sprintr_prototype::info!("{:s}", 42u32);
 /// ```
 ///
 /// Scenario: a signed integer is supplied for the unsigned hexadecimal subset.
 /// Guarantees: unsupported integer types cannot silently lose signedness.
 /// ```compile_fail
-/// sprintr_prototype::message!("{:x}", -1i32);
+/// sprintr_prototype::info!("{:x}", -1i32);
 /// ```
 ///
 /// Scenario: a placeholder has no corresponding positional expression.
 /// Guarantees: argument count mismatches are compile errors.
 /// ```compile_fail
-/// sprintr_prototype::message!("{:s}");
+/// sprintr_prototype::info!("{:s}");
 /// ```
 ///
 /// Scenario: a positional expression has no corresponding placeholder.
 /// Guarantees: surplus arguments cannot be silently discarded.
 /// ```compile_fail
-/// sprintr_prototype::message!("hello", "Ada");
+/// sprintr_prototype::info!("hello", "Ada");
 /// ```
 ///
 /// Scenario: an attribute has not been declared.
 /// Guarantees: unbound attribute handles are compile errors.
 /// ```compile_fail
-/// sprintr_prototype::message!("{:s}", name = "Ada");
+/// sprintr_prototype::info!("{:s}", name = "Ada");
 /// ```
 ///
 /// Scenario: a local variable is used as an attribute handle.
 /// Guarantees: statement metadata must be statically declared.
 /// ```compile_fail
 /// let account_name = "account.name";
-/// sprintr_prototype::message!("{}", account_name = "Ada");
+/// sprintr_prototype::info!("{}", account_name = "Ada");
 /// ```
 ///
 /// Scenario: a string attribute is associated with a number.
@@ -196,7 +202,7 @@ macro_rules! entities {
 ///     /// Account name
 ///     account_name: str = "account.name";
 /// }
-/// sprintr_prototype::message!("{}", account_name = 42u32);
+/// sprintr_prototype::info!("{}", account_name = 42u32);
 /// ```
 ///
 /// Scenario: an unsigned attribute uses the string specifier.
@@ -206,7 +212,7 @@ macro_rules! entities {
 ///     /// Retry attempt
 ///     retry_count: u64 = "retry.count";
 /// }
-/// sprintr_prototype::message!("{:s}", retry_count = 2u8);
+/// sprintr_prototype::info!("{:s}", retry_count = 2u8);
 /// ```
 ///
 /// Scenario: a string attribute uses the hexadecimal specifier.
@@ -216,48 +222,14 @@ macro_rules! entities {
 ///     /// Account name
 ///     account_name: str = "account.name";
 /// }
-/// sprintr_prototype::message!("{:x}", account_name = "Ada");
+/// sprintr_prototype::info!("{:x}", account_name = "Ada");
 /// ```
 ///
 /// Scenario: the source requests a format outside the prototype subset.
 /// Guarantees: unsupported formats fail instead of degrading to text.
 /// ```compile_fail
-/// sprintr_prototype::message!("{:?}", "Ada");
+/// sprintr_prototype::info!("{:?}", "Ada");
 /// ```
-#[macro_export]
-macro_rules! message {
-    ($($input:tt)*) => {
-        $crate::__message!($crate; []; $($input)*)
-    };
-}
-
-/// Write a captured message as one JSON line, returning any output error.
-///
-/// Defaults to stdout. Pass `logger: expression` immediately after the format
-/// to select a caller-owned [`Logger`]. No global logger is installed.
-///
-/// ```rust
-/// use sprintr_prototype::{Logger, info, replay};
-/// let mut logger = Logger::new(Vec::new());
-/// let name = "Ada";
-/// let value = 42u32;
-/// info!("hello {name:s}, value {value:04x}", logger: logger)?;
-/// let mut text = Vec::new();
-/// replay(logger.into_inner().as_slice(), &mut text)?;
-/// let text = String::from_utf8(text).unwrap();
-/// assert!(text.lines().next().unwrap().contains("Z process "));
-/// assert!(text.ends_with("hello Ada, value 002a\nlog.level = INFO\n"));
-/// # Ok::<(), std::io::Error>(())
-/// ```
-///
-/// The statement records a static `log.level:INFO` reference. No filtering is applied.
-/// Formats are checked and JSON-escaped at compile time. Arguments are borrowed
-/// in a stack array and serialized directly into the logger's reusable buffer.
-/// See [`message!`] for the supported format subset.
-///
-/// Each output begins with an `INFO` record announcing the process and the
-/// sprintr version, followed by a `WARN` record for each declaration that was
-/// renamed because of a collision. Stdout announces once per process.
 #[macro_export]
 macro_rules! info {
     ($($input:tt)*) => {
@@ -307,26 +279,6 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
             buffer,
             state: StreamState::default(),
         }
-    }
-
-    /// Validate and encode an owned message before writing it.
-    ///
-    /// The snapshot must contain its required definitions. This path validates
-    /// at runtime; [`info!`] bypasses that work using compile-time metadata.
-    /// An I/O failure can still leave a partially written line in the sink.
-    pub fn write(&mut self, message: &Message) -> io::Result<()> {
-        message
-            .validate()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        if message.attrs.contains_key(RECORD) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "expected an unaddressed snapshot",
-            ));
-        }
-        self.start()?;
-        self.state
-            .write_snapshot(&mut self.writer, &mut self.buffer, message)
     }
 
     /// Encode trusted compiler-generated metadata and typed arguments.
@@ -445,7 +397,6 @@ pub mod __private {
     pub use crate::entity::BorrowedArgument;
     pub use crate::statement::{
         Statement, capture_stack, concatenate, encoded_len, json_string, json_string_len,
-        owned_message,
     };
     pub use linkme;
     use std::cell::RefCell;

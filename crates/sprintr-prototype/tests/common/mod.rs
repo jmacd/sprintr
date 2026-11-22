@@ -85,7 +85,7 @@ pub fn replayed(encoded: &[u8]) -> String {
         .to_string()
 }
 
-/// Lift a primitive-argument event out of its delivery context as a snapshot.
+/// Make a self-contained reader fixture from a stream with primitive arguments.
 pub fn standalone(encoded: &[u8]) -> Message {
     let mut records = lines(encoded);
     let mut last = records.pop().unwrap();

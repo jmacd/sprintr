@@ -4,7 +4,7 @@ mod common;
 
 use common::{lines, records, replayed, standalone};
 use sprintr_prototype::{
-    Definition, Logger, Renderer, buffer::StackBuffer, error, info, message, replay, warn,
+    Definition, Logger, Renderer, buffer::StackBuffer, error, info, replay, warn,
 };
 use std::io;
 
@@ -153,16 +153,12 @@ fn invalid_level_definitions_and_references_are_rejected() {
     let mut bad_shape = base;
     bad_shape["defs"]["log.level:INFO"] = serde_json::json!({"desc": "Extra", "args": []});
     cases.push(bad_shape);
-    let first = serde_json::to_string(&message!("first")).unwrap();
     for bad in cases {
         let mut output = Vec::new();
-        let error = replay(format!("{first}\n{bad}\n").as_bytes(), &mut output).unwrap_err();
+        let error = replay(format!("{bad}\n").as_bytes(), &mut output).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("line 2"), "{error}");
-        assert_eq!(
-            common::body(std::str::from_utf8(&output).unwrap()),
-            "first\n"
-        );
+        assert!(error.to_string().contains("line 1"), "{error}");
+        assert!(output.is_empty());
     }
 }
 

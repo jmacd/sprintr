@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::runtime::runtime;
-use crate::{Argument, Entity, RECORD, SOURCE, STATEMENT, THREAD, schema};
+use crate::{Entity, RECORD, SOURCE, STATEMENT, THREAD, schema};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::cell::Cell;
@@ -59,18 +59,6 @@ pub enum BorrowedArgument<'a> {
     String(&'a str),
     Unsigned(u64),
     Entity(&'a EntityHandle),
-}
-
-impl BorrowedArgument<'_> {
-    pub(crate) fn snapshot(self) -> Argument {
-        match self {
-            Self::String(value) => Argument::String(value.into()),
-            Self::Unsigned(value) => Argument::Unsigned(value),
-            Self::Entity(entity) => Argument::Reference {
-                target: entity.fragment.clone(),
-            },
-        }
-    }
 }
 
 struct ThreadLog {

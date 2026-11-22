@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::StatementTemplate;
 use crate::declare::{Named, RelationMeta};
-use crate::entity::BorrowedArgument;
 use crate::format::{self, Part};
 use crate::runtime::runtime;
-use crate::{Definition, Message, STATEMENT, STATEMENT_PREFIX, StatementTemplate};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io;
@@ -269,48 +268,4 @@ pub const fn concatenate<const N: usize>(parts: &[&[u8]]) -> [u8; N] {
     }
     assert!(offset == N);
     output
-}
-
-#[doc(hidden)]
-pub fn owned_message(
-    statement: &'static Statement,
-    stack: io::Result<&[u64]>,
-    args: &[BorrowedArgument<'_>],
-) -> Message {
-    let stack = stack.expect("cannot capture logging snapshot stack");
-    let timestamp = crate::timestamp_now().expect("cannot timestamp logging snapshot");
-    let resolved = statement
-        .resolve()
-        .unwrap_or_else(|error| panic!("cannot resolve logging statement: {error}"));
-    let runtime = runtime();
-    let mut defs: BTreeMap<_, _> = resolved
-        .definitions
-        .iter()
-        .map(|&index| {
-            let encoded = &runtime.definitions[index];
-            (encoded.key.clone(), encoded.definition.clone())
-        })
-        .collect();
-    defs.insert(
-        format!("{STATEMENT_PREFIX}{}", resolved.id),
-        Definition::Statement(
-            serde_json::from_slice(&resolved.template).expect("compiled statement template"),
-        ),
-    );
-    for arg in args {
-        if let BorrowedArgument::Entity(entity) = arg {
-            let relation = &runtime.definitions[entity.relation];
-            defs.entry(relation.key.clone())
-                .or_insert_with(|| relation.definition.clone());
-            defs.entry(entity.key.clone())
-                .or_insert_with(|| Definition::Entity(entity.object.clone()));
-        }
-    }
-    Message {
-        timestamp,
-        stack: stack.to_vec(),
-        attrs: BTreeMap::from([(STATEMENT.into(), resolved.id)]),
-        args: args.iter().map(|argument| argument.snapshot()).collect(),
-        defs,
-    }
 }

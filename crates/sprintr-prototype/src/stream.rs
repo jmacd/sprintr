@@ -4,7 +4,7 @@ use crate::buffer::RecordBuffer;
 use crate::entity::{BorrowedArgument, EntityHandle, Record, with_record};
 use crate::runtime::runtime;
 use crate::statement::Resolved;
-use crate::{Definition, Message, RECORD, STACK, STATEMENT_PREFIX, THREAD, json_error};
+use crate::{STACK, STATEMENT_PREFIX, json_error};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
@@ -142,43 +142,6 @@ impl StreamState {
             if first {
                 self.statements.insert(statement.id);
             }
-            pending.commit(self, record);
-            Ok(())
-        })
-    }
-
-    pub fn write_snapshot(
-        &mut self,
-        writer: &mut impl Write,
-        buffer: &mut impl RecordBuffer,
-        snapshot: &Message,
-    ) -> io::Result<()> {
-        with_record(|record| {
-            // Snapshot arguments use fragment-only references. They still point
-            // into this record after we give it a delivery address.
-            let mut event = snapshot.clone();
-            event.attrs.insert(THREAD.into(), record.thread.id);
-            event.attrs.insert(RECORD.into(), record.seq);
-            let mut pending = Pending::default();
-            pending.schema(self, record.record_relation);
-            pending.entity(self, record.thread.id, record.thread);
-            for &index in &pending.schema {
-                let schema = &runtime().definitions[index];
-                event
-                    .defs
-                    .insert(schema.key.clone(), schema.definition.clone());
-            }
-            for e in &pending.entities {
-                event
-                    .defs
-                    .insert(e.key.clone(), Definition::Entity(e.object.clone()));
-            }
-            buffer.clear();
-            buffer.try_atomic(|buf| {
-                serde_json::to_writer(&mut *buf, &event).map_err(json_error)?;
-                buf.write_all(b"\n")
-            })?;
-            writer.write_all(buffer.as_slice())?;
             pending.commit(self, record);
             Ok(())
         })

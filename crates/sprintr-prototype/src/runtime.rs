@@ -9,7 +9,6 @@ use std::sync::OnceLock;
 
 /// One definition, pre-encoded as a `"key":value` member of a `defs` object.
 pub(crate) struct Encoded {
-    pub(crate) key: String,
     /// The recorded name: the key without its relation prefix.
     pub(crate) name: String,
     pub(crate) bytes: Box<[u8]>,
@@ -153,9 +152,8 @@ impl Runtime {
                     }
                     let bytes = format!("{}:{value}", serde_json::to_string(&key).expect("key"));
                     let index = self.definitions.len();
-                    self.keys.insert(key.clone(), index);
+                    self.keys.insert(key, index);
                     self.definitions.push(Encoded {
-                        key,
                         name: candidate,
                         bytes: bytes.into_bytes().into_boxed_slice(),
                         definition,

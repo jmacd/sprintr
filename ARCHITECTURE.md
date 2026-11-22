@@ -303,7 +303,7 @@ the value will appear as a reference like `{ "$ref":
 defined at least once. In the prototype, `<record_id>` is the decimal sequence
 on the referencing record's thread. For instance, `2#/defs/session:1` selects
 the `session:1` definition **in record 2**, not simply the most recent object
-with that name. A standalone snapshot uses `#/defs/session:1` in its own body.
+with that name. A fragment-only `#/defs/session:1` refers to the containing record.
 
 The `refs` section of the body is an array of single-entry maps.
 Ordinary references have the form `{ "<attribute-or-entity-name>": "<fragment>" }`. Each entry
@@ -408,7 +408,7 @@ the fields described above, including `attrs`, `defs`, `refs`, `args`,
 and `msg`. In JSON Lines, the top-level `seq`, `stmt`, and `thread` fields abbreviate
 `attrs["log.record"]`, `attrs["log.statement"]`, and `attrs["log.thread"]`. They have the same
 meaning as the expanded associations and must not also appear in `attrs`
-under their full names. A snapshot without a delivery address omits `seq` and `thread`.
+under their full names. Each emitted record has both `seq` and `thread`.
 The required `ts` field is the capture time in unsigned Unix nanoseconds.
 It is not part of the record address. Text playback shows UTC to milliseconds.
 Log attributes, scope attributes, and resource attributes
@@ -603,8 +603,8 @@ fixed stack buffers reuse the original implementation's storage and
 rollback approach. Bounded buffers reject a whole record on overflow,
 rather than truncating JSON or dropping arguments.
 
-Owned record construction is available separately through `message!`.
-This convenience path may allocate and is not required for logging.
+The application delivers each event to the SDK at the logging call.
+The reader decodes an owned record from the resulting stream.
 
 The recorded JSON line is:
 
@@ -710,9 +710,8 @@ does not lock the schema registry.
 The reader compiles templates once into formatting operations and argument
 bindings. It applies them to each event without copying an expanded record.
 Missing or conflicting definitions, invalid bindings, and type mismatches
-are errors. Owned `message!` snapshots include their definitions and render
-independently. `message!` captures an unlevelled snapshot; `info!`, `warn!`,
-and `error!` bake `INFO`, `WARN`, or `ERROR` into their statement templates.
+are errors. `info!`, `warn!`, and `error!` bake `INFO`, `WARN`, or `ERROR`
+into their statement templates.
 The named values carry the descriptions "Informational event", "Warning
 condition", and "Error condition". Each output emits a level definition only
 when first needed, and reuses it across statements. Application-defined

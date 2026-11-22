@@ -5,7 +5,7 @@ mod common;
 use common::{lines, records, replayed, standalone, template};
 use sprintr_prototype::buffer::{RecordBuffer, StackBuffer};
 use sprintr_prototype::{
-    Definition, Logger, Message, RECORD, Renderer, THREAD, attributes, info, message, replay,
+    Definition, Logger, Message, RECORD, Renderer, THREAD, attributes, info, replay,
 };
 use std::io::{self, Write};
 
@@ -111,12 +111,10 @@ fn static_aliases_and_multiple_positions() {
         template(first).msg,
         "{before:x} {@account.name} {@account.name}"
     );
-    let owned = message!("{before:x} {} {}", account_name = "Ada", again = "Grace");
-    assert_eq!(template(&owned).msg, template(first).msg);
-    assert_eq!(template(&owned).refs, template(first).refs);
     assert_eq!(
-        common::body(&owned.render().unwrap()),
-        "7 Ada Grace\naccount.name = Ada, account.name = Grace"
+        replayed(&encoded),
+        "7 Ada Grace\nlog.level = INFO, account.name = Ada, account.name = Grace\n\
+         Ada\nlog.level = INFO, account.name = Ada\n"
     );
 }
 
@@ -205,7 +203,11 @@ fn failed_output_does_not_consume_first_definition() {
 /// Guarantees: parameters are explicit, bounded, and typed; pointers are not silently reinterpreted.
 #[test]
 fn playback_rejects_bad_templates() {
-    let valid = message!("{}", account_name = "Ada");
+    let mut logger = Logger::new(Vec::new());
+    info!("{}", logger: logger, account_name = "Ada").unwrap();
+    let events = lines(&logger.into_inner());
+    let first = serde_json::to_string(&events[0]).unwrap();
+    let valid = &events[1];
     let key = format!("log.statement:{}", valid.attrs["log.statement"]);
     let base = serde_json::to_value(valid).unwrap();
     let mut cases = Vec::new();
@@ -238,7 +240,6 @@ fn playback_rejects_bad_templates() {
     let mut zero = base.clone();
     zero["stmt"] = 0.into();
     cases.push(zero);
-    let first = serde_json::to_string(&message!("first")).unwrap();
     for bad in cases {
         let mut output = Vec::new();
         let error = replay(format!("{first}\n{bad}\n").as_bytes(), &mut output).unwrap_err();
@@ -246,7 +247,7 @@ fn playback_rejects_bad_templates() {
         assert!(error.to_string().contains("line 2"), "{error}");
         assert_eq!(
             common::body(std::str::from_utf8(&output).unwrap()),
-            "first\n"
+            common::startup_text()
         );
     }
 }
@@ -255,7 +256,9 @@ fn playback_rejects_bad_templates() {
 /// Guarantees: failed records do not install definitions or corrupt previously compiled templates.
 #[test]
 fn renderer_updates_are_transactional() {
-    let valid = message!("{}", account_name = "Ada");
+    let mut logger = Logger::new(Vec::new());
+    info!("{}", logger: logger, account_name = "Ada").unwrap();
+    let valid = standalone(&logger.into_inner());
     let mut subsequent = valid.clone();
     subsequent.defs.clear();
     let mut renderer = Renderer::default();
@@ -289,7 +292,7 @@ fn renderer_updates_are_transactional() {
         );
         assert_eq!(
             common::body(&renderer.render(&subsequent).unwrap()),
-            "Ada\naccount.name = Ada"
+            "Ada\nlog.level = INFO, account.name = Ada"
         );
     }
 }

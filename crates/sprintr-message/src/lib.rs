@@ -269,10 +269,10 @@ fn deserialize_definitions<'de, D: Deserializer<'de>>(
     deserializer.deserialize_map(Definitions)
 }
 
-/// One occurrence, plus any definitions first needed by this stream.
+/// A decoded event, including any definitions introduced in its record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "WireEvent")]
-#[must_use = "a captured message must be recorded or rendered"]
+#[must_use]
 pub struct Message {
     /// Wall-clock capture time in nanoseconds since the Unix epoch (`ts` on the wire).
     pub timestamp: u64,
@@ -308,7 +308,7 @@ struct WireAttrs {
     scalars: BTreeMap<String, u64>,
 }
 
-// Missing is allowed (a snapshot or longhand); an explicit null is not a number.
+// A field can be absent (longhand or an unaddressed record); null is not a number.
 fn present_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     u64::deserialize(d).map(Some)
 }
@@ -383,7 +383,7 @@ impl Serialize for Message {
 }
 
 impl Message {
-    /// Validate a self-contained snapshot. Stream-dependent events need a [`Renderer`].
+    /// Validate a self-contained record. Stream-dependent events need a [`Renderer`].
     pub fn validate(&self) -> Result<(), FormatError> {
         self.render().map(|_| ())
     }

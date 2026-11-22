@@ -4,7 +4,7 @@ mod common;
 
 use common::{lines, records, replayed, template};
 use sprintr_prototype::buffer::{HeapBuffer, RecordBuffer, StackBuffer};
-use sprintr_prototype::{Argument, Logger, Message, info, message, replay};
+use sprintr_prototype::{Argument, Logger, info, replay};
 use std::cell::Cell;
 use std::io::{self, Write};
 
@@ -66,7 +66,7 @@ fn positional_and_captured_roundtrip() {
 }
 
 /// Scenario: mixed implicit and explicit arguments include an AsRef-only value and a side effect.
-/// Guarantees: capture borrows strings, snapshots eagerly, and evaluates each expression once.
+/// Guarantees: recording borrows strings and evaluates each expression once at the logging call.
 #[test]
 fn capture_is_typed_borrowed_and_evaluated_once() {
     struct Text(String);
@@ -81,16 +81,18 @@ fn capture_is_typed_borrowed_and_evaluated_once() {
         calls.set(calls.get() + 1);
         42u64
     };
-    let record = message!("hello {name:s}, value {:04x}", next());
+    let mut logger = Logger::new(Vec::new());
+    info!("hello {name:s}, value {:04x}", logger: logger, next()).unwrap();
     name.0.clear();
+    let encoded = logger.into_inner();
     assert_eq!(calls.get(), 1);
     assert_eq!(
-        record.args,
+        records(&encoded)[0].args,
         [Argument::String("Ada".into()), Argument::Unsigned(42)]
     );
     assert_eq!(
-        common::body(&record.render().unwrap()),
-        "hello Ada, value 002a"
+        replayed(&encoded),
+        "hello Ada, value 002a\nlog.level = INFO\n"
     );
 }
 
@@ -99,44 +101,38 @@ fn capture_is_typed_borrowed_and_evaluated_once() {
 #[test]
 fn escaped_literals_and_string_data() {
     let text = "quoted \"text\"\n\\{braces}\t\u{03bb}";
-    let record = message!(r"{{{text:s}}} {text:s}");
     let mut logger = Logger::new(Vec::new());
-    logger.write(&record).unwrap();
+    info!(r"{{{text:s}}} {text:s}", logger: logger).unwrap();
+    info!("{{literal}}", logger: logger).unwrap();
+    info!("", logger: logger).unwrap();
     let encoded = logger.into_inner();
-    assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 2);
-    let decoded = records(&encoded).remove(0);
-    assert_eq!(decoded.args, record.args);
-    assert_eq!(decoded.timestamp, record.timestamp);
-    assert_eq!(decoded.stack, record.stack);
-    assert_eq!(template(&decoded), template(&record));
-    assert_eq!(replayed(&encoded), format!("{{{text}}} {text}\n"));
+    assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 4);
     assert_eq!(
-        common::body(&message!("{{literal}}").render().unwrap()),
-        "{literal}"
+        replayed(&encoded),
+        format!(
+            "{{{text}}} {text}\nlog.level = INFO\n{{literal}}\nlog.level = INFO\n\nlog.level = INFO\n"
+        )
     );
-    assert_eq!(common::body(&message!("").render().unwrap()), "");
 }
 
 /// Scenario: direct encoding includes escaped format text, Unicode, braces, and a temporary argument.
-/// Guarantees: it agrees with owned-message encoding and each temporary is evaluated once.
+/// Guarantees: decoded events serialize back to the same wire fields and temporaries are evaluated once.
 #[test]
-fn direct_encoding_matches_owned_encoding() {
+fn direct_encoding_roundtrips_through_the_reader() {
     let text = "quoted \"text\"\n\\{braces}\t\u{03bb}";
     let value = u64::MAX;
     let mut logger = Logger::new(Vec::new());
     info!("line\n{{{text:s}}} {value:#04x}", logger: logger).unwrap();
-    let owned = message!("line\n{{{text:s}}} {value:#04x}");
     let encoded = logger.into_inner();
-    let direct = &records(&encoded)[0];
-    assert_eq!(direct.args, owned.args);
-    assert_eq!(template(direct).msg, template(&owned).msg);
-    assert_eq!(template(direct).refs, template(&owned).refs);
+    for (record, line) in lines(&encoded).iter().zip(encoded.split(|&b| b == b'\n')) {
+        assert_eq!(
+            serde_json::to_value(record).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(line).unwrap()
+        );
+    }
     assert_eq!(
         replayed(&encoded),
-        format!(
-            "{}\nlog.level = INFO\n",
-            common::body(&owned.render().unwrap())
-        )
+        format!("line\n{{{text}}} {value:#04x}\nlog.level = INFO\n")
     );
 
     let calls = Cell::new(0);
@@ -219,15 +215,16 @@ fn buffer_limit_includes_record_framing() {
 #[test]
 fn hexadecimal_formatting_matches_rust() {
     for value in [0u64, 42, 0x12345, (1 << 53) + 1, u64::MAX] {
-        let record =
-            message!("{value:x}|{value:04x}|{value:#04x}|{value:8x}|{value:#08x}|{value:#x}");
-        let json = serde_json::to_string(&record).unwrap();
-        let decoded: Message = serde_json::from_str(&json).unwrap();
+        let mut logger = Logger::new(Vec::new());
+        info!("{value:x}|{value:04x}|{value:#04x}|{value:8x}|{value:#08x}|{value:#x}", logger: logger).unwrap();
+        let encoded = logger.into_inner();
         assert_eq!(
-            common::body(&decoded.render().unwrap()),
-            format!("{value:x}|{value:04x}|{value:#04x}|{value:8x}|{value:#08x}|{value:#x}")
+            replayed(&encoded),
+            format!(
+                "{value:x}|{value:04x}|{value:#04x}|{value:8x}|{value:#08x}|{value:#x}\nlog.level = INFO\n"
+            )
         );
-        assert_eq!(decoded.args[0], Argument::Unsigned(value));
+        assert_eq!(records(&encoded)[0].args[0], Argument::Unsigned(value));
     }
 }
 
@@ -236,7 +233,11 @@ fn hexadecimal_formatting_matches_rust() {
 #[test]
 fn invalid_records_fail_loudly() {
     let value = 1u64;
-    let base = message!("{value:x}");
+    let mut logger = Logger::new(Vec::new());
+    info!("{value:x}", logger: logger).unwrap();
+    let events = lines(&logger.into_inner());
+    let first = serde_json::to_string(&events[0]).unwrap();
+    let base = &events[1];
     let key = format!("log.statement:{}", base.attrs["log.statement"]);
     let base = serde_json::to_value(base).unwrap();
     let mut cases = vec![("not json".into(), "line 2"), (String::new(), "line 2")];
@@ -267,7 +268,6 @@ fn invalid_records_fail_loudly() {
     let mut bad = base;
     bad["attributes"] = serde_json::json!({});
     cases.push((bad.to_string(), "unknown field"));
-    let first = serde_json::to_string(&message!("first")).unwrap();
     for (invalid, expected) in cases {
         let input = format!("{first}\n{invalid}\n");
         let mut output = Vec::new();
@@ -277,24 +277,9 @@ fn invalid_records_fail_loudly() {
         assert!(error.to_string().contains(expected), "{invalid}: {error}");
         assert_eq!(
             common::body(std::str::from_utf8(&output).unwrap()),
-            "first\n"
+            common::startup_text()
         );
     }
-}
-
-/// Scenario: a manually constructed record has arguments incompatible with its stored format.
-/// Guarantees: the writer rejects it before producing a partial JSON line.
-#[test]
-fn writer_validates_before_output() {
-    let mut logger = Logger::new(Vec::new());
-    let value = 1u32;
-    let mut record = message!("{value:x}");
-    record.args[0] = Argument::String("not numeric".into());
-    assert_eq!(
-        logger.write(&record).unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
-    assert!(logger.into_inner().is_empty());
 }
 
 struct FailWriter {
@@ -325,7 +310,9 @@ fn io_errors_are_returned() {
         io::ErrorKind::BrokenPipe
     );
     assert_eq!(logger.flush().unwrap_err().to_string(), "flush failed");
-    let input = serde_json::to_vec(&message!("hello")).unwrap();
+    let mut logger = Logger::new(Vec::new());
+    info!("hello", logger: logger).unwrap();
+    let input = logger.into_inner();
     let error = replay(input.as_slice(), FailWriter { fail_write: true }).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     let error = replay(input.as_slice(), FailWriter { fail_write: false }).unwrap_err();
@@ -341,6 +328,10 @@ fn macro_paths_are_hygienic() {
     use sprintr_prototype as renamed;
     let name = "Ada";
     let value = 42u8;
-    let record = renamed::message!("{name:s} {value:04x}");
-    assert_eq!(common::body(&record.render().unwrap()), "Ada 002a");
+    let mut logger = renamed::Logger::new(Vec::new());
+    renamed::info!("{name:s} {value:04x}", logger: logger).unwrap();
+    assert_eq!(
+        replayed(&logger.into_inner()),
+        "Ada 002a\nlog.level = INFO\n"
+    );
 }

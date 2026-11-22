@@ -12,7 +12,7 @@ use serde::Serialize;
 use sprintr_prototype::buffer::StackBuffer;
 use sprintr_prototype::symbols::LocalSymbols;
 use sprintr_prototype::{
-    Logger, Message, Renderer, attributes, entities, error, info, message, replay, warn,
+    Logger, Message, Renderer, attributes, entities, error, info, replay, warn,
 };
 use std::io::{self, BufWriter, Write};
 
@@ -104,16 +104,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reason = info!("{long:s}", logger: bounded).unwrap_err().to_string();
     info!("short records still fit", logger: bounded)?;
     error!("bounded logger rejected a record: {reason:s}", logger: logger)?;
-
-    // `message!` captures an owned, unlevelled snapshot that carries all of
-    // its definitions, renders independently, and can be written later.
-    let snapshot = message!("snapshot of {} at {value:#x}", account_name = name);
-    assert!(
-        snapshot
-            .render()?
-            .ends_with("Z snapshot of Ada at 0x2a\naccount.name = Ada")
-    );
-    logger.write(&snapshot)?;
 
     logger.flush()?;
     let encoded = logger.into_inner();

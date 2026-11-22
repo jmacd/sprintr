@@ -49,7 +49,7 @@ line number. Input, output, and flush failures are returned rather than ignored.
 ## Try the API
 
 ```rust
-use sprintr_prototype::{Logger, info, message};
+use sprintr_prototype::{Logger, info, replay};
 
 let name = String::from("Ada");
 let value = 42u32;
@@ -62,19 +62,18 @@ let mut logger = Logger::new(Vec::new());
 info!("hello {:s}, value {:04x}", logger: logger, name, value)?;
 logger.flush()?;
 
-// Capture and rendering are independent of delivery.
-let record = message!("hello {name:s}, value {value:#04x}");
-assert!(record.render()?.ends_with("Z hello Ada, value 0x2a"));
-# Ok::<(), Box<dyn std::error::Error>>(())
+// Replay the records the logger wrote.
+let mut text = Vec::new();
+replay(logger.into_inner().as_slice(), &mut text)?;
+assert!(text.ends_with(b"hello Ada, value 002a\nlog.level = INFO\n"));
+# Ok::<(), std::io::Error>(())
 ```
 
 `info!` returns `std::io::Result<()>`. It borrows string data and encodes it
 directly without requiring `Display` or allocating intermediate owned arguments.
 The caller retains ownership. Expressions are evaluated once per placeholder
-occurrence. `message!` is a separate, allocating API for unlevelled owned snapshots.
-Its snapshots include their definitions and are not preceded by an announcement.
-It panics if statement identities are exhausted or the clock is outside the
-representable range; `info!` returns the error instead.
+occurrence. Each logging call delivers the event to the SDK immediately.
+`Message` is the reader's owned representation of a decoded record.
 Writers are synchronous, and I/O failure may leave a partially written line.
 Call `Logger::flush` explicitly for buffered output.
 
@@ -198,8 +197,7 @@ Both events have `"args":[{"$ref":"1#/defs/session:1"}]`. The number before
 `#` selects record 1 **on the event's thread**; the fragment selects that
 record's definition. Playback displays the resolved object, not the pointer.
 Another output or thread defines the object on first use there, so a short
-reference never needs another stream. An owned `message!` snapshot has no
-delivery address and uses `#/defs/session:1` within its own definitions.
+reference never needs another stream.
 
 ### Collisions
 
@@ -231,7 +229,7 @@ pointing at an unaccepted definition.
 
 ## Statement templates and events
 
-Every `info!`, `warn!`, `error!`, or `message!` callsite has a static anonymous `log.statement`
+Every `info!`, `warn!`, or `error!` callsite has a static anonymous `log.statement`
 entity. Its static fields are pre-encoded:
 
 ```json
@@ -247,17 +245,16 @@ The template contains no `args` or nested `defs`. `{"$arg": 0}` binds to the
 first argument of each event using it; it is not a pointer into the template's
 record. Ordinary JSON Pointer semantics are unchanged. Repeated associations
 remain separate `refs` entries. Named level references live in static template
-`attrs`; `message!` omits the level but still captures the event's stack.
+`attrs`; the stack is captured separately for each event.
 
 `seq`, `stmt`, and `thread` are wire shorthand for `attrs["log.record"]`,
 `attrs["log.statement"]`, and `attrs["log.thread"]`. Readers accept either spelling, but reject records
 that supply both for the same value. In memory, `Message::attrs` uses the full
-names. A snapshot has `stmt` but gets `thread` and `seq` only when written to a stream.
+names.
 
 Each record also carries `ts`, the wall-clock capture time as a `u64`
 count of Unix nanoseconds. Playback displays UTC to milliseconds, truncating
-sub-millisecond digits only for display. `message!` retains its original
-timestamp when written later. Use `seq`, not wall-clock time, for ordering.
+sub-millisecond digits only for display. Use `seq` for ordering on a thread.
 
 First use assigns a process-local nonzero `u64` statement identity. `stmt`
 is a typed reference to that entity, resolved through `defs["log.statement:<id>"]`.
@@ -271,8 +268,7 @@ statement definitions but need not repeat already-emitted relations or levels.
 Each caller-owned logger tracks first use independently. Stdout tracks it per
 thread alongside its scratch buffer, so different threads may repeat identical
 definitions. Definitions are marked emitted only after the output accepts the
-record. `message!` instead includes all required definitions in each owned
-snapshot so that `Message::render()` works independently.
+record.
 
 `replay` retains definitions and compiles each template once into formatting
 operations and argument bindings; `Renderer` exposes the same behavior directly.
@@ -297,8 +293,7 @@ the statement keeps its source. Limits from 0 to 64 fit the producer's
 fixed-size capture buffer.
 Each PC identifies an anonymous `log.source` in that process; there are no
 `log.source:<pc>` records. Reaching the same statement through a different
-caller can change the stack without changing `stmt`. A `message!` snapshot
-keeps its capture stack when written later.
+caller can change the stack without changing `stmt`.
 
 The `tour` example decodes a record before asking `symbols::LocalSymbols` for
 module, demangled function, source file, and line. Its `log.stack =` display
@@ -370,8 +365,7 @@ Allocation tests cover warmed heap and stack storage and repeated attributed
 statements with changing values. The
 zero-allocation target excludes work done by user argument expressions and
 output sinks, first-use schema validation/bookkeeping, buffer initialization/growth,
-and error reporting. `message!`, validation of manually
-constructed messages, playback, and graph-building may allocate. Throughput,
+and error reporting. Playback and graph-building may allocate. Throughput,
 contention, and retained-memory policies still need production evaluation.
 
 ## Format subset
