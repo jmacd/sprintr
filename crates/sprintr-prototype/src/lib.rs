@@ -10,6 +10,7 @@ use std::io::{self, BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod buffer;
+mod context;
 mod declare;
 mod entity;
 mod runtime;
@@ -26,11 +27,12 @@ use runtime::{Collision, runtime};
 use statement::Statement;
 use stream::StreamState;
 
+pub use context::{ContextEntity, EntityContext};
 pub use declare::{Attribute, Entity, Named};
 pub use entity::BorrowedArgument as Value;
 pub use entity::EntityHandle;
 pub use sprintr_message::{
-    Argument, ArgumentBinding, Definition, EncodeDefinition, Message, RECORD, RELATION,
+    Argument, ArgumentBinding, ContextRef, Definition, EncodeDefinition, Message, RECORD, RELATION,
     RELATION_PREFIX, RelationDefinition, RelationKind, RelationType, Renderer, SOURCE, STACK,
     STATEMENT, STATEMENT_PREFIX, STRUCT_ENCODE, StatementSource, StatementTemplate, THREAD, format,
     format::FormatError,

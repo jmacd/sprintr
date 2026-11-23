@@ -3,8 +3,8 @@
 This non-production prototype captures a message format and typed positional
 arguments, records JSON Lines, and replays plain-text messages. Declared
 attributes, statically named entities such as levels, and anonymous objects
-supply self-describing metadata. There is no thread-local application
-attribute injection, filtering, or binary encoding yet.
+supply self-describing metadata. Thread-local context adds entity associations
+to events. Filtering and binary encoding are future work.
 There is no dependency on Tokio, tracing, or an OpenTelemetry runtime.
 
 ## Run the example
@@ -243,11 +243,49 @@ The levels are declared with [`entities!`](#declaring-attributes-and-entities)
 in `sprintr_prototype::schema`, like any other relation. Playback recognizes
 named entities generically, not only levels.
 
-The level comes from static statement metadata. There is no dynamic override,
-filtering, or thread-local application attribute injection yet.
+The level comes from static statement metadata. Scoped context adds separate
+event attributes; it leaves the level unchanged.
 Positional `$arg` associations still bind to each event's argument values.
 Playback includes the level first on the association line, for example
 `log.level = INFO, account.name = Ada`.
+
+## Scoped entity context
+
+Declare an entity-valued attribute for each role. Prepare its association once
+and enter it around ordinary application code:
+
+```rust
+use sprintr_prototype::{attributes, entities, info, start};
+
+entities! {
+    /// Application session
+    #[anonymous]
+    session = "session";
+}
+attributes! {
+    /// Session handling the request
+    active_session: entity(session) = "request.session";
+}
+
+fn serve() { info!("request received"); }
+
+start()?;
+let login = session.new(serde_json::json!({"account":"Ada"}))?;
+active_session.context(&login)?.in_scope(serve);
+# Ok::<(), std::io::Error>(())
+```
+
+For `session:1`, the event's `attrs` contains
+`"request.session":{"$ref":"session:1"}` alongside `log.stack`. This `$ref`
+is an immutable entity key: playback looks it up in the current or earlier
+definitions in the stream. Positional argument references still address a
+specific record and JSON Pointer. A declared named entity works the same way,
+for example `deployment.context(&environment::PRODUCTION)?`.
+
+Distinct roles compose. An inner scope for the same role temporarily replaces
+its value; returning or unwinding restores the outer value. Like the scoped
+logger, context is synchronous and thread-local. Selecting another logger on
+the thread keeps the context and introduces its definitions on that output.
 
 ## Declaring attributes and entities
 
@@ -279,7 +317,7 @@ assert_eq!(environment::STAGING.description(), "Pre-production testing");
 ```
 
 Each doc comment is the recorded description and is required. Attribute values
-are `str`, `u64`, or a handle to an anonymous relation declared with `entity(relation)`.
+are `str`, `u64`, or an entity of a relation declared with `entity(relation)`.
 Entity relations hold object values; statically named values
 such as `log.level:INFO` are the unusual case.
 `#[anonymous]` marks a relation whose values have no names, such as

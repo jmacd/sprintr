@@ -300,6 +300,8 @@ pub struct Message {
     pub stack: Vec<u64>,
     /// Scalar associations, including `log.statement` and, on delivery, `log.thread` and `log.record`.
     pub attrs: BTreeMap<String, u64>,
+    /// Entity-valued associations from event `attrs`, separate from positional arguments.
+    pub context: BTreeMap<String, ContextRef>,
     pub args: Vec<Argument>,
     /// Ordered, single-entry associations with local JSON Pointer fragments into `args`.
     pub refs: Vec<BTreeMap<String, String>>,
@@ -324,12 +326,52 @@ struct WireEvent {
     defs: BTreeMap<String, Definition>,
 }
 
-#[derive(Deserialize)]
+/// A process-local entity key in event context, not a record-relative JSON Pointer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextRef {
+    #[serde(rename = "$ref")]
+    pub entity: String,
+}
+
 struct WireAttrs {
-    #[serde(rename = "log.stack")]
     stack: Vec<u64>,
-    #[serde(flatten)]
     scalars: BTreeMap<String, u64>,
+    context: BTreeMap<String, ContextRef>,
+}
+
+impl<'de> Deserialize<'de> for WireAttrs {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = WireAttrs;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("event attributes with a stack and optional entity associations")
+            }
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<WireAttrs, A::Error> {
+                let mut stack = None;
+                let mut scalars = BTreeMap::new();
+                let mut context = BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if match key.as_str() {
+                        STACK => stack.replace(map.next_value()?).is_some(),
+                        THREAD | STATEMENT | RECORD => {
+                            scalars.insert(key, map.next_value()?).is_some()
+                        }
+                        _ => context.insert(key, map.next_value()?).is_some(),
+                    } {
+                        return Err(de::Error::custom("duplicate event attribute"));
+                    }
+                }
+                Ok(WireAttrs {
+                    stack: stack.ok_or_else(|| de::Error::missing_field(STACK))?,
+                    scalars,
+                    context,
+                })
+            }
+        }
+        d.deserialize_map(Visitor)
+    }
 }
 
 // Unlike deserializing straight into a map, this also rejects two entries
@@ -386,6 +428,7 @@ impl TryFrom<WireEvent> for Message {
             timestamp: wire.ts,
             stack: wire.attrs.stack,
             attrs: wire.attrs.scalars,
+            context: wire.attrs.context,
             args: wire.args,
             refs: wire
                 .refs
@@ -426,6 +469,17 @@ impl Serialize for Message {
                     if !matches!(key.as_str(), STATEMENT | RECORD | THREAD) {
                         attrs.serialize_entry(key, value)?;
                     }
+                }
+                for (key, value) in &self.0.context {
+                    if key == STACK
+                        || self.0.attrs.contains_key(key)
+                        || matches!(key.as_str(), THREAD | STATEMENT | RECORD)
+                    {
+                        return Err(serde::ser::Error::custom(format!(
+                            "conflicting context attribute {key:?}"
+                        )));
+                    }
+                    attrs.serialize_entry(key, value)?;
                 }
                 attrs.end()
             }
@@ -552,7 +606,7 @@ impl CompiledStatement {
         })
     }
 
-    fn render(&self, timestamp: u64, record: &RecordArgs<'_>) -> Result<String, FormatError> {
+    fn render(&self, message: &Message, record: &RecordArgs<'_>) -> Result<String, FormatError> {
         let args = record.args();
         if self.decimal.len() != args.len() {
             return Err(FormatError(format!(
@@ -565,6 +619,7 @@ impl CompiledStatement {
             args[binding.argument].check_attribute(&binding.name, &binding.value_type)?;
         }
         let mut index = 0;
+        let timestamp = message.timestamp;
         let instant = UNIX_EPOCH
             .checked_add(Duration::from_nanos(timestamp))
             .ok_or_else(|| {
@@ -582,7 +637,12 @@ impl CompiledStatement {
                 }
             }
         }
-        for (position, (name, value)) in self.template.attrs.iter().enumerate() {
+        let attrs = self
+            .template
+            .attrs
+            .iter()
+            .chain(message.context.iter().map(|(k, v)| (k, &v.entity)));
+        for (position, (name, value)) in attrs.enumerate() {
             output.push_str(if position == 0 { "\n" } else { ", " });
             output.extend(name.escape_debug());
             output.push_str(" = ");
@@ -596,11 +656,13 @@ impl CompiledStatement {
             .chain(record.associations.iter().copied())
             .enumerate()
         {
-            output.push_str(if position == 0 && self.template.attrs.is_empty() {
-                "\n"
-            } else {
-                ", "
-            });
+            output.push_str(
+                if position == 0 && self.template.attrs.is_empty() && message.context.is_empty() {
+                    "\n"
+                } else {
+                    ", "
+                },
+            );
             output.extend(name.escape_debug());
             output.push_str(" = ");
             record.write_association(&mut output, value)?;
@@ -701,10 +763,10 @@ impl Renderer {
         let relation = |name: &str| relations.get(name).or_else(|| self.relations.get(name));
         for definition in relations.values() {
             if let RelationType::Entity(target) = &definition.value_type
-                && !relation(target).is_some_and(|r| r.kind == RelationKind::Entity && r.anonymous)
+                && !relation(target).is_some_and(|r| r.kind == RelationKind::Entity)
             {
                 return Err(FormatError(format!(
-                    "expected an anonymous entity relation for attribute target {target:?}"
+                    "expected an entity relation for attribute target {target:?}"
                 )));
             }
         }
@@ -786,6 +848,29 @@ impl Renderer {
             ) || self.entities.contains_key(key)
                 || self.encoders.contains_key(key)
         };
+        for (role, value) in &message.context {
+            let Some(RelationDefinition {
+                kind: RelationKind::Attribute,
+                value_type: RelationType::Entity(expected),
+                ..
+            }) = relation(role)
+            else {
+                return Err(FormatError(format!(
+                    "expected an entity-valued context attribute {role:?}"
+                )));
+            };
+            if value
+                .entity
+                .split_once(':')
+                .is_none_or(|(target, _)| target != expected)
+                || !has_entity(&value.entity)
+            {
+                return Err(FormatError(format!(
+                    "invalid or unknown context entity {:?} for {role:?} (expected {expected:?})",
+                    value.entity
+                )));
+            }
+        }
         if let Some(address) = address {
             for name in [THREAD, RECORD] {
                 if relation(name).is_none() {
@@ -825,7 +910,7 @@ impl Renderer {
         let arguments = RecordArgs::new(self, message, address, relation, |key| {
             encoders.get(key).or_else(|| self.encoders.get(key))
         })?;
-        let output = statement.render(message.timestamp, &arguments)?;
+        let output = statement.render(message, &arguments)?;
         self.encoders.extend(encoders);
         self.relations.extend(relations);
         self.statements.extend(statements);

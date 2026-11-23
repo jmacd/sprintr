@@ -41,10 +41,10 @@ impl RelationMeta {
     }
 
     #[doc(hidden)]
-    pub const fn __entity_attribute(
+    pub const fn __entity_attribute<const ANONYMOUS: bool>(
         name: &'static str,
         desc: &'static str,
-        target: &'static Entity<true>,
+        target: &'static Entity<ANONYMOUS>,
     ) -> Self {
         Self {
             name,
@@ -155,23 +155,28 @@ impl Attribute<EntityHandle> {
     }
 
     pub(crate) fn check<'a>(&self, handle: &'a EntityHandle) -> io::Result<&'a EntityHandle> {
+        self.check_relation(handle.relation)?;
+        Ok(handle)
+    }
+
+    pub(crate) fn check_relation(&self, actual: usize) -> io::Result<()> {
         let DeclaredType::Entity(target) = self.meta.value_type else {
             return Err(io::Error::other("expected an entity-valued attribute"));
         };
         let runtime = crate::runtime::runtime();
         let expected = runtime.relation(target).map_err(io::Error::other)?;
-        if expected != handle.relation {
+        if expected != actual {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "attribute {:?} expects an entity of {:?}, got {:?}",
                     self.name(),
                     runtime.definitions[expected].name,
-                    handle.key
+                    runtime.definitions[actual].name
                 ),
             ));
         }
-        Ok(handle)
+        Ok(())
     }
 }
 

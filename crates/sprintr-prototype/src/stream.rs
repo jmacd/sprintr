@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::buffer::RecordBuffer;
+use crate::context::{self, ContextDefinition};
 use crate::entity::{BorrowedArgument, EntityHandle, Record, with_record};
 use crate::runtime::runtime;
 use crate::statement::{EncoderCache, NamedEncoder, Resolved};
@@ -118,28 +119,43 @@ impl StreamState {
         record: Record<'_>,
     ) -> io::Result<()> {
         let timestamp = crate::timestamp_now()?;
-        let state = &mut self.accepted;
-        let first = !state.statements.contains(&statement.id);
-        let mut pending = Pending::default();
-        if first {
-            for &index in &statement.definitions {
-                pending.schema(state, index);
+        context::with_current(|bindings| {
+            let state = &mut self.accepted;
+            let first = !state.statements.contains(&statement.id);
+            let mut pending = Pending::default();
+            if first {
+                for &index in &statement.definitions {
+                    pending.schema(state, index);
+                }
             }
-        }
-        let thread = record.thread.id;
-        pending.schema(state, record.record_relation);
-        pending.entity(state, record, record.thread, || {
-            Cow::Borrowed(&record.thread.member)
-        });
-        self.scratch.clear();
-        buffer.clear();
-        buffer.try_atomic(|buf| {
+            let thread = record.thread.id;
+            pending.schema(state, record.record_relation);
+            pending.entity(state, record, record.thread, || {
+                Cow::Borrowed(&record.thread.member)
+            });
+            self.scratch.clear();
+            buffer.clear();
+            buffer.try_atomic(|buf| {
                 write!(
                     buf,
                     "{{\"seq\":{},\"stmt\":{},\"thread\":{thread},\"ts\":{timestamp},\"attrs\":{{\"{STACK}\":",
                     record.seq, statement.id
                 )?;
                 serde_json::to_writer(&mut *buf, stack).map_err(json_error)?;
+                for binding in bindings {
+                    pending.schema(state, binding.attribute);
+                    match binding.definition {
+                        ContextDefinition::Named(index) => {
+                            pending.schema(state, binding.relation);
+                            pending.schema(state, index);
+                        }
+                        ContextDefinition::Anonymous(handle) => {
+                            pending.entity(state, record, handle, || Cow::Borrowed(&handle.member));
+                        }
+                    }
+                    buf.write_all(b",")?;
+                    buf.write_all(&binding.member)?;
+                }
                 buf.write_all(b"},\"args\":[")?;
                 Encoder::new(buf, &mut self.scratch, &mut self.encoders, state, &mut pending, record).args(args)?;
                 buf.write_all(b"]")?;
@@ -175,11 +191,12 @@ impl StreamState {
                 }
                 buf.write_all(b"}\n")
             })?;
-        writer.write_all(buffer.as_slice())?;
-        if first {
-            state.statements.insert(statement.id);
-        }
-        pending.commit(state, record);
-        Ok(())
+            writer.write_all(buffer.as_slice())?;
+            if first {
+                state.statements.insert(statement.id);
+            }
+            pending.commit(state, record);
+            Ok(())
+        })
     }
 }

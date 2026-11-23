@@ -574,6 +574,15 @@ incompatible definitions supplied by different dependencies.
 
 ## Context
 
+An entity-valued attribute can be bound for a synchronous thread-local scope.
+Each event in that scope carries a non-positional association such as
+`"request.session":{"$ref":"session:1"}` in its own `attrs`. Here `$ref`
+selects an immutable entity by its key in the stream's definitions; it does
+not encode a definition location. Named and anonymous context entities follow
+the same rule. `log.level` remains a static association on the statement.
+Different attribute keys coexist; the innermost binding of one key wins until
+scope exit. Context follows the thread across logger scopes, not spawned tasks.
+
 Each local logging scope defines a sequence of log records, emitted in
 ascending sequence order. The OTel instrumentation scope carries the
 defining attributes, and its associated records are grouped under that
@@ -781,8 +790,8 @@ are errors. `info!`, `warn!`, and `error!` bake `INFO`, `WARN`, or `ERROR`
 into their statement templates.
 The named values carry the descriptions "Informational event", "Warning
 condition", and "Error condition". Each output emits a level definition only
-when first needed, and reuses it across statements. Application-defined
-thread-local attribute injection is a later step.
+when first needed, and reuses it across statements. Application context
+associations live on events independently of these templates.
 The current extension supports string and `u64` attributes, statically named
 entities, anonymous runtime objects, anonymous statements, `$arg` bindings,
 and record-relative references to whole object definitions. Runtime named

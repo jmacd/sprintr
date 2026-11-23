@@ -44,7 +44,8 @@ log.level = INFO, account.name = Grace
 
 See the [prototype API and format subset](crates/sprintr-prototype/README.md)
 for [nested structured arguments](crates/sprintr-prototype/README.md#structured-arguments),
-anonymous application objects, implicit captures, positional expressions,
+anonymous application objects, [scoped entity context](crates/sprintr-prototype/README.md#scoped-entity-context),
+implicit captures, positional expressions,
 caller-owned writers, and [deferred call-stack symbolization](crates/sprintr-prototype/README.md#call-stacks-and-symbols).
 
 ## Workspace

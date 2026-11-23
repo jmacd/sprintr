@@ -76,6 +76,37 @@ fn addressed(thread: u64, sequence: u64, target: &str) -> Message {
     }))
 }
 
+/// Scenario: event context arrives with malformed, missing, or incompatible targets.
+/// Guarantees: identity lookup requires a declared role and an accepted definition.
+#[test]
+fn context_requires_a_typed_role_and_known_entity_key() {
+    let mut wire = snapshot();
+    wire["defs"]["log.relation:active"] =
+        json!({"kind":"attribute","type":{"entity":"session"},"desc":"Active session"});
+    wire["attrs"]["active"] = json!({"$ref":"session:9"});
+    let event = message(wire.clone());
+    assert_eq!(serde_json::to_value(&event).unwrap(), wire);
+    assert!(event.render().unwrap().ends_with("\nactive = session:9"));
+    for bad in [
+        json!({"$ref":"session:10"}),
+        json!({"$ref":"log.thread:17"}),
+        json!({"$ref":"3#/defs/session:9"}),
+        json!("session:9"),
+        json!({"$ref":"session:9","extra":0}),
+    ] {
+        wire["attrs"]["active"] = bad;
+        if let Ok(event) = serde_json::from_value::<Message>(wire.clone()) {
+            assert!(event.render().is_err());
+        }
+    }
+    wire["attrs"]["active"] = json!({"$ref":"session:9"});
+    wire["defs"]
+        .as_object_mut()
+        .unwrap()
+        .remove("log.relation:active");
+    assert!(message(wire).render().is_err());
+}
+
 #[test]
 fn entity_objects_roundtrip_without_shape_dispatch_or_traversal() {
     let key = "a/~%#é:9";
