@@ -28,6 +28,12 @@ crate::entities! {
     #[anonymous]
     pub log_record = "log.record";
 
+    /// Rust type name for a structured object argument
+    pub struct_name = "struct.name";
+
+    /// Named encoder for a positional structured argument
+    pub struct_encode = "struct.encode";
+
     /// Logging level
     pub log_level = "log.level" {
         /// Informational event
@@ -51,7 +57,9 @@ crate::attributes! {
 }
 
 /// Resolution order for sprintr's own declarations; not a reservation.
-pub(crate) static DECLARATIONS: [Declaration; 12] = [
+pub(crate) static DECLARATIONS: [Declaration; 14] = [
+    Declaration::Relation(struct_name.__meta()),
+    Declaration::Relation(struct_encode.__meta()),
     Declaration::Relation(log_statement.__meta()),
     Declaration::Relation(log_stack.__meta()),
     Declaration::Relation(log_source.__meta()),

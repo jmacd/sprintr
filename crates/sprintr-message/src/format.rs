@@ -93,6 +93,15 @@ fn specifier(text: &str) -> Result<Spec, FormatError> {
 /// Empty/string specifiers and `[#][0][width]x` are supported. Capture macros
 /// additionally require an explicit `:s` for string arguments.
 pub fn parse(input: &str) -> Result<Vec<Part>, FormatError> {
+    parse_impl(input, false)
+}
+
+/// Source-only `:?` captures Debug text. Like `:s`, it is omitted on the wire.
+pub fn parse_capture(input: &str) -> Result<Vec<Part>, FormatError> {
+    parse_impl(input, true)
+}
+
+fn parse_impl(input: &str, capture: bool) -> Result<Vec<Part>, FormatError> {
     let mut parts = Vec::new();
     let mut literal = String::new();
     let mut chars = input.char_indices().peekable();
@@ -127,7 +136,11 @@ pub fn parse(input: &str) -> Result<Vec<Part>, FormatError> {
                 parts.push(Part::Field(Field {
                     name: name.into(),
                     format: format.into(),
-                    spec: specifier(format)?,
+                    spec: if capture && format == "?" {
+                        Spec::String
+                    } else {
+                        specifier(format)?
+                    },
                 }));
             }
             '}' => {

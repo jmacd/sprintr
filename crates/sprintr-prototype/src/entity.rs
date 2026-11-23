@@ -15,7 +15,7 @@ pub struct EntityHandle {
     pub(crate) relation: usize,
     pub(crate) key: String,
     pub(crate) fragment: String,
-    pub(crate) object: Map<String, Value>,
+    pub(crate) member: Box<[u8]>,
 }
 
 impl Entity<true> {
@@ -36,29 +36,35 @@ impl Entity<true> {
         let id = NEXT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| io::Error::other("anonymous entity identities exhausted"))?;
-        Ok(EntityHandle::with_id(relation, id, object))
+        EntityHandle::with_id(relation, id, object)
     }
 }
 
 impl EntityHandle {
-    fn with_id(relation: usize, id: u64, object: Map<String, Value>) -> Self {
+    fn with_id(relation: usize, id: u64, object: Map<String, Value>) -> io::Result<Self> {
         let key = format!("{}:{id}", runtime().definitions[relation].name);
-        Self {
+        let mut member = serde_json::to_vec(&key).map_err(crate::json_error)?;
+        member.push(b':');
+        serde_json::to_writer(&mut member, &object).map_err(crate::json_error)?;
+        Ok(Self {
             id,
             relation,
             fragment: sprintr_message::definition_fragment(&key),
             key,
-            object,
-        }
+            member: member.into(),
+        })
     }
 }
 
-#[doc(hidden)]
 #[derive(Clone, Copy)]
 pub enum BorrowedArgument<'a> {
     String(&'a str),
     Unsigned(u64),
     Entity(&'a EntityHandle),
+    Structured(&'a dyn crate::StructuredValue),
+    Debug(&'a dyn std::fmt::Debug),
+    #[doc(hidden)]
+    EntityArgument(&'static crate::Attribute<EntityHandle>, &'a EntityHandle),
 }
 
 struct ThreadLog {
@@ -80,7 +86,7 @@ impl ThreadLog {
                     .map_err(io::Error::other)?,
                 gettid::gettid(),
                 object,
-            ),
+            )?,
             next: Cell::new(Some(0)),
             record_relation: runtime()
                 .relation(schema::log_record.__meta())
@@ -94,6 +100,16 @@ pub(crate) struct Record<'a> {
     pub thread: &'a EntityHandle,
     pub seq: u64,
     pub record_relation: usize,
+}
+
+/// Render a pre-start diagnostic in isolation, without claiming a delivery address.
+pub(crate) fn with_preview_record<T>(f: impl FnOnce(Record<'_>) -> io::Result<T>) -> io::Result<T> {
+    let log = ThreadLog::new()?;
+    f(Record {
+        thread: &log.handle,
+        seq: 0,
+        record_relation: log.record_relation,
+    })
 }
 
 /// All outputs on the thread share a sequence, but track accepted definitions

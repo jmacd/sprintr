@@ -11,7 +11,20 @@ use std::fmt::Write as _;
 /// ```
 pub fn definition_fragment(key: &str) -> String {
     let mut fragment = String::from("#/defs/");
-    for byte in key.bytes() {
+    push_pointer_token(&mut fragment, key);
+    fragment
+}
+
+/// Append one object key or array index to a JSON Pointer URI fragment, **without** a `/` separator.
+/// Escape the token as a JSON Pointer *before* escaping bytes for the URI.
+///
+/// ```
+/// let mut path = String::from("#/args/0/");
+/// sprintr_message::push_pointer_token(&mut path, "src/~#");
+/// assert_eq!(path, "#/args/0/src~1~0%23");
+/// ```
+pub fn push_pointer_token(fragment: &mut String, token: &str) {
+    for byte in token.bytes() {
         match byte {
             b'~' => fragment.push_str("~0"),
             b'/' => fragment.push_str("~1"),
@@ -21,7 +34,6 @@ pub fn definition_fragment(key: &str) -> String {
             _ => write!(fragment, "%{byte:02X}").expect("string formatting"),
         }
     }
-    fragment
 }
 
 fn unsigned_id(text: &str) -> Option<u64> {
@@ -35,10 +47,22 @@ pub(super) fn positive_id(text: &str) -> Option<u64> {
     unsigned_id(text).filter(|&id| id != 0)
 }
 
-/// Decode the URI fragment before interpreting JSON Pointer escapes. A ref
-/// must select one definition, never a member inside it.
-pub(super) fn parse(target: &str) -> Result<(Option<u64>, String), FormatError> {
-    let invalid = || FormatError(format!("invalid definition reference {target:?}"));
+pub(super) fn index(text: &str) -> Option<usize> {
+    usize::try_from(unsigned_id(text)?).ok()
+}
+
+pub(super) enum Target {
+    Definition {
+        sequence: Option<u64>,
+        key: String,
+    },
+    /// Decoded tokens *after* `/args/`, starting with the argument index.
+    Argument(Vec<String>),
+}
+
+/// Decode the URI fragment before splitting the pointer or unescaping tokens.
+pub(super) fn parse(target: &str) -> Result<Target, FormatError> {
+    let invalid = || FormatError(format!("invalid reference {target:?}"));
     let (record, fragment) = target.split_once('#').ok_or_else(invalid)?;
     let sequence = if record.is_empty() {
         None
@@ -64,19 +88,38 @@ pub(super) fn parse(target: &str) -> Result<(Option<u64>, String), FormatError> 
         }
     }
     let pointer = std::str::from_utf8(&pointer).map_err(|_| invalid())?;
-    let token = pointer.strip_prefix("/defs/").ok_or_else(invalid)?;
+    if let Some(token) = pointer.strip_prefix("/defs/").filter(|p| !p.contains('/')) {
+        return Ok(Target::Definition {
+            sequence,
+            key: unescape(token).ok_or_else(invalid)?,
+        });
+    }
+    if sequence.is_none()
+        && let Some(path) = pointer.strip_prefix("/args/")
+    {
+        let tokens: Vec<_> = path
+            .split('/')
+            .map(unescape)
+            .collect::<Option<_>>()
+            .ok_or_else(invalid)?;
+        index(&tokens[0]).ok_or_else(invalid)?;
+        return Ok(Target::Argument(tokens));
+    }
+    Err(invalid())
+}
+
+fn unescape(token: &str) -> Option<String> {
     let mut key = String::with_capacity(token.len());
     let mut chars = token.chars();
     while let Some(ch) = chars.next() {
         key.push(match ch {
-            '/' => return Err(invalid()),
             '~' => match chars.next() {
                 Some('0') => '~',
                 Some('1') => '/',
-                _ => return Err(invalid()),
+                _ => return None,
             },
             ch => ch,
         });
     }
-    Ok((sequence, key))
+    Some(key)
 }

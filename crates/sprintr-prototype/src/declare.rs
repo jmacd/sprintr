@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::__private::{BorrowedArgument, Unsigned, unsigned};
-use crate::{RelationDefinition, RelationKind, RelationType};
+use crate::{EntityHandle, RelationDefinition, RelationKind, RelationType};
+use std::io;
 use std::marker::PhantomData;
 
 /// Metadata shared by attribute and entity relation declarations.
@@ -10,9 +11,15 @@ use std::marker::PhantomData;
 pub struct RelationMeta {
     pub(crate) name: &'static str,
     kind: RelationKind,
-    value_type: RelationType,
+    value_type: DeclaredType,
     anonymous: bool,
     pub(crate) description: &'static str,
+}
+
+#[derive(Debug)]
+enum DeclaredType {
+    Literal(RelationType),
+    Entity(&'static RelationMeta),
 }
 
 impl RelationMeta {
@@ -27,16 +34,37 @@ impl RelationMeta {
         Self {
             name,
             kind,
-            value_type,
+            value_type: DeclaredType::Literal(value_type),
             anonymous,
             description,
         }
     }
 
-    pub(crate) fn definition(&self) -> RelationDefinition {
+    #[doc(hidden)]
+    pub const fn __entity_attribute(
+        name: &'static str,
+        desc: &'static str,
+        target: &'static Entity<true>,
+    ) -> Self {
+        Self {
+            name,
+            kind: RelationKind::Attribute,
+            value_type: DeclaredType::Entity(target.__meta()),
+            anonymous: false,
+            description: desc,
+        }
+    }
+
+    pub(crate) fn definition(
+        &self,
+        recorded_name: impl FnOnce(&'static RelationMeta) -> String,
+    ) -> RelationDefinition {
         RelationDefinition {
             kind: self.kind,
-            value_type: self.value_type,
+            value_type: match &self.value_type {
+                DeclaredType::Literal(ty) => ty.clone(),
+                DeclaredType::Entity(target) => RelationType::Entity(recorded_name(target)),
+            },
             desc: self.description.into(),
             anonymous: self.anonymous,
         }
@@ -52,7 +80,7 @@ impl RelationMeta {
 
 /// A typed attribute declared with [`crate::attributes!`].
 ///
-/// Positional arguments support `str` and `u64`; `[u64]` describes stack metadata.
+/// Positional arguments support `str`, `u64`, and `entity(relation)`; `[u64]` describes stack metadata.
 pub struct Attribute<T: ?Sized> {
     meta: RelationMeta,
     label: &'static [u8],
@@ -117,6 +145,33 @@ impl Attribute<u64> {
     #[doc(hidden)]
     pub fn __hex_value<V: Unsigned + ?Sized>(&self, value: &V) -> BorrowedArgument<'static> {
         self.__value(value)
+    }
+}
+
+impl Attribute<EntityHandle> {
+    #[doc(hidden)]
+    pub fn __value<'a>(&'static self, handle: &'a EntityHandle) -> BorrowedArgument<'a> {
+        BorrowedArgument::EntityArgument(self, handle)
+    }
+
+    pub(crate) fn check<'a>(&self, handle: &'a EntityHandle) -> io::Result<&'a EntityHandle> {
+        let DeclaredType::Entity(target) = self.meta.value_type else {
+            return Err(io::Error::other("expected an entity-valued attribute"));
+        };
+        let runtime = crate::runtime::runtime();
+        let expected = runtime.relation(target).map_err(io::Error::other)?;
+        if expected != handle.relation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "attribute {:?} expects an entity of {:?}, got {:?}",
+                    self.name(),
+                    runtime.definitions[expected].name,
+                    handle.key
+                ),
+            ));
+        }
+        Ok(handle)
     }
 }
 

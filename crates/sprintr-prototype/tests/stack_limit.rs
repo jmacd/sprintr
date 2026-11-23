@@ -3,20 +3,20 @@
 // An isolated test binary: the capture limit is process-wide.
 mod common;
 
-use sprintr_prototype::{Logger, Renderer, info, set_stack_limit};
+use sprintr_prototype::{Renderer, info, set_stack_limit};
 
 #[test]
 fn static_invocation_survives_disabling_caller_capture() {
     #[inline(never)]
-    fn emit(logger: &mut Logger<Vec<u8>>) -> u32 {
+    fn emit() -> u32 {
         let line = line!() + 1;
-        info!("one callsite", logger: logger).unwrap();
+        info!("one callsite");
         line
     }
 
     set_stack_limit(0).unwrap();
-    let mut logger = Logger::new(Vec::new());
-    let line = emit(&mut logger);
+    let mut logger = common::started_logger();
+    let line = logger.with_default(emit);
     let callers = if sprintr_prototype::DEFAULT_STACK_DEPTH == 0 {
         assert_eq!(
             set_stack_limit(1).unwrap_err().kind(),
@@ -27,7 +27,7 @@ fn static_invocation_survives_disabling_caller_capture() {
         set_stack_limit(1).unwrap();
         1
     };
-    emit(&mut logger);
+    logger.with_default(emit);
     let records = common::lines(&logger.into_inner());
     let mut reader = Renderer::default();
     for record in &records {

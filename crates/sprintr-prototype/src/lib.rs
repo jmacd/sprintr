@@ -17,6 +17,7 @@ pub mod schema;
 mod stack;
 mod statement;
 mod stream;
+mod structured;
 pub mod symbols;
 
 use buffer::{HeapBuffer, RecordBuffer};
@@ -26,23 +27,35 @@ use statement::Statement;
 use stream::StreamState;
 
 pub use declare::{Attribute, Entity, Named};
+pub use entity::BorrowedArgument as Value;
 pub use entity::EntityHandle;
 pub use sprintr_message::{
-    Argument, ArgumentBinding, Definition, Message, RECORD, RELATION, RELATION_PREFIX,
-    RelationDefinition, RelationKind, RelationType, Renderer, SOURCE, STACK, STATEMENT,
-    STATEMENT_PREFIX, StatementSource, StatementTemplate, THREAD, format, format::FormatError,
+    Argument, ArgumentBinding, Definition, EncodeDefinition, Message, RECORD, RELATION,
+    RELATION_PREFIX, RelationDefinition, RelationKind, RelationType, Renderer, SOURCE, STACK,
+    STATEMENT, STATEMENT_PREFIX, STRUCT_ENCODE, StatementSource, StatementTemplate, THREAD, format,
+    format::FormatError,
 };
+pub use structured::{StructuredValue, ValueWriter};
 
 pub use stack::{DEFAULT_STACK_DEPTH, MAX_STACK_DEPTH, set_stack_limit};
 
 #[doc(hidden)]
 pub use sprintr_prototype_macros::{
     attributes as __attributes, entities as __entities, record as __record,
+    structured as __structured,
 };
+
+/// Describe how a [`StructuredValue`] formats itself. Call `.encode(out)` on
+/// the result inside the trait implementation. Log the value directly with `{}`.
+#[macro_export]
+macro_rules! structured {
+    ($($input:tt)*) => { $crate::__structured!($crate; []; $($input)*) };
+}
 
 /// Declare attributes. Each doc comment becomes the recorded description.
 ///
-/// Values are `str` or `u64`. Handles may be lowercase so that logging calls
+/// Values are `str`, `u64`, or `entity(relation)` for an entity-valued argument.
+/// Handles may be lowercase so that logging calls
 /// read like assignments: `info!("{}", account_name = name)`.
 ///
 /// ```
@@ -53,7 +66,8 @@ pub use sprintr_prototype_macros::{
 ///     pub retry_count: u64 = "retry.count";
 /// }
 ///
-/// sprintr_prototype::info!("{} try {}", account_name = "Ada", retry_count = 2u8)?;
+/// sprintr_prototype::start()?;
+/// sprintr_prototype::info!("{} try {}", account_name = "Ada", retry_count = 2u8);
 /// # Ok::<(), std::io::Error>(())
 /// ```
 ///
@@ -119,21 +133,17 @@ macro_rules! entities {
     ($($input:tt)*) => { $crate::__entities!($crate; $($input)*); };
 }
 
-/// Record an INFO event as one JSON line, returning any output error.
+/// Record an INFO event. Instrumentation returns `()`; the SDK diagnoses failures.
 ///
-/// Defaults to stdout. Pass `logger: expression` immediately after the format
-/// to select a caller-owned [`Logger`].
+/// After [`start`], the default output is stdout. [`Logger::with_default`]
+/// installs a different output for a synchronous scope on this thread.
 ///
 /// ```rust
-/// use sprintr_prototype::{Logger, info, replay};
-/// let mut logger = Logger::new(Vec::new());
+/// use sprintr_prototype::{info, start};
+/// start()?;
 /// let name = String::from("Ada");
 /// let value = 42u32;
-/// info!("hello {name:s}, value {value:04x}", logger: logger)?;
-/// let mut text = Vec::new();
-/// replay(logger.into_inner().as_slice(), &mut text)?;
-/// let text = String::from_utf8(text).unwrap();
-/// assert!(text.ends_with("hello Ada, value 002a\nlog.level = INFO\n"));
+/// info!("hello {name:s}, value {value:04x}");
 /// # Ok::<(), std::io::Error>(())
 /// ```
 ///
@@ -148,7 +158,7 @@ macro_rules! entities {
 /// zero padding, and a constant width up to 4096. `{{` and `}}` are literals.
 /// A positional `attribute = value` argument associates the placeholder with a
 /// declared attribute, whose type also permits `{}`. Named/numbered argument
-/// overrides, debug formatting, and other specifiers are not supported.
+/// overrides and other specifiers are not supported. `:?` captures Debug text.
 /// Positional expression labels containing braces or colons must instead be
 /// bound to local variables.
 ///
@@ -229,32 +239,32 @@ macro_rules! entities {
 /// Scenario: the source requests a format outside the prototype subset.
 /// Guarantees: unsupported formats fail instead of degrading to text.
 /// ```compile_fail
-/// sprintr_prototype::info!("{:?}", "Ada");
+/// sprintr_prototype::info!("{:b}", 42u32);
 /// ```
 #[macro_export]
 macro_rules! info {
     ($($input:tt)*) => {
-        $crate::__record!($crate; [$crate::schema::log_level::INFO]; $($input)*)
+        $crate::__private::report($crate::__record!($crate; [$crate::schema::log_level::INFO]; $($input)*))
     };
 }
 
 /// Write a message whose statement has the static named level `log.level:WARN`.
 ///
-/// Accepts the same format, arguments, and optional `logger:` as [`info!`].
+/// Accepts the same format and arguments as [`info!`].
 #[macro_export]
 macro_rules! warn {
     ($($input:tt)*) => {
-        $crate::__record!($crate; [$crate::schema::log_level::WARN]; $($input)*)
+        $crate::__private::report($crate::__record!($crate; [$crate::schema::log_level::WARN]; $($input)*))
     };
 }
 
 /// Write a message whose statement has the static named level `log.level:ERROR`.
 ///
-/// Accepts the same format, arguments, and optional `logger:` as [`info!`].
+/// Accepts the same format and arguments as [`info!`].
 #[macro_export]
 macro_rules! error {
     ($($input:tt)*) => {
-        $crate::__record!($crate; [$crate::schema::log_level::ERROR]; $($input)*)
+        $crate::__private::report($crate::__record!($crate; [$crate::schema::log_level::ERROR]; $($input)*))
     };
 }
 
@@ -282,35 +292,51 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
         }
     }
 
-    /// Encode trusted compiler-generated metadata and typed arguments.
-    #[doc(hidden)]
-    pub fn __write_compiled(
+    /// Run `f` with this logger as the current thread's default. Nested scopes
+    /// restore their predecessor, including during unwinding. The scope does
+    /// not start the logger, propagate to spawned threads, or follow async tasks.
+    pub fn with_default<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        let logger = std::cell::RefCell::new(self);
+        CURRENT.set(
+            &|statement, stack, args| {
+                logger
+                    .try_borrow_mut()
+                    .map_err(|_| io::Error::other("scoped logger is already in use"))?
+                    .write_compiled(statement, stack, args)
+            },
+            f,
+        )
+    }
+
+    fn write_compiled(
         &mut self,
         statement: &'static Statement,
         stack: io::Result<&[u64]>,
         arguments: &[BorrowedArgument<'_>],
     ) -> io::Result<()> {
-        let stack = stack?;
-        self.start()?;
+        if self.state.startup.is_none() {
+            return unstarted(statement, arguments);
+        }
         self.state.write_compiled(
             &mut self.writer,
             &mut self.buffer,
             statement.resolve()?,
-            stack,
+            stack?,
             arguments,
         )
     }
 
-    /// Announce the stream before its first record.
-    fn start(&mut self) -> io::Result<()> {
-        if self.state.started {
-            return Ok(());
+    /// Attempt startup once. Repeated calls return the original outcome.
+    /// After a partial announcement, subsequent events continue best-effort.
+    pub fn start(&mut self) -> io::Result<()> {
+        if let Some(result) = &self.state.startup {
+            return startup_result(result);
         }
-        // Set first: the announcement is written through this logger.
-        self.state.started = true;
-        let result = announce(self);
-        if result.is_err() {
-            self.state.started = false;
+        // The announcement uses this output's normal encoder and definition table.
+        self.state.startup = Some(Ok(()));
+        let result = self.with_default(announce);
+        if let Err(error) = &result {
+            self.state.startup = Some(Err(io::Error::new(error.kind(), error.to_string())));
         }
         result
     }
@@ -326,10 +352,57 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
     }
 }
 
-fn announce<W: Write, B: RecordBuffer>(logger: &mut Logger<W, B>) -> io::Result<()> {
-    info!(
+/// Start the process-wide stdout output. Logging before this call prints the
+/// event and an unstarted-SDK warning to stderr. Logging never initiates startup.
+pub fn start() -> io::Result<()> {
+    __private::start_stdout()
+}
+
+fn startup_result(result: &io::Result<()>) -> io::Result<()> {
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+}
+
+fn unstarted(statement: &'static Statement, args: &[BorrowedArgument<'_>]) -> io::Result<()> {
+    use std::cell::RefCell;
+    thread_local! { static FALLBACK: RefCell<()> = const { RefCell::new(()) }; }
+    FALLBACK
+        .try_with(|guard| {
+            let _guard = guard
+                .try_borrow_mut()
+                .map_err(|_| io::Error::other("recursive pre-start logging"))?;
+            // Use the ordinary encoder and reader so that Debug and structured
+            // formatters run exactly once and use the same presentation as replay.
+            let mut bytes = Vec::new();
+            entity::with_preview_record(|record| {
+                StreamState::default().write_record(
+                    &mut bytes,
+                    &mut HeapBuffer::default(),
+                    statement.resolve()?,
+                    &[],
+                    args,
+                    record,
+                )
+            })?;
+            let event: Message = serde_json::from_slice(&bytes).map_err(json_error)?;
+            let text = event.render().map_err(io::Error::other)?;
+            writeln!(
+                io::stderr().lock(),
+                "sprintr: SDK has not been started; {text}"
+            )
+        })
+        .map_err(|_| io::Error::other("pre-start logging unavailable"))?
+}
+
+type Dispatch<'scope> = dyn Fn(&'static Statement, io::Result<&[u64]>, &[BorrowedArgument<'_>]) -> io::Result<()>
+    + 'scope;
+scoped_tls_hkt::scoped_thread_local!(static CURRENT: for<'a> &'a Dispatch<'a>);
+
+fn announce() -> io::Result<()> {
+    crate::__record!(crate; [crate::schema::log_level::INFO];
         "process {} started logging with {} {}",
-        logger: logger,
         schema::process_pid = std::process::id(),
         schema::telemetry_sdk_name = "sprintr",
         schema::telemetry_sdk_version = env!("CARGO_PKG_VERSION"),
@@ -341,12 +414,29 @@ fn announce<W: Write, B: RecordBuffer>(logger: &mut Logger<W, B>) -> io::Result<
             description,
             recorded,
         } = collision;
-        warn!(
+        crate::__record!(crate; [crate::schema::log_level::WARN];
             "{kind:s} {declared:s} ({description:s}) collides with an earlier declaration; recorded as {recorded:s}",
-            logger: logger,
         )?;
     }
     Ok(())
+}
+
+/// Last path component outside generic parameters or a qualified trait receiver.
+fn rust_leaf_name(name: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, b) in name.bytes().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' if !name[..i].ends_with('-') => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && name[i..].starts_with("::") && !name[i..].starts_with("::<") => {
+                start = i + 2
+            }
+            _ => {}
+        }
+    }
+    let leaf = name[start..].split('<').next()?.trim_end_matches("::");
+    (!leaf.is_empty()).then_some(leaf)
 }
 
 fn json_error(error: serde_json::Error) -> io::Error {
@@ -393,16 +483,18 @@ pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
 
 #[doc(hidden)]
 pub mod __private {
-    use super::{HeapBuffer, Logger, StreamState, announce};
+    use super::{HeapBuffer, Logger, StreamState, startup_result, unstarted};
     pub use crate::declare::{Declaration, RelationMeta};
     pub use crate::entity::BorrowedArgument;
     pub use crate::stack::capture_stack;
-    pub use crate::statement::{Statement, concatenate, encoded_len, json_string, json_string_len};
+    pub use crate::statement::{
+        NestedTemplate, Statement, concatenate, encoded_len, json_string, json_string_len,
+    };
+    pub use crate::structured::{ScalarArgument, StructuredArgument, formatted_value};
     pub use linkme;
     use std::cell::RefCell;
-    use std::io;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::io::{self, Write};
+    use std::sync::OnceLock;
 
     /// Every declaration in the program, collected at link time.
     #[linkme::distributed_slice]
@@ -418,8 +510,18 @@ pub mod __private {
         static STDOUT_STATE: RefCell<StdoutState> = RefCell::new(StdoutState::default());
     }
 
-    static STDOUT_STARTED: AtomicBool = AtomicBool::new(false);
-    static STDOUT_START: Mutex<()> = Mutex::new(());
+    static STDOUT_START: OnceLock<io::Result<()>> = OnceLock::new();
+
+    #[inline]
+    pub fn report(result: io::Result<()>) {
+        if let Err(error) = result {
+            // stderr itself may be unavailable; instrumentation must still return.
+            let _ = writeln!(
+                io::stderr().lock(),
+                "sprintr: could not record event: {error}"
+            );
+        }
+    }
 
     mod sealed {
         pub trait Sealed {}
@@ -455,41 +557,40 @@ pub mod __private {
     }
 
     /// Announce stdout once per process, before any thread's first record.
-    fn start_stdout(state: &mut StdoutState) -> io::Result<()> {
-        let _guard = STDOUT_START
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if STDOUT_STARTED.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let mut logger = Logger {
-            writer: io::stdout(),
-            buffer: std::mem::take(&mut state.buffer),
-            state: std::mem::take(&mut state.definitions),
-        };
-        logger.state.started = true;
-        let result = announce(&mut logger);
-        state.buffer = logger.buffer;
-        state.definitions = logger.state;
-        result?;
-        STDOUT_STARTED.store(true, Ordering::Release);
-        Ok(())
+    pub(super) fn start_stdout() -> io::Result<()> {
+        startup_result(STDOUT_START.get_or_init(|| {
+            STDOUT_STATE
+                .try_with(|state| {
+                    let mut state = state.try_borrow_mut().map_err(|_| {
+                        io::Error::other("stdout encoding buffer is already in use")
+                    })?;
+                    let mut logger = Logger::new(io::stdout());
+                    let result = logger.start();
+                    state.buffer = logger.buffer;
+                    state.definitions = logger.state;
+                    result
+                })
+                .map_err(|_| io::Error::other("stdout encoding buffer is unavailable"))?
+        }))
     }
 
-    pub fn write_stdout(
+    pub fn write_event(
         statement: &'static Statement,
         stack: io::Result<&[u64]>,
         arguments: &[BorrowedArgument<'_>],
     ) -> io::Result<()> {
+        if super::CURRENT.is_set() {
+            return super::CURRENT.with(|dispatch| dispatch(statement, stack, arguments));
+        }
+        if STDOUT_START.get().is_none() {
+            return unstarted(statement, arguments);
+        }
         let stack = stack?;
         STDOUT_STATE
             .try_with(|state| {
                 let mut state = state
                     .try_borrow_mut()
                     .map_err(|_| io::Error::other("stdout encoding buffer is already in use"))?;
-                if !STDOUT_STARTED.load(Ordering::Acquire) {
-                    start_stdout(&mut state)?;
-                }
                 let resolved = statement.resolve()?;
                 let StdoutState {
                     buffer,

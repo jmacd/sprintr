@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{lines, records, replayed, standalone, template};
+use common::{FailNth, lines, records, replayed, standalone, started_logger, template};
 use sprintr_prototype::buffer::{RecordBuffer, StackBuffer};
 use sprintr_prototype::{
     Definition, Logger, Message, RECORD, Renderer, THREAD, attributes, info, replay,
@@ -16,18 +16,18 @@ attributes! {
     retry_count: u64 = "retry.count";
 }
 
-fn log_name<W: Write, B: RecordBuffer>(logger: &mut Logger<W, B>, name: &str) -> io::Result<()> {
+fn log_name<W: Write, B: RecordBuffer>(logger: &mut Logger<W, B>, name: &str) {
     let value = 42u32;
-    info!("hello {}, value {value:04x}", logger: logger, account_name = name)
+    logger.with_default(|| info!("hello {}, value {value:04x}", account_name = name))
 }
 
 /// Scenario: one callsite logs different values, including into an independent stream.
 /// Guarantees: definitions accompany first use only; later events carry only IDs and arguments.
 #[test]
 fn first_record_bootstraps_statement_and_later_records_reuse_it() {
-    let mut logger = Logger::new(Vec::new());
+    let mut logger = started_logger();
     for name in ["Ada", "Grace"] {
-        log_name(&mut logger, name).unwrap();
+        log_name(&mut logger, name);
     }
     let encoded = logger.into_inner();
     let startup = &lines(&encoded)[0];
@@ -72,8 +72,8 @@ fn first_record_bootstraps_statement_and_later_records_reuse_it() {
          hello Grace, value 002a\nlog.level = INFO, account.name = Grace\n"
     );
 
-    let mut another = Logger::new(Vec::new());
-    log_name(&mut another, "Ada").unwrap();
+    let mut another = started_logger();
+    log_name(&mut another, "Ada");
     let another = common::records(&another.into_inner()).remove(0);
     assert_eq!(another.defs, first.defs);
     assert_eq!(another.args, first.args);
@@ -90,10 +90,10 @@ fn static_aliases_and_multiple_positions() {
         again: str = "account.name";
     }
     use crate::account_name as local_alias;
-    let mut logger = Logger::new(Vec::new());
+    let mut logger = started_logger();
     let before = 7u32;
-    info!("{before:x} {} {}", logger: logger, local_alias = "Ada", again = "Grace").unwrap();
-    info!("{}", logger: logger, again = "Ada").unwrap();
+    logger.with_default(|| info!("{before:x} {} {}", local_alias = "Ada", again = "Grace"));
+    logger.with_default(|| info!("{}", again = "Ada"));
     let encoded = logger.into_inner();
     let text = String::from_utf8(encoded.clone()).unwrap();
     assert_eq!(text.matches("\"log.relation:account.name\"").count(), 1);
@@ -122,8 +122,8 @@ fn static_aliases_and_multiple_positions() {
 /// Guarantees: untyped placeholders follow the declared type; associations show decimal values.
 #[test]
 fn unsigned_attributes_render_decimal_and_hex() {
-    let mut logger = Logger::new(Vec::new());
-    info!("try {} ({:#x})", logger: logger, retry_count = 10u8, retry_count = 255u64).unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!("try {} ({:#x})", retry_count = 10u8, retry_count = 255u64));
     let encoded = logger.into_inner();
     assert_eq!(
         serde_json::to_value(&records(&encoded)[0].defs["log.relation:retry.count"]).unwrap(),
@@ -144,11 +144,9 @@ fn unsigned_attributes_render_decimal_and_hex() {
 #[test]
 fn overflow_does_not_consume_first_definition() {
     let mut logger = Logger::with_buffer(Vec::new(), StackBuffer::<2048>::new());
-    assert_eq!(
-        log_name(&mut logger, &"x".repeat(2048)).unwrap_err().kind(),
-        io::ErrorKind::StorageFull
-    );
-    log_name(&mut logger, "Ada").unwrap();
+    logger.start().unwrap();
+    log_name(&mut logger, &"x".repeat(2048));
+    log_name(&mut logger, "Ada");
     let encoded = logger.into_inner();
     assert_eq!(records(&encoded)[0].defs.len(), 2);
     assert_eq!(
@@ -157,54 +155,46 @@ fn overflow_does_not_consume_first_definition() {
     );
 }
 
-/// Fails only the given write; each record is written with one call.
-struct FailNth {
-    fail: usize,
-    writes: usize,
-    output: Vec<u8>,
-}
-
-impl Write for FailNth {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.writes += 1;
-        if self.writes - 1 == self.fail {
-            return Err(io::ErrorKind::BrokenPipe.into());
-        }
-        self.output.write(bytes)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Scenario: the sink rejects the startup announcement or the first occurrence, then accepts a retry.
-/// Guarantees: output failure cannot suppress the announcement or definitions needed by the first accepted event.
+/// The first accepted occurrence still carries its definitions after a rejected write.
 #[test]
 fn failed_output_does_not_consume_first_definition() {
-    for fail in [0, 1] {
-        let mut logger = Logger::new(FailNth {
-            fail,
-            writes: 0,
-            output: Vec::new(),
-        });
-        assert_eq!(
-            log_name(&mut logger, "Ada").unwrap_err().kind(),
-            io::ErrorKind::BrokenPipe
-        );
-        log_name(&mut logger, "Ada").unwrap();
-        assert_eq!(
-            replayed(&logger.into_inner().output),
-            "hello Ada, value 002a\nlog.level = INFO, account.name = Ada\n"
-        );
-    }
+    let mut logger = Logger::new(FailNth::new(2));
+    logger.start().unwrap();
+    log_name(&mut logger, "rejected");
+    log_name(&mut logger, "Ada");
+    let sink = logger.into_inner();
+    assert_eq!(sink.writes, 3);
+    assert_eq!(
+        replayed(&sink.output),
+        "hello Ada, value 002a\nlog.level = INFO, account.name = Ada\n"
+    );
+}
+
+/// If even the startup record failed, the first accepted event must replay on its own.
+#[test]
+fn rejected_announcement_does_not_consume_first_definition() {
+    let mut logger = Logger::new(FailNth::new(1));
+    assert_eq!(
+        logger.start().unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    log_name(&mut logger, "Ada");
+    let sink = logger.into_inner();
+    assert_eq!(sink.writes, 2);
+    let events = lines(&sink.output);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        common::body(&events[0].render().unwrap()),
+        "hello Ada, value 002a\nlog.level = INFO, account.name = Ada"
+    );
 }
 
 /// Scenario: wire input contains malformed parameters, unknown relations, or invalid statement shapes.
 /// Guarantees: parameters are explicit, bounded, and typed; pointers are not silently reinterpreted.
 #[test]
 fn playback_rejects_bad_templates() {
-    let mut logger = Logger::new(Vec::new());
-    info!("{}", logger: logger, account_name = "Ada").unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!("{}", account_name = "Ada"));
     let events = lines(&logger.into_inner());
     let first = serde_json::to_string(&events[0]).unwrap();
     let valid = &events[1];
@@ -256,8 +246,8 @@ fn playback_rejects_bad_templates() {
 /// Guarantees: failed records do not install definitions or corrupt previously compiled templates.
 #[test]
 fn renderer_updates_are_transactional() {
-    let mut logger = Logger::new(Vec::new());
-    info!("{}", logger: logger, account_name = "Ada").unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!("{}", account_name = "Ada"));
     let valid = standalone(&logger.into_inner());
     let mut subsequent = valid.clone();
     subsequent.defs.clear();
@@ -306,12 +296,16 @@ fn escaped_names_and_temporary_values_roundtrip() {
         escaped: str = "tests.name/~\"\\\n";
     }
     let mut calls = 0;
-    let mut logger = Logger::new(Vec::new());
-    info!("{}", logger: logger, escaped = {
-        calls += 1;
-        String::from("Ada\t\"name\"")
-    })
-    .unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| {
+        info!(
+            "{}",
+            escaped = {
+                calls += 1;
+                String::from("Ada\t\"name\"")
+            }
+        )
+    });
     assert_eq!(calls, 1);
     let record = standalone(&logger.into_inner());
     assert_eq!(template(&record).msg, format!("{{@{}}}", escaped.name()));
@@ -335,8 +329,8 @@ fn escaped_names_and_temporary_values_roundtrip() {
 #[test]
 fn concurrent_first_use_has_one_identity() {
     fn record() -> Message {
-        let mut logger = Logger::new(Vec::new());
-        info!("{}", logger: logger, account_name = "Ada").unwrap();
+        let mut logger = started_logger();
+        logger.with_default(|| info!("{}", account_name = "Ada"));
         standalone(&logger.into_inner())
     }
     let threads: Vec<_> = (0..4).map(|_| std::thread::spawn(record)).collect();

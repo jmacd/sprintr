@@ -3,7 +3,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{ToTokens, format_ident, quote};
-use sprintr_message::format::{Part, Spec, parse};
+use sprintr_message::format::{Part, Spec, parse_capture};
 use sprintr_message::validate_relation_name;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
@@ -16,7 +16,6 @@ struct Input {
     root: Path,
     values: Vec<Path>,
     format: LitStr,
-    logger: Option<Expr>,
     arguments: Vec<Expr>,
 }
 
@@ -31,35 +30,18 @@ impl Parse for Input {
             .collect();
         input.parse::<Token![;]>()?;
         let format = input.parse()?;
-        let mut logger = None;
         let mut arguments = Vec::new();
         while !input.is_empty() {
             input.parse::<Token![,]>()?;
             if input.is_empty() {
                 break;
             }
-            let fork = input.fork();
-            if fork.parse::<Ident>().is_ok_and(|ident| ident == "logger")
-                && fork.peek(Token![:])
-                && !fork.peek(Token![::])
-            {
-                if logger.is_some() || !arguments.is_empty() {
-                    return Err(
-                        input.error("logger: must appear once, immediately after the format")
-                    );
-                }
-                input.parse::<Ident>()?;
-                input.parse::<Token![:]>()?;
-                logger = Some(input.parse()?);
-            } else {
-                arguments.push(input.parse()?);
-            }
+            arguments.push(input.parse()?);
         }
         Ok(Self {
             root,
             values,
             format,
-            logger,
             arguments,
         })
     }
@@ -144,8 +126,13 @@ struct AttributeItem {
     attrs: Vec<syn::Attribute>,
     vis: Visibility,
     ident: Ident,
-    ty: Type,
+    ty: AttributeType,
     name: LitStr,
+}
+
+enum AttributeType {
+    Value(Type),
+    Entity(Path),
 }
 
 struct Declarations<T> {
@@ -171,7 +158,21 @@ impl Parse for AttributeItem {
         let vis = input.parse()?;
         let ident = input.parse()?;
         input.parse::<Token![:]>()?;
-        let ty = input.parse()?;
+        let fork = input.fork();
+        let ty = if fork.parse::<Ident>().is_ok_and(|ident| ident == "entity")
+            && fork.peek(syn::token::Paren)
+        {
+            input.parse::<Ident>()?;
+            let target;
+            syn::parenthesized!(target in input);
+            let path = target.parse()?;
+            if !target.is_empty() {
+                return Err(target.error("expected a single entity relation path"));
+            }
+            AttributeType::Entity(path)
+        } else {
+            AttributeType::Value(input.parse()?)
+        };
         input.parse::<Token![=]>()?;
         let name = input.parse()?;
         input.parse::<Token![;]>()?;
@@ -217,15 +218,29 @@ fn attribute(root: &Path, item: AttributeItem) -> syn::Result<Tokens> {
         ));
     }
     let value = relation_name(&name)?;
-    let value_type = match ty.to_token_stream().to_string().as_str() {
-        "str" => quote!(#root::RelationType::String),
-        "u64" => quote!(#root::RelationType::U64),
-        "[u64]" => quote!(#root::RelationType::U64Array),
-        _ => {
-            return Err(syn::Error::new_spanned(
-                ty,
-                "attribute types are `str`, `u64`, or `[u64]`",
-            ));
+    let (ty, meta) = match ty {
+        AttributeType::Entity(target) => (
+            quote!(#root::EntityHandle),
+            quote!(#root::__private::RelationMeta::__entity_attribute(#name, #description, &#target)),
+        ),
+        AttributeType::Value(ty) => {
+            let value_type = match ty.to_token_stream().to_string().as_str() {
+                "str" => quote!(#root::RelationType::String),
+                "u64" => quote!(#root::RelationType::U64),
+                "[u64]" => quote!(#root::RelationType::U64Array),
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        ty,
+                        "attribute types are `str`, `u64`, `[u64]`, or `entity(relation)`",
+                    ));
+                }
+            };
+            (
+                quote!(#ty),
+                quote!(#root::__private::RelationMeta::__new(
+                    #name, #root::RelationKind::Attribute, #value_type, false, #description,
+                )),
+            )
         }
     };
     let label = json_content(&format!("@{value}"), name.span());
@@ -238,13 +253,7 @@ fn attribute(root: &Path, item: AttributeItem) -> syn::Result<Tokens> {
         #(#docs)*
         #[allow(non_upper_case_globals)]
         #vis static #ident: #root::Attribute<#ty> = #root::Attribute::__new(
-            #root::__private::RelationMeta::__new(
-                #name,
-                #root::RelationKind::Attribute,
-                #value_type,
-                false,
-                #description,
-            ),
+            #meta,
             #label,
             #reference,
         );
@@ -413,11 +422,11 @@ struct Compiled {
     arguments: Vec<Tokens>,
 }
 
-fn compile(input: &Input) -> syn::Result<Compiled> {
+fn compile(input: &Input, nested: bool) -> syn::Result<Compiled> {
     let root = &input.root;
     let span = input.format.span();
     let error = |message: &str| syn::Error::new(span, message);
-    let parts = parse(&input.format.value()).map_err(|err| error(&err.to_string()))?;
+    let parts = parse_capture(&input.format.value()).map_err(|err| error(&err.to_string()))?;
     let mut positional = input.arguments.iter();
     let mut arguments = Vec::new();
     let mut attributes = Vec::new();
@@ -465,13 +474,21 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
                     format!(":{}", field.format)
                 };
                 if let Some(attribute) = attribute {
-                    if !attributes.is_empty() {
-                        references.push(quote!(b","));
+                    if field.format == "?" {
+                        return Err(error("use :s or :x for a typed attribute, not Debug text"));
                     }
-                    let index = bytes(&format!("{}}}}}", arguments.len()), span);
-                    references.push(quote!((#attribute).__reference()));
-                    references.push(quote!(#index));
-                    attributes.push(quote!((#attribute).__meta()));
+                    let position = arguments.len();
+                    if nested {
+                        attributes.push(quote!((#position, (#attribute).__meta())));
+                    } else {
+                        if !attributes.is_empty() {
+                            references.push(quote!(b","));
+                        }
+                        let index = bytes(&format!("{position}}}}}"), span);
+                        references.push(quote!((#attribute).__reference()));
+                        references.push(quote!(#index));
+                        attributes.push(quote!((#attribute).__meta()));
+                    }
                     let suffix = bytes(&format!("{suffix}}}"), span);
                     message.push(quote!(b"{"));
                     message.push(quote!((#attribute).__label()));
@@ -489,8 +506,17 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
                     message.push(quote!(#label));
                     arguments.push(match (field.spec, field.format.is_empty()) {
                         (Spec::String, true) => {
-                            quote!(#root::__private::BorrowedArgument::Entity(&(#expression)))
+                            let scalars =
+                                nested.then(|| quote!(use #root::__private::ScalarArgument as _;));
+                            quote!({
+                                use #root::__private::StructuredArgument as _;
+                                #scalars
+                                (#expression).__sprintr_argument()
+                            })
                         }
+                        (Spec::String, false) if field.format == "?" => quote!(
+                            #root::__private::BorrowedArgument::Debug(&(#expression))
+                        ),
                         (Spec::String, false) => quote!(#root::__private::BorrowedArgument::String(
                             ::core::convert::AsRef::<str>::as_ref(&(#expression))
                         )),
@@ -515,24 +541,35 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
         fragments.push(quote!((#value).__fragment()));
     }
     let values = &input.values;
-    let declaration = quote! {
-        const __MODULE: &str = ::core::module_path!();
-        const __FILE: &str = ::core::file!();
-        const __PARTS: &[&[u8]] = &[
-            b"{\"attrs\":{", #(#fragments,)* b"},\"refs\":[", #(#references,)*
-            b"],\"msg\":\"", #(#message,)* b"\",\"source\":{\"mod\":",
-            &#root::__private::json_string::<{#root::__private::json_string_len(__MODULE)}>(__MODULE),
-            b",\"file\":",
-            &#root::__private::json_string::<{#root::__private::json_string_len(__FILE)}>(__FILE),
-            ::core::concat!(",\"line\":", ::core::line!(), ",\"column\":", ::core::column!(), "}}").as_bytes(),
-        ];
-        static __ENCODED: [u8; #root::__private::encoded_len(__PARTS)] =
-            #root::__private::concatenate(__PARTS);
-        static __STATEMENT: #root::__private::Statement = #root::__private::Statement::new(
-            &__ENCODED,
-            &[#(#attributes),*],
-            &[#(&#values),*],
-        );
+    let declaration = if nested {
+        quote! {
+            const __PARTS: &[&[u8]] = &[b"\"", #(#message,)* b"\""];
+            static __ENCODED: [u8; #root::__private::encoded_len(__PARTS)] =
+                #root::__private::concatenate(__PARTS);
+            static __FORMAT: #root::__private::NestedTemplate = #root::__private::NestedTemplate::new(
+                &__ENCODED, &[#(#attributes),*], ::core::file!(), ::core::line!(),
+            );
+        }
+    } else {
+        quote! {
+            const __MODULE: &str = ::core::module_path!();
+            const __FILE: &str = ::core::file!();
+            const __PARTS: &[&[u8]] = &[
+                b"{\"attrs\":{", #(#fragments,)* b"},\"refs\":[", #(#references,)*
+                b"],\"msg\":\"", #(#message,)* b"\",\"source\":{\"mod\":",
+                &#root::__private::json_string::<{#root::__private::json_string_len(__MODULE)}>(__MODULE),
+                b",\"file\":",
+                &#root::__private::json_string::<{#root::__private::json_string_len(__FILE)}>(__FILE),
+                ::core::concat!(",\"line\":", ::core::line!(), ",\"column\":", ::core::column!(), "}}").as_bytes(),
+            ];
+            static __ENCODED: [u8; #root::__private::encoded_len(__PARTS)] =
+                #root::__private::concatenate(__PARTS);
+            static __STATEMENT: #root::__private::Statement = #root::__private::Statement::new(
+                &__ENCODED,
+                &[#(#attributes),*],
+                &[#(&#values),*],
+            );
+        }
     };
     // Capture each invocation before entering the logger.
     let stack = quote! {
@@ -549,17 +586,30 @@ fn compile(input: &Input) -> syn::Result<Compiled> {
 #[proc_macro]
 pub fn record(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as Input);
-    let result = compile(&input).map(|compiled| {
+    let result = compile(&input, false).map(|compiled| {
         let declaration = compiled.declaration;
         let stack = compiled.stack;
         let arguments = compiled.arguments;
-        let call = if let Some(logger) = input.logger {
-            quote!((#logger).__write_compiled(&__STATEMENT, #stack, &[#(#arguments),*]))
-        } else {
-            let root = input.root;
-            quote!(#root::__private::write_stdout(&__STATEMENT, #stack, &[#(#arguments),*]))
-        };
-        quote! {{ #declaration #call }}
+        let root = input.root;
+        quote! {{ #declaration #root::__private::write_event(&__STATEMENT, #stack, &[#(#arguments),*]) }}
+    });
+    result.unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+/// A borrowed formatter; invoked only when writing its containing event.
+#[proc_macro]
+pub fn structured(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as Input);
+    let result = compile(&input, true).map(|compiled| {
+        let root = &input.root;
+        let declaration = compiled.declaration;
+        let arguments = compiled.arguments;
+        quote! {{
+            #declaration
+            #root::__private::formatted_value(|__out| {
+                __out.__formatted(&__FORMAT, &[#(#arguments),*])
+            })
+        }}
     });
     result.unwrap_or_else(syn::Error::into_compile_error).into()
 }

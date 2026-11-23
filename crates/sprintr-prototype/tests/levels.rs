@@ -2,34 +2,34 @@
 
 mod common;
 
-use common::{lines, records, replayed, standalone};
+use common::{lines, records, replayed, standalone, started_logger};
 use sprintr_prototype::{
     Definition, Logger, Renderer, buffer::StackBuffer, error, info, replay, warn,
 };
 use std::io;
 
 fn info_record(logger: &mut Logger<Vec<u8>>) {
-    info!("event", logger: logger).unwrap();
+    logger.with_default(|| info!("event"))
 }
 
 fn warn_record(logger: &mut Logger<Vec<u8>>) {
-    warn!("event", logger: logger).unwrap();
+    logger.with_default(|| warn!("event"))
 }
 
 fn error_record(logger: &mut Logger<Vec<u8>>) {
-    error!("event", logger: logger).unwrap();
+    logger.with_default(|| error!("event"))
 }
 
 /// Scenario: three level macros are used twice each and INFO is used at another callsite.
 /// Guarantees: levels are named entities with descriptions, static in templates, and emitted once per stream.
 #[test]
 fn named_levels_are_static_and_deduplicated() {
-    let mut logger = Logger::new(Vec::new());
+    let mut logger = started_logger();
     for emit in [info_record, warn_record, error_record] {
         emit(&mut logger);
         emit(&mut logger);
     }
-    info!("another", logger: logger).unwrap();
+    logger.with_default(|| info!("another"));
     let encoded = logger.into_inner();
     let startup = serde_json::to_value(&lines(&encoded)[0]).unwrap();
     assert_eq!(
@@ -88,7 +88,7 @@ fn named_levels_are_static_and_deduplicated() {
          another\nlog.level = INFO\n"
     );
 
-    let mut independent = Logger::new(Vec::new());
+    let mut independent = started_logger();
     error_record(&mut independent);
     let first = standalone(&independent.into_inner());
     assert_eq!(
@@ -101,16 +101,14 @@ fn named_levels_are_static_and_deduplicated() {
 /// Guarantees: failed encoding does not consume the new named value's definition.
 #[test]
 fn new_level_definition_survives_overflow() {
-    fn emit(logger: &mut Logger<Vec<u8>, StackBuffer<2048>>, text: &str) -> io::Result<()> {
-        warn!("{text:s}", logger: logger)
+    fn emit(logger: &mut Logger<Vec<u8>, StackBuffer<2048>>, text: &str) {
+        logger.with_default(|| warn!("{text:s}"))
     }
     let mut logger = Logger::with_buffer(Vec::new(), StackBuffer::<2048>::new());
-    info!("first", logger: logger).unwrap();
-    assert_eq!(
-        emit(&mut logger, &"x".repeat(2048)).unwrap_err().kind(),
-        io::ErrorKind::StorageFull
-    );
-    emit(&mut logger, "retry").unwrap();
+    logger.start().unwrap();
+    logger.with_default(|| info!("first"));
+    emit(&mut logger, &"x".repeat(2048));
+    emit(&mut logger, "retry");
     let encoded = logger.into_inner();
     let last = &records(&encoded)[1];
     assert!(last.defs.contains_key("log.level:WARN"));
@@ -125,7 +123,7 @@ fn new_level_definition_survives_overflow() {
 /// Guarantees: missing definitions and unsupported static attributes fail explicitly.
 #[test]
 fn invalid_level_definitions_and_references_are_rejected() {
-    let mut logger = Logger::new(Vec::new());
+    let mut logger = started_logger();
     info_record(&mut logger);
     let base = serde_json::to_value(standalone(&logger.into_inner())).unwrap();
     let key = format!("log.statement:{}", base["stmt"]);
@@ -166,7 +164,7 @@ fn invalid_level_definitions_and_references_are_rejected() {
 /// Guarantees: only accepted records extend the reader's level table; equal repeats remain valid.
 #[test]
 fn named_level_definitions_are_transactional_and_immutable() {
-    let mut logger = Logger::new(Vec::new());
+    let mut logger = started_logger();
     info_record(&mut logger);
     let valid = standalone(&logger.into_inner());
     let mut invalid = valid.clone();

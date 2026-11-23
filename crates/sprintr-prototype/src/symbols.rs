@@ -154,30 +154,7 @@ pub struct SourceLocation {
 }
 
 fn short_function(name: &str) -> &str {
-    // Find the last path separator outside generic arguments or a qualified
-    // trait receiver. `::<` introduces arguments, and `->` isn't a closing `>`.
-    let mut depth = 0usize;
-    let mut start = 0;
-    for (i, b) in name.bytes().enumerate() {
-        match b {
-            b'<' => depth += 1,
-            b'>' if !name[..i].ends_with('-') => depth = depth.saturating_sub(1),
-            b':' if depth == 0 && name[i..].starts_with("::") && !name[i..].starts_with("::<") => {
-                start = i + 2
-            }
-            _ => {}
-        }
-    }
-    let leaf = name[start..]
-        .split('<')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches("::");
-    if leaf.is_empty() {
-        "<unknown function>"
-    } else {
-        leaf
-    }
+    crate::rust_leaf_name(name).unwrap_or("<unknown function>")
 }
 
 /// Local lookup is **only** for PCs from this execution. Cache misses as well

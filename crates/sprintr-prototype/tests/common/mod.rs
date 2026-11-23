@@ -1,12 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared helpers. Every output stream begins with a startup announcement.
+//! Shared helpers for integration tests.
 
 #![allow(dead_code)]
 
 use sprintr_prototype::{
-    Argument, Definition, Message, RECORD, STATEMENT_PREFIX, StatementTemplate, THREAD, replay,
+    Argument, Definition, Logger, Message, RECORD, STATEMENT_PREFIX, StatementTemplate, THREAD,
+    replay,
 };
+use std::io::{self, Write};
+
+pub fn started_logger() -> Logger<Vec<u8>> {
+    let mut logger = Logger::new(Vec::new());
+    logger.start().unwrap();
+    logger
+}
+
+/// Reject just the specified write (counting from one); each record is one write.
+pub struct FailNth {
+    fail: usize,
+    pub writes: usize,
+    pub output: Vec<u8>,
+}
+
+impl FailNth {
+    pub fn new(fail: usize) -> Self {
+        Self {
+            fail,
+            writes: 0,
+            output: Vec::new(),
+        }
+    }
+}
+
+impl Write for FailNth {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.writes += 1;
+        if self.writes == self.fail {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "sink rejected record",
+            ));
+        }
+        self.output.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 pub fn template(record: &Message) -> &StatementTemplate {
     let key = format!("{STATEMENT_PREFIX}{}", record.attrs["log.statement"]);

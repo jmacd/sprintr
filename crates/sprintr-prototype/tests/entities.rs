@@ -2,13 +2,13 @@
 
 mod common;
 
-use common::{lines, records, replayed};
+use common::{lines, records, replayed, started_logger};
 use serde_json::json;
 use sprintr_prototype::buffer::StackBuffer;
 use sprintr_prototype::{
     Argument, Definition, EntityHandle, Logger, Message, RECORD, Renderer, THREAD, entities, info,
 };
-use std::io::{self, Write};
+use std::io::Write;
 
 entities! {
     /// Application session
@@ -16,8 +16,8 @@ entities! {
     session = "session";
 }
 
-fn emit<W: Write>(logger: &mut Logger<W>, handle: &EntityHandle) -> io::Result<()> {
-    info!("opened {handle}", logger: logger)
+fn emit<W: Write>(logger: &mut Logger<W>, handle: &EntityHandle) {
+    logger.with_default(|| info!("opened {handle}"))
 }
 
 fn target(record: &Message) -> &str {
@@ -35,10 +35,10 @@ fn defines_and_reuses_application_values() {
     value["msg"] = "another session".into();
     let other = session.new(&value).unwrap();
     assert!(session.new(42).is_err());
-    let mut logger = Logger::new(Vec::new());
-    emit(&mut logger, &login).unwrap();
-    emit(&mut logger, &other).unwrap();
-    info!("resumed {} {}", logger: logger, login, login).unwrap();
+    let mut logger = started_logger();
+    emit(&mut logger, &login);
+    emit(&mut logger, &other);
+    logger.with_default(|| info!("resumed {} {}", login, login));
     let bytes = logger.into_inner();
     let events = records(&bytes);
     let (a, b, reuse) = (&events[0], &events[1], &events[2]);
@@ -74,17 +74,17 @@ fn defines_and_reuses_application_values() {
 #[test]
 fn each_thread_and_output_defines_the_handle_locally() {
     let login = session.new(json!({"account":"Ada"})).unwrap();
-    let mut logger = Logger::new(Vec::new());
-    emit(&mut logger, &login).unwrap();
+    let mut logger = started_logger();
+    emit(&mut logger, &login);
     let worker = std::thread::scope(|s| {
         s.spawn(|| {
-            emit(&mut logger, &login).unwrap();
+            emit(&mut logger, &login);
             gettid::gettid()
         })
         .join()
         .unwrap()
     });
-    emit(&mut logger, &login).unwrap();
+    emit(&mut logger, &login);
     let bytes = logger.into_inner();
     let startup = &lines(&bytes)[0];
     assert_eq!(startup.attrs[RECORD], 0);
@@ -109,8 +109,8 @@ fn each_thread_and_output_defines_the_handle_locally() {
         3
     );
 
-    let mut another = Logger::new(Vec::new());
-    emit(&mut another, &login).unwrap();
+    let mut another = started_logger();
+    emit(&mut another, &login);
     let another = records(&another.into_inner()).remove(0);
     assert!(another.defs.contains_key(key));
     assert_eq!(another.attrs[THREAD], a.attrs[THREAD]);
@@ -125,13 +125,11 @@ fn each_thread_and_output_defines_the_handle_locally() {
 fn rejected_first_use_is_not_a_reference_target() {
     let login = session.new(json!({"account":"Ada"})).unwrap();
     let mut logger = Logger::with_buffer(Vec::new(), StackBuffer::<2048>::new());
-    let mut log = |note: &str| info!("{login} {note:s}", logger: logger);
-    assert_eq!(
-        log(&"x".repeat(4096)).unwrap_err().kind(),
-        io::ErrorKind::StorageFull
-    );
-    log("first accepted").unwrap();
-    log("again").unwrap();
+    logger.start().unwrap();
+    let mut log = |note: &str| logger.with_default(|| info!("{login} {note:s}"));
+    log(&"x".repeat(4096));
+    log("first accepted");
+    log("again");
     let bytes = logger.into_inner();
     let events = records(&bytes);
     assert_eq!(events.len(), 2);

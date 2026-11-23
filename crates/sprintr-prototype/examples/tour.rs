@@ -50,11 +50,7 @@ struct Login<'a> {
     method: &'a str,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // A caller-owned logger over any `io::Write`. Its first record is the
-    // startup announcement.
-    let mut logger = Logger::new(Vec::new());
-
+fn record_events() -> io::Result<()> {
     // Both arguments point to the same definition. The sequence before `#`
     // matches the opened record's `seq`. The resumed record
     // has its own sequence on the same `log.thread`.
@@ -62,49 +58,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         account: "Ada",
         method: "passkey",
     })?;
-    info!("opened {}", logger: logger, login)?;
-    info!("resumed {}", logger: logger, login)?;
+    info!("opened {}", login);
+    info!("resumed {}", login);
 
     // Plain formatting: implicit captures name local variables, and explicit
     // positional expressions fill `{}` placeholders. Strings take `:s`;
     // unsigned integers take `:x` with `#`, zero padding, and width.
     let name = "Ada";
     let value = 42u32;
-    info!("hello {name:s}, value {value:04x}", logger: logger)?;
-    info!("hello {:s}, value {:#x}", logger: logger, name, value)?;
-    info!("{{literal braces}} around {name:s}", logger: logger)?;
+    info!("hello {name:s}, value {value:04x}");
+    info!("hello {:s}, value {:#x}", name, value);
+    info!("{{literal braces}} around {name:s}");
 
     // Attributes: `handle = expression` associates a placeholder with a
     // declared attribute. The stored placeholder is `{@account.name}`.
     // Ada's record defines the anonymous log.statement; Grace's refers to
     // the same statement by ID without repeating its template.
     for name in ["Ada", "Grace"] {
-        info!("signed in {}", logger: logger, account_name = name)?;
+        info!("signed in {}", account_name = name);
     }
 
     // Levels are static named entities baked into each statement. Unsigned
     // attributes render `{}` in decimal or `{:x}` in hexadecimal.
     warn!(
         "attempt {} failed for {}",
-        logger: logger,
         retry_count = 2u8,
         account_name = name,
-    )?;
+    );
     error!(
         "request {:016x} gave up after {} attempts",
-        logger: logger,
         request_id = 0xdead_beef_u64,
         retry_count = 3u8,
-    )?;
+    );
 
     // Bounded storage fails loudly and atomically; the logger remains usable.
     // It must fit the startup announcement, for which 2 KB suffices.
     let mut bounded = Logger::with_buffer(io::sink(), StackBuffer::<2048>::new());
+    bounded.start()?;
     let long = "x".repeat(4096);
-    let reason = info!("{long:s}", logger: bounded).unwrap_err().to_string();
-    info!("short records still fit", logger: bounded)?;
-    error!("bounded logger rejected a record: {reason:s}", logger: logger)?;
+    bounded.with_default(|| {
+        info!("{long:s}"); // reports the overflow to stderr
+        info!("short records still fit");
+    });
+    Ok(())
+}
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut logger = Logger::new(Vec::new());
+    logger.start()?;
+    logger.with_default(record_events)?;
     logger.flush()?;
     let encoded = logger.into_inner();
 

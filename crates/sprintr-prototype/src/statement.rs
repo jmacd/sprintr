@@ -5,10 +5,10 @@ use crate::declare::{Named, RelationMeta};
 use crate::format::{self, Part};
 use crate::runtime::runtime;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::io;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -19,6 +19,142 @@ pub struct Statement {
     attributes: &'static [&'static RelationMeta],
     values: &'static [&'static Named],
     resolved: OnceLock<Result<Resolved, String>>,
+}
+
+/// A `structured!` invocation shared by every concrete type using this callsite.
+#[doc(hidden)]
+pub struct NestedTemplate {
+    encoded: &'static [u8],
+    attributes: &'static [(usize, &'static RelationMeta)],
+    file: &'static str,
+    line: u32,
+    resolved: OnceLock<Result<NestedFormat, String>>,
+}
+
+pub(crate) struct NestedFormat {
+    pub msg: String,
+    pub bindings: Vec<(usize, usize)>,
+}
+
+impl NestedTemplate {
+    pub const fn new(
+        encoded: &'static [u8],
+        attributes: &'static [(usize, &'static RelationMeta)],
+        file: &'static str,
+        line: u32,
+    ) -> Self {
+        Self {
+            encoded,
+            attributes,
+            file,
+            line,
+            resolved: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn resolve(&self) -> io::Result<&NestedFormat> {
+        self.resolved
+            .get_or_init(|| {
+                let mut msg: String =
+                    serde_json::from_slice(self.encoded).map_err(|e| e.to_string())?;
+                let mut bindings = Vec::new();
+                let mut names = Vec::new();
+                let mut renamed = false;
+                for &(argument, attr) in self.attributes {
+                    let relation = runtime().relation(attr)?;
+                    let name = runtime().definitions[relation].name.as_str();
+                    renamed |= name != attr.name;
+                    names.push(name);
+                    bindings.push((argument, relation));
+                }
+                if renamed {
+                    msg = rename_fields(&msg, &names)?;
+                }
+                Ok(NestedFormat { msg, bindings })
+            })
+            .as_ref()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.clone()))
+    }
+}
+
+pub(crate) struct NamedEncoder {
+    pub key: String,
+    pub member: Vec<u8>,
+    pub id: usize,
+}
+
+// A static inside a generic impl is shared by all monomorphizations.
+type Variant = (usize, &'static str);
+
+#[derive(Default)]
+pub(crate) struct EncoderCache(HashMap<Variant, Arc<NamedEncoder>>);
+
+impl EncoderCache {
+    pub fn resolve(
+        &mut self,
+        site: &'static NestedTemplate,
+        name: &'static str,
+        msg: &str,
+    ) -> io::Result<&Arc<NamedEncoder>> {
+        let variant = (std::ptr::from_ref(site).addr(), name);
+        match self.0.entry(variant) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => Ok(entry.insert(intern_encoder(variant, site, name, msg)?)),
+        }
+    }
+}
+
+// Cold path only. Definitions are immutable and can be copied to any output;
+// whether a particular thread has delivered one is tracked by that output.
+fn intern_encoder(
+    variant: Variant,
+    site: &NestedTemplate,
+    name: &str,
+    msg: &str,
+) -> io::Result<Arc<NamedEncoder>> {
+    #[derive(Default)]
+    struct Registry {
+        variants: HashMap<Variant, Arc<NamedEncoder>>,
+        names: HashMap<String, Arc<NamedEncoder>>,
+    }
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    let mut registry = REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| io::Error::other("encoder registry poisoned"))?;
+    if let Some(known) = registry.variants.get(&variant) {
+        return Ok(known.clone());
+    }
+    let def = sprintr_message::EncodeDefinition {
+        msg: msg.into(),
+        name: name.into(),
+        file: site.file.into(),
+        line: site.line,
+    };
+    let bytes = serde_json::to_vec(&def).map_err(crate::json_error)?;
+    let hash = crate::runtime::fnv1a(&bytes);
+    let leaf = crate::rust_leaf_name(name).unwrap_or("Value");
+    let key = format!(
+        "{}{leaf}_{hash:016x}",
+        sprintr_message::STRUCT_ENCODE_PREFIX
+    );
+    let mut member = serde_json::to_vec(&key).map_err(crate::json_error)?;
+    member.push(b':');
+    member.extend_from_slice(&bytes);
+    let id = registry.names.len();
+    let encoded = match registry.names.entry(key.clone()) {
+        Entry::Occupied(entry) if entry.get().member == member => entry.get().clone(),
+        Entry::Occupied(_) => {
+            return Err(io::Error::other(format!(
+                "conflicting encoder identity {key}"
+            )));
+        }
+        Entry::Vacant(entry) => entry
+            .insert(Arc::new(NamedEncoder { key, member, id }))
+            .clone(),
+    };
+    registry.variants.insert(variant, encoded.clone());
+    Ok(encoded)
 }
 
 /// A statement's identity, its template under recorded names, and the
@@ -120,7 +256,12 @@ fn rename(
             .ok_or_else(|| invalid(&"empty reference"))?;
         reference.insert((*name).into(), binding);
     }
-    let mut parts = format::parse(&template.msg).map_err(|error| invalid(&error))?;
+    template.msg = rename_fields(&template.msg, names)?;
+    serde_json::to_vec(&template).map_err(|error| invalid(&error))
+}
+
+fn rename_fields(msg: &str, names: &[&str]) -> Result<String, String> {
+    let mut parts = format::parse(msg).map_err(|e| e.to_string())?;
     let mut names = names.iter();
     for part in &mut parts {
         if let Part::Field(field) = part
@@ -128,12 +269,11 @@ fn rename(
         {
             let name = names
                 .next()
-                .ok_or_else(|| invalid(&"placeholder count differs from attributes"))?;
+                .ok_or("placeholder count differs from attributes")?;
             field.name = format!("@{name}");
         }
     }
-    template.msg = format::unparse(&parts);
-    serde_json::to_vec(&template).map_err(|error| invalid(&error))
+    Ok(format::unparse(&parts))
 }
 
 #[doc(hidden)]

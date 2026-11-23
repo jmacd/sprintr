@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{lines, records, replayed, template};
+use common::{lines, records, replayed, started_logger, template};
 use sprintr_prototype::buffer::{HeapBuffer, RecordBuffer, StackBuffer};
 use sprintr_prototype::{Argument, Logger, info, replay};
 use std::cell::Cell;
@@ -12,19 +12,21 @@ use std::io::{self, Write};
 #[test]
 fn repeated_statement_captures_the_current_call_path() {
     #[inline(never)]
-    fn emit(logger: &mut Logger<Vec<u8>>) {
-        info!("same statement", logger: logger).unwrap();
+    fn emit() {
+        info!("same statement");
     }
     #[inline(never)]
-    fn via_caller(logger: &mut Logger<Vec<u8>>) {
-        emit(logger);
-        std::hint::black_box(logger);
+    fn via_caller() {
+        emit();
+        std::hint::black_box(());
     }
 
-    let mut logger = Logger::new(Vec::new());
-    emit(&mut logger);
-    via_caller(&mut logger);
-    via_caller(&mut logger);
+    let mut logger = started_logger();
+    logger.with_default(|| {
+        emit();
+        via_caller();
+        via_caller();
+    });
     let events = records(&logger.into_inner());
     let (a, b, c) = (&events[0], &events[1], &events[2]);
     assert_eq!(a.attrs["log.statement"], b.attrs["log.statement"]);
@@ -51,9 +53,9 @@ fn repeated_statement_captures_the_current_call_path() {
 fn positional_and_captured_roundtrip() {
     let name = String::from("Ada");
     let value = 42u32;
-    let mut logger = Logger::new(Vec::new());
-    info!("hello {:s}, value {:04x}", logger: logger, name, value).unwrap();
-    info!("hello {name:s}, value {value:04x}", logger: logger).unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!("hello {:s}, value {:04x}", name, value));
+    logger.with_default(|| info!("hello {name:s}, value {value:04x}"));
     logger.flush().unwrap();
     let encoded = logger.into_inner();
     let records = records(&encoded);
@@ -89,8 +91,8 @@ fn capture_is_typed_borrowed_and_evaluated_once() {
         calls.set(calls.get() + 1);
         42u64
     };
-    let mut logger = Logger::new(Vec::new());
-    info!("hello {name:s}, value {:04x}", logger: logger, next()).unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!("hello {name:s}, value {:04x}", next()));
     name.0.clear();
     let encoded = logger.into_inner();
     assert_eq!(calls.get(), 1);
@@ -109,10 +111,10 @@ fn capture_is_typed_borrowed_and_evaluated_once() {
 #[test]
 fn escaped_literals_and_string_data() {
     let text = "quoted \"text\"\n\\{braces}\t\u{03bb}";
-    let mut logger = Logger::new(Vec::new());
-    info!(r"{{{text:s}}} {text:s}", logger: logger).unwrap();
-    info!("{{literal}}", logger: logger).unwrap();
-    info!("", logger: logger).unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!(r"{{{text:s}}} {text:s}"));
+    logger.with_default(|| info!("{{literal}}"));
+    logger.with_default(|| info!(""));
     let encoded = logger.into_inner();
     assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 4);
     assert_eq!(
@@ -129,8 +131,8 @@ fn escaped_literals_and_string_data() {
 fn direct_encoding_roundtrips_through_the_reader() {
     let text = "quoted \"text\"\n\\{braces}\t\u{03bb}";
     let value = u64::MAX;
-    let mut logger = Logger::new(Vec::new());
-    info!("line\n{{{text:s}}} {value:#04x}", logger: logger).unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!("line\n{{{text:s}}} {value:#04x}"));
     let encoded = logger.into_inner();
     for (record, line) in lines(&encoded).iter().zip(encoded.split(|&b| b == b'\n')) {
         assert_eq!(
@@ -148,8 +150,8 @@ fn direct_encoding_roundtrips_through_the_reader() {
         calls.set(calls.get() + 1);
         String::from("temporary")
     };
-    let mut logger = Logger::new(Vec::new());
-    info!("hello {:s}", logger: logger, temporary()).unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!("hello {:s}", temporary()));
     assert_eq!(calls.get(), 1);
     assert_eq!(
         replayed(&logger.into_inner()),
@@ -163,13 +165,11 @@ fn direct_encoding_roundtrips_through_the_reader() {
 fn oversized_records_roll_back_and_allow_reuse() {
     fn check(buffer: impl RecordBuffer) {
         let mut logger = Logger::with_buffer(Vec::new(), buffer);
-        info!("before", logger: logger).unwrap();
+        logger.start().unwrap();
+        logger.with_default(|| info!("before"));
         let text = "\n".repeat(1100);
-        assert_eq!(
-            info!("{text:s}", logger: logger).unwrap_err().kind(),
-            io::ErrorKind::StorageFull
-        );
-        info!("after", logger: logger).unwrap();
+        logger.with_default(|| info!("{text:s}"));
+        logger.with_default(|| info!("after"));
         assert_eq!(
             replayed(&logger.into_inner()),
             "before\nlog.level = INFO\nafter\nlog.level = INFO\n"
@@ -183,11 +183,12 @@ fn oversized_records_roll_back_and_allow_reuse() {
 /// Guarantees: limits apply to the complete wire record, including framing; nothing partial is written.
 #[test]
 fn buffer_limit_includes_record_framing() {
-    fn emit(logger: &mut Logger<Vec<u8>>) -> io::Result<()> {
-        info!("hello", logger: logger)
+    fn emit(logger: &mut Logger<Vec<u8>>) {
+        logger.with_default(|| info!("hello"))
     }
     let mut sample = Logger::new(Vec::new());
-    emit(&mut sample).unwrap();
+    sample.start().unwrap();
+    emit(&mut sample);
     let output = sample.into_inner();
     let startup = output.iter().position(|byte| *byte == b'\n').unwrap() + 1;
     assert_eq!(lines(&output).len(), 2);
@@ -199,7 +200,8 @@ fn buffer_limit_includes_record_framing() {
         Vec::new(),
         HeapBuffer::with_capacity_and_limit(startup, startup),
     );
-    emit(&mut exact).unwrap();
+    exact.start().unwrap();
+    emit(&mut exact);
     let exact = exact.into_inner();
     assert_eq!(
         exact.iter().position(|byte| *byte == b'\n').unwrap() + 1,
@@ -212,7 +214,7 @@ fn buffer_limit_includes_record_framing() {
         HeapBuffer::with_capacity_and_limit(startup, startup - 1),
     );
     assert_eq!(
-        emit(&mut short).unwrap_err().kind(),
+        short.start().unwrap_err().kind(),
         io::ErrorKind::StorageFull
     );
     assert!(short.into_inner().is_empty());
@@ -223,8 +225,10 @@ fn buffer_limit_includes_record_framing() {
 #[test]
 fn hexadecimal_formatting_matches_rust() {
     for value in [0u64, 42, 0x12345, (1 << 53) + 1, u64::MAX] {
-        let mut logger = Logger::new(Vec::new());
-        info!("{value:x}|{value:04x}|{value:#04x}|{value:8x}|{value:#08x}|{value:#x}", logger: logger).unwrap();
+        let mut logger = started_logger();
+        logger.with_default(|| {
+            info!("{value:x}|{value:04x}|{value:#04x}|{value:8x}|{value:#08x}|{value:#x}")
+        });
         let encoded = logger.into_inner();
         assert_eq!(
             replayed(&encoded),
@@ -241,8 +245,8 @@ fn hexadecimal_formatting_matches_rust() {
 #[test]
 fn invalid_records_fail_loudly() {
     let value = 1u64;
-    let mut logger = Logger::new(Vec::new());
-    info!("{value:x}", logger: logger).unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!("{value:x}"));
     let events = lines(&logger.into_inner());
     let first = serde_json::to_string(&events[0]).unwrap();
     let base = &events[1];
@@ -308,18 +312,17 @@ impl Write for FailWriter {
     }
 }
 
-/// Scenario: recording/playback encounters a broken sink, failed flush, or invalid UTF-8 input.
-/// Guarantees: every I/O failure is returned to the caller.
+/// Explicit startup, flush, and playback still report I/O failures to their caller.
 #[test]
-fn io_errors_are_returned() {
+fn start_flush_and_playback_return_io_errors() {
     let mut logger = Logger::new(FailWriter { fail_write: true });
     assert_eq!(
-        info!("hello", logger: logger).unwrap_err().kind(),
+        logger.start().unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
     );
     assert_eq!(logger.flush().unwrap_err().to_string(), "flush failed");
-    let mut logger = Logger::new(Vec::new());
-    info!("hello", logger: logger).unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| info!("hello"));
     let input = logger.into_inner();
     let error = replay(input.as_slice(), FailWriter { fail_write: true }).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
@@ -337,7 +340,8 @@ fn macro_paths_are_hygienic() {
     let name = "Ada";
     let value = 42u8;
     let mut logger = renamed::Logger::new(Vec::new());
-    renamed::info!("{name:s} {value:04x}", logger: logger).unwrap();
+    logger.start().unwrap();
+    logger.with_default(|| renamed::info!("{name:s} {value:04x}"));
     assert_eq!(
         replayed(&logger.into_inner()),
         "Ada 002a\nlog.level = INFO\n"

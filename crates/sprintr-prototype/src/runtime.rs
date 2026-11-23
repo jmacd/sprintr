@@ -49,7 +49,7 @@ fn address<T>(value: &'static T) -> usize {
     value as *const T as usize
 }
 
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })
@@ -75,10 +75,14 @@ impl Runtime {
         if let Some(index) = self.relations.get(&address(meta)) {
             return *index;
         }
+        let definition = meta.definition(|target| {
+            let index = self.declare_relation(target);
+            self.definitions[index].name.clone()
+        });
         let index = self.insert(
             RELATION_PREFIX,
             meta.name,
-            Definition::Relation(meta.definition()),
+            Definition::Relation(definition),
             meta.kind_name(),
             meta.description,
         );

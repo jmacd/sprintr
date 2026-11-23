@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{assert_startup, lines, replayed, template};
+use common::{FailNth, assert_startup, lines, replayed, started_logger, template};
 use sprintr_prototype::{Argument, Logger, Message, attributes, info};
 
 attributes! {
@@ -65,15 +65,15 @@ fn suffixed(recorded: &str, declared: &str) -> bool {
 #[test]
 fn collisions_are_renamed_and_announced() {
     let _ = (&levels::same, &levels::different);
-    let mut logger = Logger::new(Vec::new());
-    info!(
-        "{} {}",
-        logger: logger,
-        account_name = "Ada",
-        other::account_name = "Ada Lovelace"
-    )
-    .unwrap();
-    info!("{}", logger: logger, other::worker = "worker-7").unwrap();
+    let mut logger = started_logger();
+    logger.with_default(|| {
+        info!(
+            "{} {}",
+            account_name = "Ada",
+            other::account_name = "Ada Lovelace"
+        );
+        info!("{}", other::worker = "worker-7");
+    });
     let encoded = logger.into_inner();
     let records = lines(&encoded);
     assert_startup(&records[0]);
@@ -157,8 +157,9 @@ fn collisions_are_renamed_and_announced() {
         )
     );
 
-    let mut another = Logger::new(Vec::new());
-    info!("again", logger: another).unwrap();
+    let mut another = started_logger();
+    another.with_default(|| info!("again"));
+    another.start().unwrap();
     let again = another.into_inner();
     for (later, first) in lines(&again).iter().zip(&records).take(5) {
         assert_eq!(later.defs, first.defs);
@@ -166,8 +167,30 @@ fn collisions_are_renamed_and_announced() {
         assert_eq!(later.attrs["log.statement"], first.attrs["log.statement"]);
         assert!(later.attrs["log.record"] > first.attrs["log.record"]);
     }
+
     assert_eq!(
         replayed(&again),
         format!("{announced}again\nlog.level = INFO\n")
     );
+}
+
+/// The sink accepts the startup record and three collision warnings, then rejects the fourth.
+#[test]
+fn partial_startup_failure_is_not_reannounced() {
+    let mut logger = Logger::new(FailNth::new(5));
+    let failure = logger.start().unwrap_err();
+    assert_eq!(failure.kind(), std::io::ErrorKind::BrokenPipe);
+    logger.with_default(|| info!("after partial startup"));
+    let repeated = logger.start().unwrap_err();
+    assert_eq!(repeated.kind(), failure.kind());
+    assert_eq!(repeated.to_string(), failure.to_string());
+
+    let sink = logger.into_inner();
+    assert_eq!(sink.writes, 6);
+    let text = replayed(&sink.output);
+    assert_eq!(
+        text.matches("collides with an earlier declaration").count(),
+        3
+    );
+    assert!(text.ends_with("after partial startup\nlog.level = INFO\n"));
 }

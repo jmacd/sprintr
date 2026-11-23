@@ -8,6 +8,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and planned entity model.
 The current milestone is a standalone JSON Lines logger and plain-text reader.
 It pre-encodes statement templates and statically declared string attributes.
 `info!`, `warn!`, and `error!` attach named levels to those static templates.
+Call `start()` explicitly at application startup. Ordinary logging returns `()`;
+before startup, it prints a warning and the event to stderr.
 Logging calls deliver each event to the SDK as it is created. Events carry
 a statement reference and typed arguments; first-use definitions
 bootstrap the reader. Playback executes the stored formatting. It is not production-ready.
@@ -22,7 +24,7 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record
 After the startup announcement:
 
 ```json
-{"seq":1,"stmt":2,"thread":88888,"ts":1704067200123456789,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}}}}
+{"seq":1,"stmt":2,"thread":88888,"ts":1704067200123456789,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":25,"column":17}}}}
 {"seq":2,"stmt":2,"thread":88888,"ts":1704067200124567890,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Grace",42]}
 ```
 
@@ -41,7 +43,8 @@ log.level = INFO, account.name = Grace
 ```
 
 See the [prototype API and format subset](crates/sprintr-prototype/README.md)
-for anonymous application objects, implicit captures, positional expressions,
+for [nested structured arguments](crates/sprintr-prototype/README.md#structured-arguments),
+anonymous application objects, implicit captures, positional expressions,
 caller-owned writers, and [deferred call-stack symbolization](crates/sprintr-prototype/README.md#call-stacks-and-symbols).
 
 ## Workspace

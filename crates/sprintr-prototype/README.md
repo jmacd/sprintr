@@ -18,7 +18,7 @@ cargo run --quiet -p sprintr-prototype --example json_lines -- record
 After the [startup announcement](#startup-announcement):
 
 ```json
-{"seq":1,"stmt":2,"thread":88888,"ts":1704067200123456789,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}}}}
+{"seq":1,"stmt":2,"thread":88888,"ts":1704067200123456789,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":25,"column":17}}}}
 {"seq":2,"stmt":2,"thread":88888,"ts":1704067200124567890,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Grace",42]}
 ```
 
@@ -49,27 +49,40 @@ line number. Input, output, and flush failures are returned rather than ignored.
 ## Try the API
 
 ```rust
-use sprintr_prototype::{Logger, info, replay};
+use sprintr_prototype::{info, start};
 
 let name = String::from("Ada");
 let value = 42u32;
 
-// JSON Lines to stdout, with implicit captures.
-info!("hello {name:s}, value {value:04x}")?;
+start()?;
+info!("hello {name:s}, value {value:04x}");
+info!("hello {:s}, value {:04x}", name, value);
+# Ok::<(), std::io::Error>(())
+```
 
-// Caller-owned output, with explicit positional expressions.
+To record a synchronous operation into a caller-owned writer, install it once
+for the scope. Calls made by other functions on that thread use it too:
+
+```rust
+use sprintr_prototype::{Logger, info, replay};
+
+fn greet(name: &str) {
+    info!("hello {name:s}");
+}
+
 let mut logger = Logger::new(Vec::new());
-info!("hello {:s}, value {:04x}", logger: logger, name, value)?;
+logger.start()?;
+logger.with_default(|| greet("Ada"));
 logger.flush()?;
 
 // Replay the records the logger wrote.
 let mut text = Vec::new();
 replay(logger.into_inner().as_slice(), &mut text)?;
-assert!(text.ends_with(b"hello Ada, value 002a\nlog.level = INFO\n"));
+assert!(text.ends_with(b"hello Ada\nlog.level = INFO\n"));
 # Ok::<(), std::io::Error>(())
 ```
 
-`info!` returns `std::io::Result<()>`. It borrows string data and encodes it
+`info!` returns `()`. It borrows string data and encodes it
 directly without requiring `Display` or allocating intermediate owned arguments.
 The caller retains ownership. Expressions are evaluated once per placeholder
 occurrence. Each logging call delivers the event to the SDK immediately.
@@ -77,20 +90,137 @@ occurrence. Each logging call delivers the event to the SDK immediately.
 Writers are synchronous, and I/O failure may leave a partially written line.
 Call `Logger::flush` explicitly for buffered output.
 
-## Static levels
+## Structured arguments
+
+Implement `StructuredValue` on the type you want to log. Its `encode` method
+can use `structured!` to describe how to display its fields. Callers pass the
+object directly to `{}`; no adapter or intermediate label is needed.
 
 ```rust
-use sprintr_prototype::{Logger, error, info, warn};
+use sprintr_prototype::{StructuredValue, ValueWriter, info, structured};
 
-let mut logger = Logger::new(Vec::new());
-info!("ready", logger: logger)?;
-warn!("retrying", logger: logger)?;
-error!("failed", logger: logger)?;
-logger.flush()?;
+struct Point { x: u64, y: u64 }
+impl StructuredValue for Point {
+    fn encode(&self, out: &mut dyn ValueWriter) -> std::io::Result<()> {
+        let Self { x, y } = self;
+        structured!("({x}, {y})").encode(out)
+    }
+}
+
+sprintr_prototype::start()?;
+let point = Point { x: 3, y: 4 };
+info!("position {point}");
 # Ok::<(), std::io::Error>(())
 ```
 
-The macros share the same capture syntax and return `std::io::Result<()>`.
+The event renders as `position (3, 4)`. First use on each output and thread
+includes the named encoder definition (record excerpt):
+
+```json
+{
+  "args": [[3,4]],
+  "refs": [{"struct.encode:Point_f26ff73e147c5d02":"#/args/0"}],
+  "defs": {
+    "struct.encode:Point_f26ff73e147c5d02": {
+      "msg":"({x}, {y})", "name":"example::Point", "file":"src/main.rs", "line":8
+    }
+  }
+}
+```
+
+Later events carry the same `refs` entry and new `args`. The key uses the
+unqualified type without generic arguments plus a hash of the definition.
+The definition retains the full concrete type and the location of `structured!`.
+
+For named fields instead, the same trait method can call
+`out.object("Point", &[("x", Value::Unsigned(self.x)), ("y", Value::Unsigned(self.y))])`.
+The call site stays the same; `args[0]` becomes `{"x":3,"y":4}` with a
+`struct.name:Point` reference. `out.array` writes a plain array. Object fields can hold another
+`Value::Structured` or an entity handle (`Value::Entity`). Attributes label
+positional arguments of `structured!` or a log statement. Inside `structured!`,
+bare strings and unsigned integers also work, with
+integers rendered in decimal. Formatting markers and associations are recorded
+on the outer event. An entity's first use supplies its definition there.
+`:?` accepts a borrowed `dyn Debug` and stores its Debug **text** as a JSON
+string; use `StructuredValue` to expose individual fields.
+
+Pass children to the writer rather than recursively calling a child's `encode`
+yourself. If a child is the same active nonzero-sized node, its place in `args`
+holds a `$ref` back to the ancestor. Independent sibling uses are encoded
+normally. Traversals deeper than 32 structured values fail the whole record.
+
+### A value that is an entity, or contains one
+
+```rust
+use sprintr_prototype::{attributes, entities, info, structured, EntityHandle, StructuredValue, ValueWriter};
+
+entities! {
+    /// Application session
+    #[anonymous]
+    session = "session";
+}
+attributes! {
+    /// Session handling the request
+    active_session: entity(session) = "request.session";
+}
+
+struct Session(EntityHandle);
+impl StructuredValue for Session {
+    fn encode(&self, out: &mut dyn ValueWriter) -> std::io::Result<()> {
+        self.0.encode(out)
+    }
+}
+struct Request<'a> { entity_handle: &'a EntityHandle }
+impl StructuredValue for Request<'_> {
+    fn encode(&self, out: &mut dyn ValueWriter) -> std::io::Result<()> {
+        structured!("handling {}", active_session = self.entity_handle).encode(out)
+    }
+}
+
+sprintr_prototype::start()?;
+let login = Session(session.new(serde_json::json!({"name":"Ada"}))?);
+info!("{login}");
+let request = Request { entity_handle: &login.0 };
+info!("{request}");
+# Ok::<(), std::io::Error>(())
+```
+
+`Session` delegates directly: `args[0]` holds only a `$ref` to its definition.
+`Request` emits a formatted array containing that same reference. If `session:9`
+was defined in record 1, the second event has these fields (hash abbreviated):
+
+```json
+{
+  "args": [[{"$ref":"1#/defs/session:9"}]],
+  "refs": [
+    {"struct.encode:Request_abcd":"#/args/0"},
+    {"request.session":"#/args/0/0"}
+  ]
+}
+```
+
+The encoder names the layout of the array; `request.session` labels its first
+argument. That argument's `$ref` already identifies `session:9` and the record
+that defines it.
+
+An outer statement can likewise use `info!("handling {}", active_session = login.0)`.
+There the attribute binding lives in the statement template; the event needs
+only the `$ref` in its argument slot. The attribute's schema records its
+target as `"type":{"entity":"session"}`.
+
+## Static levels
+
+```rust
+use sprintr_prototype::{error, info, start, warn};
+
+start()?;
+info!("ready");
+warn!("retrying");
+error!("failed");
+# Ok::<(), std::io::Error>(())
+```
+
+The macros share the same capture syntax and return `()`.
 They bake `{"log.level":"INFO"}`, `{"log.level":"WARN"}`, or
 `{"log.level":"ERROR"}` into the statement's `attrs`. `log.level` is a named
 object-entity relation, not a string attribute. A value such as `"INFO"` is a
@@ -142,13 +272,15 @@ entities! {
 }
 
 let name = "Ada";
-info!("hello {}, attempt {}", account_name = name, retry_count = 2u8)?;
+sprintr_prototype::start()?;
+info!("hello {}, attempt {}", account_name = name, retry_count = 2u8);
 assert_eq!(environment::STAGING.description(), "Pre-production testing");
 # Ok::<(), std::io::Error>(())
 ```
 
 Each doc comment is the recorded description and is required. Attribute values
-are `str` or `u64`. Entity relations hold object values; statically named values
+are `str`, `u64`, or a handle to an anonymous relation declared with `entity(relation)`.
+Entity relations hold object values; statically named values
 such as `log.level:INFO` are the unusual case.
 `#[anonymous]` marks a relation whose values have no names, such as
 `log.statement`. A relation with named values also declares a module of the
@@ -185,8 +317,9 @@ entities! {
 struct Login<'a> { account: &'a str, method: &'a str }
 
 let login = session.new(Login { account: "Ada", method: "passkey" })?;
-info!("opened {}", login)?;
-info!("resumed {}", login)?;
+sprintr_prototype::start()?;
+info!("opened {}", login);
+info!("resumed {}", login);
 # Ok::<(), std::io::Error>(())
 ```
 
@@ -216,7 +349,16 @@ log.level = WARN
 
 ## Startup announcement
 
-Each caller-owned `Logger` begins its output with an `INFO` record announcing
+Call `start()` once for stdout or `logger.start()` for a caller-owned output.
+`logger.with_default(f)` selects that output for `f` on the current thread.
+Nested scopes restore the previous output on return or panic. Spawned threads
+use their own default; the scope does not follow a future across `.await`.
+Before startup, a logging call prints the message and an unstarted-SDK warning
+to stderr. Startup is fallible; a repeated explicit call returns the original
+outcome. After a partial startup failure, ordinary calls continue best-effort.
+Encoding and sink errors are diagnosed on stderr, not returned to instrumentation.
+
+Startup begins its output with an `INFO` record announcing
 the process and the library, followed by any collision warnings. Stdout announces
 once per process. Every emitted event has `thread` (the native unsigned thread
 ID) and `seq` (the record ID within that thread). A thread's first record is
@@ -237,7 +379,7 @@ entity. Its static fields are pre-encoded:
   "attrs": {"log.level": "INFO"},
   "refs": [{"account.name": {"$arg": 0}}],
   "msg": "hello {@account.name}, value {value:04x}",
-  "source": {"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}
+  "source": {"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":25,"column":17}
 }
 ```
 
@@ -341,27 +483,28 @@ recording performs zero library heap allocations. Declarations are resolved
 once per process, and first use assigns the statement's identity once;
 subsequent recording neither locks the registry nor re-encodes definitions.
 By default stdout uses the
-same approach with a per-thread scratch buffer, without global logger setup.
+same approach with a per-thread scratch buffer.
 Encoding happens before acquiring the stdout lock.
 
 Fixed stack storage avoids the initial heap-buffer allocation, but first-use
 definition tracking can still allocate. Bounded storage must fit the startup
 announcement; 2 KB is sufficient, and a smaller buffer fails loudly with
-`StorageFull` on the first record:
+`StorageFull` from `start()` if the announcement does not fit:
 
 ```rust
 use sprintr_prototype::{Logger, buffer::StackBuffer, info};
 
 let mut logger = Logger::with_buffer(std::io::sink(), StackBuffer::<2048>::new());
+logger.start()?;
 let name = "Ada";
 let value = 42u32;
-info!("hello {name:s}, value {value:04x}", logger: logger)?;
+logger.with_default(|| info!("hello {name:s}, value {value:04x}"));
 # Ok::<(), std::io::Error>(())
 ```
 
 `HeapBuffer::with_capacity_and_limit` also permits an explicit record-size
 limit. Limits count the complete encoded line, including JSON escaping and
-the newline. An oversized record returns `StorageFull` without writing any
+the newline. An oversized event produces a diagnostic without writing any
 of it to the output, and the buffer can be reused. No positional arguments
 are silently dropped and no JSON strings are byte-truncated.
 
@@ -375,7 +518,7 @@ contention, and retained-memory policies still need production evaluation.
 ## Format subset
 
 - `:s` captures an `AsRef<str>` value. Its stored placeholder omits `:s`.
-- A bare `{}` or `{login}` borrows an anonymous object handle. The argument
+- A bare `{}` borrows a structured value or an anonymous object handle. For a handle the argument
   on the wire is a reference; playback displays the resolved object as JSON.
 - `{}` also captures a value when the positional argument uses a declared
   attribute handle, such as `account_name = name`; its stored label is
@@ -390,7 +533,7 @@ contention, and retained-memory policies still need production evaluation.
   expressions; attributed labels use canonical names. All placeholders consume
   `args` in occurrence order, not by name lookup.
 
-Bare `{name}` string capture, signed integers, floats, `Debug`, named argument
+Bare `{name}` string capture in a log statement, signed integers, floats, named argument
 overrides, and indexed placeholders are deliberately unsupported. Bind explicit
 expressions containing braces or colons to local variables first, so their
 stored labels cannot be mistaken for placeholder syntax. Invalid source formats,

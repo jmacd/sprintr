@@ -19,9 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     match (command.as_deref(), modules) {
         (Some("record"), modules) => {
+            sprintr_prototype::start()?;
             let value = 42u32;
             for name in ["Ada", "Grace"] {
-                info!("hello {}, value {value:04x}", account_name = name)?;
+                info!("hello {}, value {value:04x}", account_name = name);
             }
             if let Some(path) = modules {
                 let map = ModuleMap::current_process()?;

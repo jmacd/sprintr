@@ -252,8 +252,8 @@ use super::entity::{my_session};
 
 let handle = my_session.new(session_data)?;
 
-info!("new session {}", handle)?;
-info!("resumed {}", handle)?;
+info!("new session {}", handle);
+info!("resumed {}", handle);
 ```
 
 Logging entity values has the effect of placing a reference to the
@@ -277,16 +277,30 @@ the body, as a list.
 }
 ```
 
-### Next milestone: structured arguments
+### Structured arguments
 
 Building on [open-telemetry/otel-arrow#4450](https://github.com/open-telemetry/otel-arrow/pull/4450),
-a Rust struct should be able to hold entity handles and implement a formatting
-trait. Its implementation can describe a value with `structured!`-style
+a Rust struct can hold entity handles and implement `StructuredValue`.
+Its implementation can supply named fields directly or use `structured!` for
 formatting: positional arguments, optionally bound to declared attributes,
 just as in a logging statement. A positional argument can itself be another
 structured value. The reader needs both the typed fields and their formatting
 instructions; producing a formatted string during capture loses the fields.
-The Rust API and the encoding of nested formatting instructions are still open.
+Named objects carry a `struct.name:<type>` association in the outer `refs`.
+Formatted arguments are positional arrays with a `struct.encode:<type>_<hash>`
+association at their path. Each output emits that named encoder definition
+once per thread, committing first use after a successful write. Its `msg`
+is the canonical stored format, `name` the full Rust type (including generic
+arguments), and `file` and `line` locate the `structured!` invocation. Replay
+compiles the definition once and reuses it. `:?` captures Rust `Debug` text.
+
+A type that represents an entity directly delegates `encode` to its handle:
+its argument slot holds only a `$ref` to the definition. A type that contains
+an entity can format it with `structured!("handling {}", active_session = self.handle)`.
+The encoder reference targets the positional array; `active_session`'s
+attribute name targets the child slot. The `$ref` in that slot identifies the
+entity and its defining record. Explicit entity identity entries in `refs`
+are for literal values whose identity the argument data does not convey.
 
 The outer record owns `refs` and `defs` for the whole traversal. `args` holds
 the application data; attribute and entity associations point into it rather
@@ -297,7 +311,7 @@ itself can be encoded like this (record excerpt):
 ```json
 {
   "args": [{"name": "root", "next": {"$ref": "#/args/0"}}],
-  "refs": [{"node:7": "#/args/0"}, {"node.name": "#/args/0/name"}]
+  "refs": [{"struct.name:Node": "#/args/0"}]
 }
 ```
 
@@ -325,8 +339,8 @@ sequence on the receiving thread would select the wrong record. The export
 API and qualified wire spelling remain to be designed.
 
 The current JSON prototype instead defines an entity on first use per output
-and thread, and retains those locations in the writer. Explicit export and
-nested structured arguments are design goals, not current wire behavior.
+and thread, and retains those locations in the writer. Explicit export remains
+a design goal; nested structured arguments use the current entity addresses.
 
 Each emitted record carries `thread` (the OS-assigned `log.thread` ID) and
 `seq` (the `log.record` ID within that thread, starting at zero). The first record on
@@ -350,12 +364,12 @@ The `refs` section of the body is an array of single-entry maps.
 Ordinary references have the form `{ "<attribute-or-entity-name>": "<fragment>" }`. Each entry
 associates a name with the location of its value in the containing
 record's `args` or `defs`, including nested values. Since these values
-are always reference fragments, no `$ref` wrapper is needed. For example, an anonymous entity
-whose value is stored directly in `args[0]` is referenced as follows:
+are always reference fragments, no `$ref` wrapper is needed. For example, a
+literal session object in `args[0]` can be labeled with its identity:
 
 ```json
 {
-  "args": [4],
+  "args": [{"name": "Ada"}],
   "refs": [
     { "my_session:12345678": "#/args/0" }
   ]
@@ -521,6 +535,13 @@ its wire representation remain to be specified.
 
 ## Startup
 
+Startup is explicit and fallible. Before `start()`, instrumentation writes a
+warning and the event to stderr. After a startup attempt it records best-effort;
+ordinary logging always returns `()` and never initiates or retries startup.
+Logger selection is scoped to the current thread. `logger.with_default(f)`
+installs a borrowed logger for synchronous calls under `f`, restoring the
+previous selection on exit. Instrumentation has no logger argument.
+
 The initial log record of each output announces the process and the
 logging library, and contains the definitions of the relations and
 entities it references, bootstrapping the graph from the presumed
@@ -635,14 +656,15 @@ use sprintr_prototype::info;
 let name = "Ada";
 let value = 42u32;
 
-info!("hello {:s}, value {:04x}", name, value)?;
+sprintr_prototype::start()?;
+info!("hello {:s}, value {:04x}", name, value);
 ```
 
 The equivalent implicit-capture form is
-`info!("hello {name:s}, value {value:04x}")?`.
-Both return output errors to the caller. The prototype defaults to
-JSON Lines on stdout; an optional `logger:` argument selects a
-caller-owned writer. `info!` encodes borrowed arguments directly into
+`info!("hello {name:s}, value {value:04x}")`.
+Both return `()`. The prototype defaults to
+JSON Lines on stdout; a scoped default selects a caller-owned writer.
+`info!` encodes borrowed arguments directly into
 reusable storage, using a statically encoded format prefix. Heap and
 fixed stack buffers reuse the original implementation's storage and
 rollback approach. Bounded buffers reject a whole record on overflow,
@@ -702,7 +724,7 @@ attributes! {
 
 let value = 42u32;
 for name in ["Ada", "Grace"] {
-    info!("hello {}, value {value:04x}", account_name = name)?;
+    info!("hello {}, value {value:04x}", account_name = name);
 }
 ```
 
@@ -712,7 +734,7 @@ Each callsite defines an anonymous `log.statement` entity whose value
 contains static `attrs`, argument bindings in `refs`, `msg`, and `source`:
 
 ```json
-{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}}
+{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":25,"column":17}}
 ```
 
 `log.relation:log.statement` describes anonymous object entities;
@@ -724,7 +746,7 @@ first event bootstraps only the remaining definitions. The next event carries
 its own address but reuses the statement:
 
 ```json
-{"seq":1,"stmt":2,"thread":88888,"ts":1704067200123456789,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":24,"column":17}}}}
+{"seq":1,"stmt":2,"thread":88888,"ts":1704067200123456789,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Ada",42],"defs":{"log.relation:account.name":{"kind":"attribute","type":"string","desc":"Account name"},"log.statement:2":{"attrs":{"log.level":"INFO"},"refs":[{"account.name":{"$arg":0}}],"msg":"hello {@account.name}, value {value:04x}","source":{"mod":"json_lines","file":"crates/sprintr-prototype/examples/json_lines.rs","line":25,"column":17}}}}
 {"seq":2,"stmt":2,"thread":88888,"ts":1704067200124567890,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Grace",42]}
 ```
 
