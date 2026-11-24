@@ -27,7 +27,7 @@ use runtime::{Collision, runtime};
 use statement::Statement;
 use stream::StreamState;
 
-pub use context::{ContextEntity, EntityContext};
+pub use context::{Context, ContextEntity, EntityContext};
 pub use declare::{Attribute, Entity, Named};
 pub use entity::BorrowedArgument as Value;
 pub use entity::EntityHandle;

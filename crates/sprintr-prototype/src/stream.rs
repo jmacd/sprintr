@@ -7,7 +7,6 @@ use crate::runtime::runtime;
 use crate::statement::{EncoderCache, NamedEncoder, Resolved};
 use crate::structured::{Encoder, Scratch};
 use crate::{STACK, STATEMENT_PREFIX, json_error};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
@@ -32,15 +31,14 @@ pub(crate) struct Accepted {
 
 /// Only first use allocates. Nothing is installed until the whole line is accepted.
 #[derive(Default)]
-pub(crate) struct Pending<'a> {
+pub(crate) struct Pending {
     schema: Vec<usize>,
     encoders: Vec<std::sync::Arc<NamedEncoder>>,
-    // Root arguments outlive assembly. Only a newly introduced handle supplied
-    // by a nested formatter might disappear before we reach the defs section.
-    entities: Vec<(usize, u64, Cow<'a, [u8]>)>,
+    // Keep first-use payloads alive even when a formatter creates a temporary.
+    entities: Vec<EntityHandle>,
 }
 
-impl<'a> Pending<'a> {
+impl Pending {
     pub(crate) fn encoder(
         &mut self,
         state: &Accepted,
@@ -65,7 +63,6 @@ impl<'a> Pending<'a> {
         state: &Accepted,
         record: Record<'_>,
         entity: &EntityHandle,
-        member: impl FnOnce() -> Cow<'a, [u8]>,
     ) -> u64 {
         if let Some(&seq) = state
             .locations
@@ -76,10 +73,10 @@ impl<'a> Pending<'a> {
         if !self
             .entities
             .iter()
-            .any(|(relation, id, _)| *relation == entity.relation && *id == entity.id)
+            .any(|e| e.relation == entity.relation && e.id == entity.id)
         {
             self.schema(state, entity.relation);
-            self.entities.push((entity.relation, entity.id, member()));
+            self.entities.push(entity.clone());
         }
         record.seq
     }
@@ -89,10 +86,10 @@ impl<'a> Pending<'a> {
         state
             .encoders
             .extend(self.encoders.into_iter().map(|e| (record.thread.id, e.id)));
-        for (relation, id, _) in self.entities {
+        for entity in self.entities {
             state
                 .locations
-                .insert((record.thread.id, relation, id), record.seq);
+                .insert((record.thread.id, entity.relation, entity.id), record.seq);
         }
     }
 }
@@ -130,9 +127,7 @@ impl StreamState {
             }
             let thread = record.thread.id;
             pending.schema(state, record.record_relation);
-            pending.entity(state, record, record.thread, || {
-                Cow::Borrowed(&record.thread.member)
-            });
+            pending.entity(state, record, record.thread);
             self.scratch.clear();
             buffer.clear();
             buffer.try_atomic(|buf| {
@@ -143,14 +138,15 @@ impl StreamState {
                 )?;
                 serde_json::to_writer(&mut *buf, stack).map_err(json_error)?;
                 for binding in bindings {
+                    let binding = binding.data();
                     pending.schema(state, binding.attribute);
-                    match binding.definition {
-                        ContextDefinition::Named(index) => {
+                    match &binding.definition {
+                        ContextDefinition::Named { index, .. } => {
                             pending.schema(state, binding.relation);
-                            pending.schema(state, index);
+                            pending.schema(state, *index);
                         }
                         ContextDefinition::Anonymous(handle) => {
-                            pending.entity(state, record, handle, || Cow::Borrowed(&handle.member));
+                            pending.entity(state, record, handle);
                         }
                     }
                     buf.write_all(b",")?;
@@ -172,9 +168,9 @@ impl StreamState {
                         buf.write_all(&runtime().definitions[index].bytes)?;
                         sep = b",";
                     }
-                    for (_, _, member) in &pending.entities {
+                    for entity in &pending.entities {
                         buf.write_all(sep)?;
-                        buf.write_all(member)?;
+                        buf.write_all(&entity.payload.member)?;
                         sep = b",";
                     }
                     for encoder in &pending.encoders {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sprintr_prototype::buffer::{HeapBuffer, StackBuffer};
-use sprintr_prototype::{Logger, attributes, entities, info};
+use sprintr_prototype::{Context, Logger, attributes, entities, info};
 use std::io;
 
 /// Scenario: a statement and its storage have been initialized before repeated recording.
@@ -110,6 +110,43 @@ fn repeated_structured_recording_does_not_allocate() {
             for _ in 0..128 {
                 emit();
             }
+        })
+    });
+    assert_eq!(measured.count_total, 0, "{measured:?}");
+}
+
+/// Scenario: a worker repeatedly detaches and re-enters a prepared multi-role bag.
+/// Guarantees: neither capturing the snapshot nor warm event encoding copies the bag.
+#[test]
+fn warmed_detached_context_does_not_allocate() {
+    entities! {
+        /// Local work item
+        #[anonymous]
+        work = "work";
+    }
+    attributes! {
+        /// Current work item
+        current: entity(work) = "work.current";
+        /// Parent work item
+        parent: entity(work) = "work.parent";
+    }
+    let handle = work.new(serde_json::json!({})).unwrap();
+    let mut ctx = Context::root();
+    ctx.insert(current.context(&handle).unwrap());
+    ctx.insert(parent.context(&handle).unwrap());
+    let mut logger = Logger::new(io::sink());
+    logger.start().unwrap();
+    fn emit() {
+        info!("working");
+    }
+    let measured = logger.with_default(|| {
+        ctx.in_scope(|| {
+            emit();
+            allocation_counter::measure(|| {
+                for _ in 0..128 {
+                    Context::current().in_scope(emit);
+                }
+            })
         })
     });
     assert_eq!(measured.count_total, 0, "{measured:?}");

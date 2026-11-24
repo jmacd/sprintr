@@ -255,7 +255,7 @@ Declare an entity-valued attribute for each role. Prepare its association once
 and enter it around ordinary application code:
 
 ```rust
-use sprintr_prototype::{attributes, entities, info, start};
+use sprintr_prototype::{Context, attributes, entities, info, start};
 
 entities! {
     /// Application session
@@ -267,11 +267,17 @@ attributes! {
     active_session: entity(session) = "request.session";
 }
 
+struct Request { context: Context }
 fn serve() { info!("request received"); }
 
 start()?;
-let login = session.new(serde_json::json!({"account":"Ada"}))?;
-active_session.context(&login)?.in_scope(serve);
+let request = {
+    let login = session.new(serde_json::json!({"account":"Ada"}))?;
+    let mut context = Context::root();
+    context.insert(active_session.context(&login)?);
+    Request { context }
+};
+request.context.in_scope(serve);
 # Ok::<(), std::io::Error>(())
 ```
 
@@ -282,10 +288,15 @@ definitions in the stream. Positional argument references still address a
 specific record and JSON Pointer. A declared named entity works the same way,
 for example `deployment.context(&environment::PRODUCTION)?`.
 
-Distinct roles compose. An inner scope for the same role temporarily replaces
-its value; returning or unwinding restores the outer value. Like the scoped
-logger, context is synchronous and thread-local. Selecting another logger on
-the thread keeps the context and introduces its definitions on that output.
+`Context::current()` detaches an owned snapshot, or returns an empty root outside
+a scope. Clones share prepared, immutable bindings; inserting a replacement or
+removing a role affects only the edited snapshot. Use `context.get(&active_session)?`
+to inspect a role and `context.remove(&active_session)?` to remove it.
+`context.in_scope(f)` replaces the *whole* current bag until `f` returns or
+unwinds; `Context::root().in_scope(f)` therefore clears all inherited roles.
+For a one-role overlay, `active_session.context(&login)?.in_scope(f)` retains
+the other current roles. Neither operation changes the selected logger.
+Contexts can be stored and re-entered on their owning thread.
 
 ## Declaring attributes and entities
 
@@ -367,8 +378,9 @@ includes `"session:1":{"account":"Ada","method":"passkey"}` in `defs`.
 Both events have `"args":[{"$ref":"1#/defs/session:1"}]`. The number before
 `#` selects record 1 **on the event's thread**; the fragment selects that
 record's definition. Playback displays the resolved object, not the pointer.
-Another output or thread defines the object on first use there, so a short
-reference never needs another stream.
+Another output on the same thread defines the object on first use there.
+Local handles share immutable bytes through `Rc`; a transferable origin
+reference is planned separately.
 
 ### Collisions
 

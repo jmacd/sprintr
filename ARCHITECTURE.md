@@ -583,6 +583,12 @@ the same rule. `log.level` remains a static association on the statement.
 Different attribute keys coexist; the innermost binding of one key wins until
 scope exit. Context follows the thread across logger scopes, not spawned tasks.
 
+`Context::current()` detaches a storable, thread-local snapshot. Editing the
+snapshot leaves the installed bag and other stored copies unchanged. Activating
+a `Context` replaces the whole bag, including when the replacement is an empty
+root. The one-binding scope instead overlays a role on a snapshot of the current
+bag. Both restore their predecessor on unwind.
+
 Each local logging scope defines a sequence of log records, emitted in
 ascending sequence order. The OTel instrumentation scope carries the
 defining attributes, and its associated records are grouped under that
@@ -617,9 +623,9 @@ there is no separate link event, `add_link` call, or change of parent.
 Build this in five increments. Each keeps the flat JSON Lines stream usable
 by its reader.
 
-1. **Own the bag; scope only its activation.** Start in
-   [`context.rs`](crates/sprintr-prototype/src/context.rs). Today's `EntityContext<'a>` borrows
-   one binding. Introduce an owned, mutable, `!Send` `Context` with an empty
+1. **Own the bag; scope only its activation (implemented).** See
+   [`context.rs`](crates/sprintr-prototype/src/context.rs). The owned, mutable,
+   `!Send` `Context` has an empty
    root, typed lookup, insert/replace, and remove. Own the local handles
    (using `Rc` where ownership is shared) and prepare bindings when the bag
    changes. Allow a context to be stored in a struct, accessed as current,

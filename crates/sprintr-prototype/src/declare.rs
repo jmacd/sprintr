@@ -85,7 +85,8 @@ pub struct Attribute<T: ?Sized> {
     meta: RelationMeta,
     label: &'static [u8],
     reference: &'static [u8],
-    value_type: PhantomData<T>,
+    // The static declaration accepts T; it never owns a thread-local value.
+    value_type: PhantomData<fn(&T)>,
 }
 
 impl<T: ?Sized> Attribute<T> {

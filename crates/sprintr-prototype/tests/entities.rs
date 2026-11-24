@@ -70,15 +70,16 @@ fn defines_and_reuses_application_values() {
     assert!(renderer.render(reuse).is_ok());
 }
 
-/// A short pointer must resolve even after moving a logger or changing sinks.
+/// A logger can move across threads; each handle stays on its owning thread.
 #[test]
-fn each_thread_and_output_defines_the_handle_locally() {
+fn local_handles_resolve_after_moving_a_logger_or_changing_sinks() {
     let login = session.new(json!({"account":"Ada"})).unwrap();
     let mut logger = started_logger();
     emit(&mut logger, &login);
     let worker = std::thread::scope(|s| {
         s.spawn(|| {
-            emit(&mut logger, &login);
+            let local = session.new(json!({"account":"Ada"})).unwrap();
+            emit(&mut logger, &local);
             gettid::gettid()
         })
         .join()
@@ -94,12 +95,14 @@ fn each_thread_and_output_defines_the_handle_locally() {
     let key = a.defs.keys().find(|k| k.starts_with("session:")).unwrap();
     assert_ne!(a.attrs[THREAD], b.attrs[THREAD]);
     assert_eq!((b.attrs[THREAD], b.attrs[RECORD]), (worker, 0));
-    assert!(b.defs.contains_key(key));
+    let worker_key = b.defs.keys().find(|k| k.starts_with("session:")).unwrap();
+    assert_ne!(key, worker_key);
+    assert!(!b.defs.contains_key(key));
     assert!(
         b.defs
             .contains_key(&format!("log.thread:{}", b.attrs[THREAD]))
     );
-    assert_eq!(target(b), format!("0#/defs/{key}"));
+    assert_eq!(target(b), format!("0#/defs/{worker_key}"));
     assert_eq!(target(c), target(a));
     assert!(c.defs.is_empty());
     assert_eq!(

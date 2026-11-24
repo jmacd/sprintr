@@ -6,7 +6,6 @@ use crate::statement::{EncoderCache, NestedTemplate};
 use crate::stream::{Accepted, Pending};
 use crate::{Value, json_error, schema};
 use serde::{Serialize, Serializer};
-use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 
@@ -131,22 +130,22 @@ impl Serialize for DebugText<'_> {
     }
 }
 
-pub(crate) struct Encoder<'a, 'event> {
+pub(crate) struct Encoder<'a> {
     buf: &'a mut dyn Write,
     scratch: &'a mut Scratch,
     encoders: &'a mut EncoderCache,
     state: &'a Accepted,
-    pending: &'a mut Pending<'event>,
+    pending: &'a mut Pending,
     record: Record<'a>,
 }
 
-impl<'a, 'event> Encoder<'a, 'event> {
+impl<'a> Encoder<'a> {
     pub fn new(
         buf: &'a mut dyn Write,
         scratch: &'a mut Scratch,
         encoders: &'a mut EncoderCache,
         state: &'a Accepted,
-        pending: &'a mut Pending<'event>,
+        pending: &'a mut Pending,
         record: Record<'a>,
     ) -> Self {
         Self {
@@ -159,22 +158,10 @@ impl<'a, 'event> Encoder<'a, 'event> {
         }
     }
 
-    pub fn args(&mut self, args: &[Value<'event>]) -> io::Result<()> {
+    pub fn args(&mut self, args: &[Value<'_>]) -> io::Result<()> {
         for (i, &arg) in args.iter().enumerate() {
             if i != 0 {
                 self.buf.write_all(b",")?;
-            }
-            let entity = match arg {
-                Value::Entity(e) => Some(e),
-                Value::EntityArgument(attr, e) => Some(attr.check(e)?),
-                _ => None,
-            };
-            if let Some(e) = entity {
-                let seq = self
-                    .pending
-                    .entity(self.state, self.record, e, || Cow::Borrowed(&e.member));
-                self.entity_ref(e, seq)?;
-                continue;
             }
             if matches!(arg, Value::Structured(_)) {
                 self.scratch.path.clear();
@@ -194,10 +181,8 @@ impl<'a, 'event> Encoder<'a, 'event> {
             }
             Value::EntityArgument(attr, e) => self.value(Value::Entity(attr.check(e)?)),
             Value::Entity(e) => {
-                let seq = self
-                    .pending
-                    .entity(self.state, self.record, e, || Cow::Owned(e.member.to_vec()));
-                self.entity_ref(e, seq)
+                let seq = self.pending.entity(self.state, self.record, e);
+                write!(self.buf, "{{\"$ref\":\"{seq}{}\"}}", e.payload.fragment)
             }
             Value::Structured(value) => {
                 let address = std::ptr::from_ref(value).cast::<()>().addr();
@@ -249,10 +234,6 @@ impl<'a, 'event> Encoder<'a, 'event> {
         annotation(&mut self.scratch.refs, &self.scratch.path, key)
     }
 
-    fn entity_ref(&mut self, e: &EntityHandle, seq: u64) -> io::Result<()> {
-        write!(self.buf, "{{\"$ref\":\"{seq}{}\"}}", e.fragment)
-    }
-
     fn elements(&mut self, args: &[Value<'_>], bindings: &[(usize, usize)]) -> io::Result<()> {
         self.buf.write_all(b"[")?;
         let parent = self.scratch.path.len();
@@ -287,12 +268,12 @@ fn annotation(refs: &mut Vec<u8>, path: &str, key: &str) -> io::Result<()> {
     Ok(())
 }
 
-struct Slot<'a, 'b, 'event> {
-    encoder: &'a mut Encoder<'b, 'event>,
+struct Slot<'a, 'b> {
+    encoder: &'a mut Encoder<'b>,
     written: Option<bool>,
 }
-impl Slot<'_, '_, '_> {
-    fn one(&mut self, f: impl FnOnce(&mut Encoder<'_, '_>) -> io::Result<()>) -> io::Result<()> {
+impl Slot<'_, '_> {
+    fn one(&mut self, f: impl FnOnce(&mut Encoder<'_>) -> io::Result<()>) -> io::Result<()> {
         if self.written.replace(false).is_some() {
             return Err(invalid("formatter wrote more than one value"));
         }
@@ -301,7 +282,7 @@ impl Slot<'_, '_, '_> {
         Ok(())
     }
 }
-impl ValueWriter for Slot<'_, '_, '_> {
+impl ValueWriter for Slot<'_, '_> {
     fn entity(&mut self, entity: &EntityHandle) -> io::Result<()> {
         self.one(|e| e.value(Value::Entity(entity)))
     }

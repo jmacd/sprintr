@@ -6,13 +6,19 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::cell::Cell;
 use std::io;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// An immutable snapshot of an application object. Logging borrows the handle;
-/// the first use in each output/thread defines it, later uses refer back to it.
+/// A thread-local identity for an immutable application object. Clones retain
+/// the same identity and encoded payload without copying the object.
+#[derive(Clone)]
 pub struct EntityHandle {
     pub(crate) id: u64,
     pub(crate) relation: usize,
+    pub(crate) payload: Rc<EntityPayload>,
+}
+
+pub(crate) struct EntityPayload {
     pub(crate) key: String,
     pub(crate) fragment: String,
     pub(crate) member: Box<[u8]>,
@@ -49,9 +55,11 @@ impl EntityHandle {
         Ok(Self {
             id,
             relation,
-            fragment: sprintr_message::definition_fragment(&key),
-            key,
-            member: member.into(),
+            payload: Rc::new(EntityPayload {
+                fragment: sprintr_message::definition_fragment(&key),
+                key,
+                member: member.into(),
+            }),
         })
     }
 }
