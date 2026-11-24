@@ -604,6 +604,84 @@ locally after recording, or relocate the PCs with a bulk module map and
 matching debug artifacts from that run. Each concept is described through a relation rooted in
 `log.relation`. Placement of this context in OTel resources is deferred.
 
+### Work plan: detachable contexts and spans
+
+The acceptance case is a worker in span A logging
+`info!("we ran into a lock {holder}")`, where `holder` refers to a context
+in span B. The producer
+writes one event. From A, the reader can find the holder; from B, it can find
+the event that mentioned it. The argument retains its `holder` role. With no
+current span, the explicit reference to B still works. The `$ref` is the link:
+there is no separate link event, `add_link` call, or change of parent.
+
+Build this in five increments. Each keeps the flat JSON Lines stream usable
+by its reader.
+
+1. **Own the bag; scope only its activation.** Start in
+   [`context.rs`](crates/sprintr-prototype/src/context.rs). Today's `EntityContext<'a>` borrows
+   one binding. Introduce an owned, mutable, `!Send` `Context` with an empty
+   root, typed lookup, insert/replace, and remove. Own the local handles
+   (using `Rc` where ownership is shared) and prepare bindings when the bag
+   changes. Allow a context to be stored in a struct, accessed as current,
+   installed as a whole, detached, and re-entered. Preserve the existing
+   one-binding scope as a convenience. **Done when:** entering an empty root
+   hides outer baggage without changing the logger or record counter; nested
+   scopes restore on return and unwind. Re-entering a stored context reflects
+   its edits; earlier records keep the values they observed.
+
+2. **Give creation an address.** Add a typed process-local record address
+   to `sprintr-message` and an internal write path that returns that address
+   only after the sink accepts the record. Use it for `context!("new {id}")`:
+   reuse the normal statement template, arguments, timestamp, and definitions
+   to record creation and return a detached context. Creating an empty bag,
+   recording its origin, and entering it are distinct operations. **Done
+   when:** re-entering never emits another start, and a rejected write or
+   pre-start stderr preview never publishes a reference to a nonexistent
+   record. Ordinary instrumentation stays infallible.
+
+3. **Implement `span!` and its lifecycle.** A start statement supplies the
+   span's formatted name; its event records the arguments, attributes, start
+   time, and parent. A root's `span.start:<spanID>` and
+   `trace.start:<traceID>` identify the same start record. A child inherits
+   the trace root and gets its own span ID and start record. Enter/exit
+   selects the context; closing the span emits its own end statement exactly
+   once, referring to the start. Decide explicit close versus last-owner drop
+   here; a stored reference to a span is not a lifecycle owner. **Done when:**
+   a span can be entered twice and closed once, child parentage survives
+   replay, and consumers can compute duration from the two timestamps.
+
+4. **Promote references and connect events across workers.** Export an
+   immutable `Send + Sync` reference backed by `Arc`, leaving the mutable bag
+   on its owning thread. Reuse an accepted origin; for a pending local entity
+   that needs an origin, record creation on the originating thread first.
+   Accept both local and exported contexts as ordinary log arguments. For
+   example, `log.thread:42/span.start:17` selects **record sequence 17** on
+   thread 42, not OTel span ID 17. Specify and exercise the corresponding
+   record and detached-context targets in the encoder and reader together.
+   **Done when:** the lock-holder case works across threads and outputs, and
+   one event can reference several contexts without merging their baggage or
+   copying their records. Index the event from each context by the same event
+   address. A valid target from another, not-yet-loaded stream is unresolved;
+   a malformed address is an error.
+
+5. **Carry propagation state; leave transport policy separate.** Keep current
+   trace flags and `tracestate` directly available alongside the span and
+   trace anchors. An amendment records the change and updates the owner's
+   state for subsequent children and exports. All other scoped entity roles
+   are local baggage. **Done when:** a child created before an amendment and
+   one created after it observe the corresponding states without reading the
+   log; an already exported snapshot stays unchanged. In a later transport
+   milestone, extract onto an explicit base context and inject from a selected
+   context. Plain W3C IDs must work without a sprintr record address. Defer
+   cross-process qualification in `tracestate` and baggage selection to that
+   milestone.
+
+**Performance gate:** extend the existing allocation checks to warmed context
+logging, including an explicit holder reference. Keep process-wide locks,
+atomic ownership, and copying whole bags off the ordinary local event path;
+measure mutation, first use, and export separately in CI. Task-local async
+attachment, durable record retrieval, and OTLP encoding remain later work.
+
 ## Application
 
 ### Graph navigation
