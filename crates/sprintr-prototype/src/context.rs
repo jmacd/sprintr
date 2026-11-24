@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::runtime::runtime;
-use crate::{Attribute, EntityHandle, Named, json_error};
+use crate::{Attribute, EntityHandle, Named, RecordAddress, json_error};
 use std::io;
 use std::rc::Rc;
 
@@ -127,6 +127,7 @@ enum Bindings {
 #[derive(Clone, Default)]
 pub struct Context {
     bindings: Bindings,
+    origin: Option<RecordAddress>,
 }
 
 scoped_tls_hkt::scoped_thread_local!(static CURRENT: Context);
@@ -136,7 +137,18 @@ impl Context {
     pub const fn root() -> Self {
         Self {
             bindings: Bindings::Empty,
+            origin: None,
         }
+    }
+
+    /// Address of this snapshot's `context!` creation record, if one was accepted.
+    pub fn origin(&self) -> Option<RecordAddress> {
+        self.origin
+    }
+
+    pub(crate) fn with_origin(mut self, origin: Option<RecordAddress>) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Detach a snapshot of the active bindings, or an empty root outside any scope.

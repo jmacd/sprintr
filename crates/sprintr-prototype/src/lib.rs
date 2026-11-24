@@ -33,9 +33,9 @@ pub use entity::BorrowedArgument as Value;
 pub use entity::EntityHandle;
 pub use sprintr_message::{
     Argument, ArgumentBinding, ContextRef, Definition, EncodeDefinition, Message, RECORD, RELATION,
-    RELATION_PREFIX, RelationDefinition, RelationKind, RelationType, Renderer, SOURCE, STACK,
-    STATEMENT, STATEMENT_PREFIX, STRUCT_ENCODE, StatementSource, StatementTemplate, THREAD, format,
-    format::FormatError,
+    RELATION_PREFIX, RecordAddress, RelationDefinition, RelationKind, RelationType, Renderer,
+    SOURCE, STACK, STATEMENT, STATEMENT_PREFIX, STRUCT_ENCODE, StatementSource, StatementTemplate,
+    THREAD, format, format::FormatError,
 };
 pub use structured::{StructuredValue, ValueWriter};
 
@@ -270,6 +270,19 @@ macro_rules! error {
     };
 }
 
+/// Record the creation of a detached context using the current bindings.
+/// The returned [`Context`] has its own [`Context::origin`] if the output
+/// accepted its creation record. Creating it does not enter it.
+#[macro_export]
+macro_rules! context {
+    ($($input:tt)*) => {
+        $crate::__private::created_context(
+            $crate::Context::current(),
+            $crate::__record!($crate; [$crate::schema::log_kind::CONTEXT_START]; $($input)*)
+        )
+    };
+}
+
 /// A synchronous, caller-owned JSON Lines writer.
 pub struct Logger<W, B = HeapBuffer> {
     writer: W,
@@ -315,17 +328,19 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
         statement: &'static Statement,
         stack: io::Result<&[u64]>,
         arguments: &[BorrowedArgument<'_>],
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<RecordAddress>> {
         if self.state.startup.is_none() {
             return unstarted(statement, arguments);
         }
-        self.state.write_compiled(
-            &mut self.writer,
-            &mut self.buffer,
-            statement.resolve()?,
-            stack?,
-            arguments,
-        )
+        self.state
+            .write_compiled(
+                &mut self.writer,
+                &mut self.buffer,
+                statement.resolve()?,
+                stack?,
+                arguments,
+            )
+            .map(Some)
     }
 
     /// Attempt startup once. Repeated calls return the original outcome.
@@ -367,7 +382,10 @@ fn startup_result(result: &io::Result<()>) -> io::Result<()> {
         .map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
 
-fn unstarted(statement: &'static Statement, args: &[BorrowedArgument<'_>]) -> io::Result<()> {
+fn unstarted(
+    statement: &'static Statement,
+    args: &[BorrowedArgument<'_>],
+) -> io::Result<Option<RecordAddress>> {
     use std::cell::RefCell;
     thread_local! { static FALLBACK: RefCell<()> = const { RefCell::new(()) }; }
     FALLBACK
@@ -393,12 +411,17 @@ fn unstarted(statement: &'static Statement, args: &[BorrowedArgument<'_>]) -> io
             writeln!(
                 io::stderr().lock(),
                 "sprintr: SDK has not been started; {text}"
-            )
+            )?;
+            Ok(None)
         })
         .map_err(|_| io::Error::other("pre-start logging unavailable"))?
 }
 
-type Dispatch<'scope> = dyn Fn(&'static Statement, io::Result<&[u64]>, &[BorrowedArgument<'_>]) -> io::Result<()>
+type Dispatch<'scope> = dyn Fn(
+        &'static Statement,
+        io::Result<&[u64]>,
+        &[BorrowedArgument<'_>],
+    ) -> io::Result<Option<RecordAddress>>
     + 'scope;
 scoped_tls_hkt::scoped_thread_local!(static CURRENT: for<'a> &'a Dispatch<'a>);
 
@@ -485,7 +508,9 @@ pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
 
 #[doc(hidden)]
 pub mod __private {
-    use super::{HeapBuffer, Logger, StreamState, startup_result, unstarted};
+    use super::{
+        Context, HeapBuffer, Logger, RecordAddress, StreamState, startup_result, unstarted,
+    };
     pub use crate::declare::{Declaration, RelationMeta};
     pub use crate::entity::BorrowedArgument;
     pub use crate::stack::capture_stack;
@@ -515,14 +540,27 @@ pub mod __private {
     static STDOUT_START: OnceLock<io::Result<()>> = OnceLock::new();
 
     #[inline]
-    pub fn report(result: io::Result<()>) {
-        if let Err(error) = result {
+    fn accepted_address(result: io::Result<Option<RecordAddress>>) -> Option<RecordAddress> {
+        result.unwrap_or_else(|error| {
             // stderr itself may be unavailable; instrumentation must still return.
             let _ = writeln!(
                 io::stderr().lock(),
                 "sprintr: could not record event: {error}"
             );
-        }
+            None
+        })
+    }
+
+    #[inline]
+    pub fn report(result: io::Result<Option<RecordAddress>>) {
+        let _ = accepted_address(result);
+    }
+
+    pub fn created_context(
+        snapshot: Context,
+        result: io::Result<Option<RecordAddress>>,
+    ) -> Context {
+        snapshot.with_origin(accepted_address(result))
     }
 
     mod sealed {
@@ -580,7 +618,7 @@ pub mod __private {
         statement: &'static Statement,
         stack: io::Result<&[u64]>,
         arguments: &[BorrowedArgument<'_>],
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<RecordAddress>> {
         if super::CURRENT.is_set() {
             return super::CURRENT.with(|dispatch| dispatch(statement, stack, arguments));
         }
@@ -598,7 +636,9 @@ pub mod __private {
                     buffer,
                     definitions,
                 } = &mut *state;
-                definitions.write_compiled(&mut io::stdout(), buffer, resolved, stack, arguments)
+                definitions
+                    .write_compiled(&mut io::stdout(), buffer, resolved, stack, arguments)
+                    .map(Some)
             })
             .map_err(|_| io::Error::other("stdout encoding buffer is unavailable"))?
     }

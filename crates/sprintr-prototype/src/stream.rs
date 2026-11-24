@@ -6,7 +6,7 @@ use crate::entity::{BorrowedArgument, EntityHandle, Record, with_record};
 use crate::runtime::runtime;
 use crate::statement::{EncoderCache, NamedEncoder, Resolved};
 use crate::structured::{Encoder, Scratch};
-use crate::{STACK, STATEMENT_PREFIX, json_error};
+use crate::{RecordAddress, STACK, STATEMENT_PREFIX, json_error};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
@@ -102,8 +102,13 @@ impl StreamState {
         statement: &Resolved,
         stack: &[u64],
         args: &[BorrowedArgument<'_>],
-    ) -> io::Result<()> {
-        with_record(|record| self.write_record(writer, buffer, statement, stack, args, record))
+    ) -> io::Result<RecordAddress> {
+        with_record(|record| {
+            let address = RecordAddress::new(record.thread.id, record.seq)
+                .ok_or_else(|| io::Error::other("native thread ID must be nonzero"))?;
+            self.write_record(writer, buffer, statement, stack, args, record)?;
+            Ok(address)
+        })
     }
 
     pub(crate) fn write_record(

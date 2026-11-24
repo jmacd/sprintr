@@ -635,15 +635,14 @@ by its reader.
    scopes restore on return and unwind. Re-entering a stored context reflects
    its edits; earlier records keep the values they observed.
 
-2. **Give creation an address.** Add a typed process-local record address
-   to `sprintr-message` and an internal write path that returns that address
-   only after the sink accepts the record. Use it for `context!("new {id}")`:
-   reuse the normal statement template, arguments, timestamp, and definitions
-   to record creation and return a detached context. Creating an empty bag,
-   recording its origin, and entering it are distinct operations. **Done
-   when:** re-entering never emits another start, and a rejected write or
-   pre-start stderr preview never publishes a reference to a nonexistent
-   record. Ordinary instrumentation stays infallible.
+2. **Give creation an address (implemented).** `context!` records a start
+   using the ordinary format grammar and marks the static statement template
+   with `log.kind:CONTEXT_START`. It snapshots the active bindings and returns
+   a detached context. Its fresh `RecordAddress` identifies the accepted start
+   by native thread and record sequence. A rejected write or pre-start stderr
+   preview leaves that origin unset, even if the creator has an origin.
+   Entering or copying the snapshot emits no extra start. The public macro
+   returns a `Context`, not a delivery result.
 
 3. **Implement `span!` and its lifecycle.** A start statement supplies the
    span's formatted name; its event records the arguments, attributes, start

@@ -34,6 +34,12 @@ crate::entities! {
     /// Named encoder for a positional structured argument
     pub struct_encode = "struct.encode";
 
+    /// Purpose of a statement in the event stream
+    pub log_kind = "log.kind" {
+        /// Creation of a detached instrumentation context
+        CONTEXT_START,
+    }
+
     /// Logging level
     pub log_level = "log.level" {
         /// Informational event
@@ -57,7 +63,9 @@ crate::attributes! {
 }
 
 /// Resolution order for sprintr's own declarations; not a reservation.
-pub(crate) static DECLARATIONS: [Declaration; 14] = [
+pub(crate) static DECLARATIONS: [Declaration; 16] = [
+    Declaration::Relation(log_kind.__meta()),
+    Declaration::Named(&log_kind::CONTEXT_START),
     Declaration::Relation(struct_name.__meta()),
     Declaration::Relation(struct_encode.__meta()),
     Declaration::Relation(log_statement.__meta()),

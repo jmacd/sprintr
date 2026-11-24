@@ -3,7 +3,7 @@
 mod common;
 
 use common::FailNth;
-use sprintr_prototype::{Logger, buffer::StackBuffer, error, info, replay, warn};
+use sprintr_prototype::{Logger, buffer::StackBuffer, context, error, info, replay, warn};
 use std::{env, io, process::Command};
 
 fn global_event(text: &str) {
@@ -31,6 +31,7 @@ fn exercise_outputs() {
 
     // Starting a caller-owned logger did not start stdout.
     global_event("global preview");
+    assert!(context!("preview context").origin().is_none());
     println!("START STDOUT");
     sprintr_prototype::start().unwrap();
     let mut scoped = common::started_logger();
@@ -38,6 +39,8 @@ fn exercise_outputs() {
         global_event("scoped parent");
         std::thread::spawn(|| {
             sprintr_prototype::start().unwrap();
+            let origin = context!("global context").origin().unwrap();
+            assert_eq!(origin.thread(), gettid::gettid());
             global_event("global accepted");
         })
         .join()
@@ -101,12 +104,12 @@ fn explicit_start_and_stderr_diagnostics() {
         .unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{stderr}");
-    for preview in ["local preview", "global preview"] {
+    for preview in ["local preview", "global preview", "preview context"] {
         assert!(stderr.contains(preview), "{stderr}");
     }
     assert_eq!(
         stderr.matches("has not been started").count(),
-        2,
+        3,
         "{stderr}"
     );
     assert!(
@@ -120,7 +123,7 @@ fn explicit_start_and_stderr_diagnostics() {
         .split_once("BEGIN OUTPUT\nSTART STDOUT\n")
         .expect("no stdout before start");
     let (stream, _) = stream.split_once("END OUTPUT").unwrap();
-    assert_eq!(common::lines(stream.as_bytes()).len(), 2);
+    assert_eq!(common::lines(stream.as_bytes()).len(), 3);
     let mut text = Vec::new();
     replay(stream.as_bytes(), &mut text).unwrap();
     let text = String::from_utf8(text).unwrap();

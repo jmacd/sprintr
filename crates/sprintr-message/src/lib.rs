@@ -502,6 +502,12 @@ impl Serialize for Message {
 }
 
 impl Message {
+    /// Validate the event identity and return its address within the originating
+    /// process. Self-contained records may be unaddressed.
+    pub fn address(&self) -> Result<Option<RecordAddress>, FormatError> {
+        event_identity(&self.attrs).map(|(_, address)| address)
+    }
+
     /// Validate a self-contained record. Stream-dependent events need a [`Renderer`].
     pub fn validate(&self) -> Result<(), FormatError> {
         self.render().map(|_| ())
@@ -677,10 +683,30 @@ fn statement_id(key: &str) -> Result<u64, FormatError> {
         .ok_or_else(|| FormatError(format!("invalid statement identity {key:?}")))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct RecordAddress {
-    thread: u64,
+/// A record's process-local identity: native thread ID and per-thread sequence.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RecordAddress {
+    thread: std::num::NonZeroU64,
     sequence: u64,
+}
+
+impl RecordAddress {
+    /// Sequence zero is valid; a native thread ID must be nonzero.
+    pub fn new(thread: u64, sequence: u64) -> Option<Self> {
+        Some(Self {
+            thread: std::num::NonZeroU64::new(thread)?,
+            sequence,
+        })
+    }
+
+    /// Native ID of the thread that recorded the event.
+    pub fn thread(self) -> u64 {
+        self.thread.get()
+    }
+    /// Record sequence on that thread, shared across its outputs.
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
 }
 
 struct StoredEntity {
@@ -699,9 +725,10 @@ fn event_identity(
         .ok_or_else(|| FormatError(format!("expected a nonzero {STATEMENT} reference")))?;
     let address = match (attrs.get(THREAD), attrs.get(RECORD)) {
         (None, None) if attrs.len() == 1 => None,
-        (Some(&thread), Some(&sequence)) if attrs.len() == 3 && thread != 0 => {
-            Some(RecordAddress { thread, sequence })
-        }
+        (Some(&thread), Some(&sequence)) if attrs.len() == 3 => Some(
+            RecordAddress::new(thread, sequence)
+                .ok_or_else(|| FormatError(format!("expected a nonzero {THREAD} reference")))?,
+        ),
         _ => {
             return Err(FormatError(format!(
                 "event must contain only stmt ({STATEMENT}), or nonzero stmt and thread ({THREAD}) with seq ({RECORD})"
@@ -722,9 +749,14 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// The immutable template (including its static associations) of an accepted statement.
+    pub fn statement(&self, id: u64) -> Option<&StatementTemplate> {
+        self.statements.get(&id).map(|s| &s.template)
+    }
+
     /// Static frame zero for a statement already accepted by this reader.
     pub fn statement_source(&self, id: u64) -> Option<&StatementSource> {
-        self.statements.get(&id).map(|s| &s.template.source)
+        self.statement(id).map(|s| &s.source)
     }
 
     /// Invalid records never install definitions or advance a thread's sequence.
@@ -733,7 +765,7 @@ impl Renderer {
         if let Some(address) = address
             && self
                 .last_record
-                .get(&address.thread)
+                .get(&address.thread())
                 .is_some_and(|&last| address.sequence <= last)
         {
             return Err(FormatError(format!(
@@ -929,7 +961,7 @@ impl Renderer {
             }
         }
         if let Some(address) = address {
-            self.last_record.insert(address.thread, address.sequence);
+            self.last_record.insert(address.thread(), address.sequence);
         }
         Ok(output)
     }

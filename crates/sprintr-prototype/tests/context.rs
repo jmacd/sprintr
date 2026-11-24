@@ -3,7 +3,9 @@
 mod common;
 
 use serde_json::json;
-use sprintr_prototype::{Context, ContextEntity, Logger, attributes, entities, info};
+use sprintr_prototype::{
+    Context, ContextEntity, Logger, Renderer, attributes, context, entities, info,
+};
 
 entities! {
     /// Application session
@@ -22,10 +24,104 @@ attributes! {
     parent: entity(session) = "request.parent";
     /// Current environment
     env: entity(environment) = "deployment.env";
+    /// Job number in a creation statement
+    job_id: u64 = "job.id";
 }
 
 fn emit() {
     info!("ready");
+}
+
+/// Scenario: one creation callsite is used both in a role scope and in an
+/// already-addressed context. Guarantees: each result inherits the bindings
+/// but gets its own origin; activation only changes the current bag.
+#[test]
+fn context_origins_are_accepted_start_records() {
+    fn create(id: u32) -> Context {
+        context!("new job {:04x}", job_id = id)
+    }
+
+    let mut logger = common::started_logger();
+    let role = env.context(&environment::PROD).unwrap();
+    let (outer, child) = logger.with_default(|| role.in_scope(|| {
+        let outer = create(42);
+        assert!(Context::current().origin().is_none());
+        let child = outer.in_scope(|| {
+            let child = create(43);
+            assert_eq!(Context::current().origin(), outer.origin());
+            child
+        });
+        for ctx in [&outer, &child] {
+            ctx.in_scope(|| {
+                assert_eq!(Context::current().origin(), ctx.origin());
+                assert!(matches!(Context::current().get(&env).unwrap(), Some(ContextEntity::Named(n)) if std::ptr::eq(n, &environment::PROD)));
+            });
+        }
+        (outer, child)
+    }));
+
+    let bytes = logger.into_inner();
+    let events = common::records(&bytes);
+    assert_eq!(events.len(), 2);
+    let mut reader = Renderer::default();
+    let mut text = String::new();
+    for event in common::lines(&bytes) {
+        text = reader.render(&event).unwrap();
+    }
+    assert!(text.contains("new job 002b"));
+    let statement = events[0].attrs["log.statement"];
+    assert_eq!(events[1].attrs["log.statement"], statement);
+    let template = reader.statement(statement).unwrap();
+    assert_eq!(template.attrs["log.kind"], "CONTEXT_START");
+    assert_eq!(template.refs[0]["job.id"].argument, 0);
+    assert!(events[0].defs.contains_key("log.kind:CONTEXT_START"));
+    assert!(events[1].defs.is_empty());
+    for (ctx, event) in [(&outer, &events[0]), (&child, &events[1])] {
+        let origin = ctx.origin().unwrap();
+        assert_eq!(Some(origin), event.address().unwrap());
+        assert_eq!(origin.thread(), event.attrs["log.thread"]);
+        assert_eq!(origin.sequence(), event.attrs["log.record"]);
+        assert_eq!(event.context["deployment.env"].entity, "environment:PROD");
+    }
+    assert_ne!(outer.origin(), child.origin());
+}
+
+/// Scenario: startup and a parent start succeed, then the sink rejects the
+/// child's first record. Guarantees: no synthetic or inherited origin on
+/// failure, and the next accepted start publishes its definitions normally.
+#[test]
+fn rejected_context_start_keeps_bindings_but_not_parent_origin() {
+    fn child() -> Context {
+        context!("child")
+    }
+    let mut logger = Logger::new(common::FailNth::new(3));
+    logger.start().unwrap();
+    let (outer, accepted) = logger.with_default(|| {
+        let outer = env
+            .context(&environment::PROD)
+            .unwrap()
+            .in_scope(|| context!("parent"));
+        let accepted = outer.in_scope(|| {
+            let rejected = child();
+            assert!(rejected.origin().is_none());
+            assert!(rejected.get(&env).unwrap().is_some());
+            child()
+        });
+        (outer, accepted)
+    });
+    let sink = logger.into_inner();
+    let events = common::records(&sink.output);
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        outer.origin().unwrap(),
+        events[0].address().unwrap().unwrap()
+    );
+    assert_eq!(
+        accepted.origin().unwrap(),
+        events[1].address().unwrap().unwrap()
+    );
+    assert_eq!(common::template(&events[1]).msg, "child");
+    assert!(common::replayed(&sink.output).contains("child\nlog.kind = CONTEXT_START"));
 }
 
 /// Scenario: a work item outlives its creating scope and its original handle.

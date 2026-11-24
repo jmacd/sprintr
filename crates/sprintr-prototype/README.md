@@ -298,6 +298,32 @@ For a one-role overlay, `active_session.context(&login)?.in_scope(f)` retains
 the other current roles. Neither operation changes the selected logger.
 Contexts can be stored and re-entered on their owning thread.
 
+### Recording a context's origin
+
+```rust
+use sprintr_prototype::{context, info, start};
+
+start()?;
+let id = 42u32;
+let job = context!("new job {id:04x}");
+job.in_scope(|| info!("processing"));
+# Ok::<(), std::io::Error>(())
+```
+
+`context!` takes a snapshot of the active bindings and records one creation
+event without entering the new context. The format and typed arguments work
+as in `info!`. Its statement template carries `"attrs":{"log.kind":"CONTEXT_START"}`;
+the first use defines the named kind. Playback can recognize subsequent starts
+from their statement ID without inspecting the message text.
+
+`job.origin()` is the accepted creation record's `(thread, sequence)` as a
+`RecordAddress`. Cloning, editing, or re-entering the snapshot preserves that
+origin without emitting another start. `Context::root()` has no origin.
+If the output rejects the record, the SDK diagnoses the failure and returns
+a usable context with its inherited bindings and no origin. A pre-start stderr
+preview likewise has no origin. Acceptance means the writer took the complete
+record, not that buffered output reached durable storage.
+
 ## Declaring attributes and entities
 
 ```rust
