@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sprintr_prototype::buffer::{HeapBuffer, StackBuffer};
-use sprintr_prototype::{Context, Logger, attributes, entities, info};
+use sprintr_prototype::{Context, Logger, attributes, entities, info, span};
 use std::io;
 
 /// Scenario: a statement and its storage have been initialized before repeated recording.
@@ -145,6 +145,29 @@ fn warmed_detached_context_does_not_allocate() {
             allocation_counter::measure(|| {
                 for _ in 0..128 {
                     Context::current().in_scope(emit);
+                }
+            })
+        })
+    });
+    assert_eq!(measured.count_total, 0, "{measured:?}");
+}
+
+/// Scenario: warmed instrumentation logs under a span and refers to a holder.
+/// Guarantees: neither implicit membership nor the explicit reference allocates.
+#[test]
+fn warmed_span_event_does_not_allocate() {
+    let mut logger = Logger::new(io::sink());
+    logger.start().unwrap();
+    let measured = logger.with_default(|| {
+        let holder_span = span!("holder");
+        let holder = holder_span.reference().unwrap();
+        let active = span!("active");
+        active.in_scope(|| {
+            let emit = || info!("blocked on {holder}");
+            emit();
+            allocation_counter::measure(|| {
+                for _ in 0..128 {
+                    emit();
                 }
             })
         })

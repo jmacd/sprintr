@@ -9,7 +9,10 @@ sprintr (Structured PRINT in Rust) is a structured printing library that:
   - refer to values in the same log stream,
   - or refer to a qualified log record in another stream
 - Includes file:line and a limited number of stack frames
-- Supports declaring entities that are named or anonymous
+- Records each failure as an entity so wrapping errors and later logs can
+  refer to the failure and its original stack
+- Supports global and local entity identities with typed identifying properties,
+  including SDK-generated local UIDs
 - Supports declaring attributes with descriptions and types
 - Encodes definitions for callsite, stackframe, entity, attribute once
   per log stream by default; uses references to refer to definitions
@@ -111,12 +114,12 @@ or an entity, its description, and its value type. Readers presume an
 understanding of the base relation; the remaining concepts are described
 through relation definitions in the graph.
 
-Each process uses one shared namespace and consistent definitions
-across all logging scopes. Names are used directly, without namespace
-qualification; dots in names such as `log.level` do not introduce
-separate namespaces. Scopes neither shadow names nor change their
-meaning. Definitions may appear in multiple records or scopes, provided
-their values agree.
+Each process uses one shared namespace for **relation declarations**.
+Dots in names such as `log.level` do not introduce separate namespaces.
+The identity scope of an **entity instance** is a separate matter: two
+instances of the same declared type can have the same local ID in different
+containers. Definitions of the same fully identified entity may appear in
+multiple records, provided their values agree.
 
 Named definitions are immutable within a process. A conflicting
 definition cannot replace an existing name, and readers reject
@@ -173,91 +176,98 @@ the indicated type.
 
 ## Entities
 
-Entities are declared similarly to attributes; however, whereas
-attributes label values, entities give values a shared identity.
-Weaver code generation will be used to
-declare these in a similar manner to attributes, as they have the same
-representation and structure (KeyValue). Entities are passed by handle
-to the log API; entities are constructed using the entity definition
-and a structured value. Construction evaluates the value exactly once
-and eagerly encodes it into a reusable intermediate representation.
-The entity is a construction-time snapshot; logging does not
-re-evaluate the expression.
+`entities!` declares a type and its identity rule. Today the prototype
+constructs instances with `.new(...)`, `.named(...)`, or
+`.within(&parent).named(...)`. The proposed entity form of `structured!`
+would replace those constructors. In both designs, ordinary log statements
+use a handle to record facts about the instance.
 
-The intermediate representation retains encoded chunks for ordinary
-values, deferred slots for nested entities, and the entity dependencies
-needed to fill those slots. It need not be a complete OTLP byte string:
-a nested entity's definition location may not yet be known. Final
-assembly reuses the encoded chunks and fills deferred slots with inline
-entity values or references, according to the selected definition
-locations. Reference strings and enclosing protobuf lengths are
-finalized during assembly, rather than patched into fixed-size slots.
+### Identity rule
 
-Note that this concept of entity is not directly related to the
-experimental OpenTelemetry Entities specification.
+A declaration answers two questions: **where is the ID unique**, and **who
+supplies its identifying properties**? A caller-supplied ID can be global or
+local to a declared container type. An *anonymous* entity has a local ID
+supplied by the SDK: the declaration names the scope and the typed UID property
+to generate. It uses the same construction and reference machinery. Two such
+creations with identical descriptive properties still have distinct UIDs.
 
-We have two categories of entity, named and anonymous. Callers
-construct named entities by providing a globally distinct string-value
-identifier. Semantically, a named entity is used to correlate the
-entity across process boundaries; they should be used when there
-is a natural, globally given name for the entity.
+For example, a node called `batch` is identified within a particular pipeline
+instance. A span is identified by its SpanID within a particular TraceID; its
+parent span is a separate relationship. In both cases the handle retains the
+typed local and enclosing identifying properties. The JSON encoder can form a
+qualified key, and a direct OTAP encoder can use those values without parsing
+JSON or looking up a record. This follows the distinction between identity
+scope and topology in [the OTel entity proposal](https://github.com/open-telemetry/opentelemetry-specification/pull/5361)
+and [the DFE entity-reporting RFC](https://github.com/open-telemetry/otel-arrow/pull/4798).
 
-Repeated definitions of a named entity within a process must have the
-same value, as described under Relations; they are not updates to a
-mutable named value.
+### Entity statements (proposed API)
 
-Anonymous entities are a convenience for entities that are locally
-unique without a natural namespace; these entities are given unique
-integer identifiers, which may be randomly or sequentially assigned by
-the library, and which should not be presumed equal unless assigned
-within the same process. (Process identity is discussed below.)
-
-Each log record is itself an anonymous entity described by `log.record`.
-Records participate in the same graph as other entities and can be
-located through that relation.
-
-```
-groups:
-  - id: registry.sprintr_example
-    type: attribute_group
-    brief: Attributes used by the sprintr example process.
-    attributes:
-      - ref: my_thing
-        annotations:
-          sprintr:
-            entity: named  # implies type: string
-```
-
-Callers will allocate long-lived entity-value objects:
+The following illustrates the intended declaration and call syntax. The
+prototype currently uses `#[named(...)]` or `#[anonymous]` declarations and
+`.named(...)` or `.new(...)` constructors with a serializable object.
 
 ```rust
-use super::entity::{my_thing};
+attributes! {
+    /// Identifier of this engine incarnation
+    engine_uid: str = "engine.uid";
+    /// Group name within one engine
+    group_id: str = "pipeline_group.id";
+    /// SDK-assigned work item ID within one group
+    work_uid: u64 = "work.uid";
+}
 
-let handle = my_thing.new("thing_name", <expression>);
+entities! {
+    /// Engine incarnation
+    #[identity(global, id = engine_uid)]
+    engine = "engine";
+    /// Pipeline group
+    #[identity(within = engine, id = group_id)]
+    group = "pipeline_group";
+    /// Work item
+    #[identity(within = group, id = generated(work_uid))]
+    work_item = "work_item";
+}
 
-info!("starting {}", handle);
+let instance = structured!(engine, "engine {}", engine_uid = uid);
+let ingest = structured!(
+    group, "group {} in {} uses {policy:s}",
+    group_id = "ingest",
+    entity_scope = instance,
+);
+let work = structured!(work_item, "work for {}", entity_scope = ingest);
+info!("starting {work}");
 ```
 
-The `<expression>` above is a placeholder for a structured value, as
-provided by the `as_struct()` method (or something similarly idiomatic). In
-this example, the entity key-value `my_thing:thing_name` is defined by
-the expression and logged once; future uses of the `handle` are logged
-as an entity reference.
+In `structured!(group, ...)`, `group` is a Rust path to a typed `entities!`
+declaration. A qualified path or import alias selects the same declaration
+and recorded type. `entity_scope` supplies the **concrete container** of the
+declared type. `group_id` supplies the **identifying property** once; `policy`
+is **descriptive**. For `work_item` the SDK assigns `work_uid` at construction.
+There is no second name argument or separate `Serialize`/`json!` payload in
+this design. The existing value-only form, `structured!("...", ...)`, describes
+how to render a value; it does not assign that value an identity.
 
-For anonymous entities, simply remove the name and let the library
-fill one in:
+The declaration determines identity; the message determines presentation.
+Changing the wording or recording a new fact about policy does not rename the
+group. A formatter should also be able to omit the engine from the displayed
+text while retaining it in the handle. The syntax for supplying a binding
+that consumes no placeholder is still open.
 
-```rust
-use super::entity::{my_session};
+### Capture and first use
 
-let handle = my_session.new(session_data)?;
+**Defer publication, not evaluation.** Construction evaluates the arguments
+once and retains typed identity, formatting metadata, and encoded descriptive
+values. An unused handle emits no record. The first accepted event using the
+handle publishes its definition in `defs`; subsequent uses can refer to that
+record. A rejected write leaves the definition pending. For nested entity
+arguments, retain the dependencies and encoded chunks so that only reference
+addresses and enclosing lengths need to be filled in at record assembly.
 
-info!("new session {}", handle);
-info!("resumed {}", handle);
-```
-
-Logging entity values has the effect of placing a reference to the
-entity value in the log.
+The scope supplied at construction determines identity. The creating thread
+or active context is provenance: if creation under worker W must be observable,
+capture that association at construction or record an explicit creation event.
+A later first use under worker X is an observation by X. Its record address
+locates the definition; it does not make X the creator or the identity scope.
 
 ## Arguments
 
@@ -400,7 +410,7 @@ instantiated for each event, not resolved against the template definition.
 
 The `defs` section of the record body is a map from entity names to
 their values, which may contain entity references. Definitions are
-logged at least once. Entities are synchronized independently of log
+published on first accepted use. Entities are synchronized independently of log
 record emission. Although each scope emits records in ascending
 sequence order, readers may observe references before their definitions,
 including when combining records from different scopes. Readers should
@@ -504,8 +514,9 @@ For exchange between processes, the intended **graph** address of a record is
 The first pair must uniquely identify the process execution; a PID alone is
 not enough. An RPC peer could exchange the address of a start record and
 link to the corresponding end records using ordinary entities and attributes.
-This global index and span linkage are not implemented. The thread and record
-components are the same ones used for local references.
+The prototype already links spans and exceptions across threads and outputs
+of one process execution. Extending those addresses with a process identity
+for RPC propagation and lookup is future work.
 
 Log records collectively describe a directed graph. Loading resolves
 reference targets into graph edges, preserving shared nodes and cycles
@@ -563,14 +574,9 @@ immediately after the startup record, so collisions are visible without
 preventing the process from starting. Later definitions extend the same
 process-wide namespace; repeated definitions must agree.
 
-Common definitions can be generated from external schema files,
-including the Weaver definitions described above. A more restrictive
-future model would require common named definitions to come from those
-files and allow only anonymous entities to be created at runtime.
-Library-assigned unique identities avoid named-definition conflicts
-for those anonymous entities. Build-time validation can catch schema
-conflicts earlier, while process-wide consistency checks can catch
-incompatible definitions supplied by different dependencies.
+Common relation declarations, including their identifying properties and
+scope rules, can be generated from external schemas such as Weaver. The
+same typed declarations can then be used to construct runtime instances.
 
 ## Context
 
@@ -610,6 +616,53 @@ locally after recording, or relocate the PCs with a bulk module map and
 matching debug artifacts from that run. Each concept is described through a relation rooted in
 `log.relation`. Placement of this context in OTel resources is deferred.
 
+### Structured exceptions (implemented)
+
+`exception!(LoadError::Config, "could not load {path:s}", cause = &inner)`
+captures a failure and constructs the application's tuple variant. The
+variant path as written names its `exception.class` on the static
+`log.kind:EXCEPTION` statement; use consistently qualified paths for classes
+shared between modules. An occurrence's typed fields use the statement's
+ordinary positional argument bindings. Its event carries the active context,
+span membership, and failure-site stack. Selecting the variant, cloning the
+local error, and logging a reference each preserve that occurrence.
+
+For example, `LoadError::Config(StructuredError)` can use `thiserror`'s
+`#[error(transparent)]` to delegate `Display` and `Error::source`; the SDK
+itself has no `thiserror` dependency. `cause = &inner` is a relationship, so
+it consumes no message placeholder. Unlike an ordinary `info!` call, the
+error must outlive the borrowed arguments: it owns its field values and
+formats the message on demand. An explicit `:?` field captures Debug text
+once. A later `warn!("startup failed: {problem}")` records only the reference
+in that argument slot, while the warning retains its own reporting stack.
+
+The occurrence record defines one anonymous `exception:<uid>` entity. A
+leaf's object is empty; a wrapper supplies the declared `exception.cause`
+entity-valued attribute:
+
+```json
+{"exception:9":{"exception.cause":{"$ref":"log.thread:42/17#/defs/exception:8"}}}
+```
+
+Here `42/17` locates the accepted *record*, and `8` identifies the *entity*
+in it. The same `$ref` works as a normal log argument on any thread. If the
+cause's delivery failed, `"exception:8"` identifies the unrecorded occurrence
+without claiming an address. The local payload retains `Display`, `source()`
+and the original raw PCs in either case. Only the reference to an accepted
+record can be promoted and sent to another thread: `StructuredError` is
+thread-local (`Rc`), and `.reference()` returns `Option<ExceptionRef>`. The
+`Send + Sync` reference carries the UID and origin; promotion performs no I/O.
+
+Playback validates UID/origin pairs before committing a record, including
+references arriving before their defining thread's records. It distinguishes
+a missing record from an unrecorded cause. Chain expansion and symbol lookup
+are reader operations: each layer contributes its own message, frame zero
+and stack. Exporters can derive exception message and stacktrace strings from
+these fields without putting those strings on the capture path.
+`crates/sprintr-prototype/examples/exception_chain.rs` demonstrates recording
+and reading in separate processes: `Renderer::exception_chain` prints
+`Caused by:` and preserves raw PCs when no symbol is available.
+
 ### Work plan: detachable contexts and spans
 
 The acceptance case is a worker in span A logging
@@ -644,14 +697,17 @@ by its reader.
    Entering or copying the snapshot emits no extra start. The public macro
    returns a `Context`, not a delivery result.
 
-3. **Implement `span!` and its lifecycle.** A start statement supplies the
+3. **Implement `span!` and its lifecycle (implemented).** A start statement supplies the
    span's formatted name; its event records the arguments, attributes, start
    time, and parent. A root's `span.start:<spanID>` and
    `trace.start:<traceID>` identify the same start record. A child inherits
    the trace root and gets its own span ID and start record. Enter/exit
    selects the context; closing the span emits its own end statement exactly
-   once, referring to the start. Decide explicit close versus last-owner drop
-   here; a stored reference to a span is not a lifecycle owner. **Done when:**
+   once, referring to the start. There is a single close owner: consume it
+   with `end(self)` or let it drop. A `SpanRef` can outlive that owner;
+   `into_owner()` explicitly transfers the close right and the span/trace
+   anchors. The receiving worker supplies its own baggage and output.
+   General context/baggage export is separate. **Done when:**
    a span can be entered twice and closed once, child parentage survives
    replay, and consumers can compute duration from the two timestamps.
 
@@ -875,10 +931,10 @@ The named values carry the descriptions "Informational event", "Warning
 condition", and "Error condition". Each output emits a level definition only
 when first needed, and reuses it across statements. Application context
 associations live on events independently of these templates.
-The current extension supports string and `u64` attributes, statically named
-entities, anonymous runtime objects, anonymous statements, `$arg` bindings,
-and record-relative references to whole object definitions. Runtime named
-entities, general graph linking, filtering, and graph navigation remain future work.
+The prototype supports string and `u64` identity attributes, global and
+container-scoped named entities, anonymous runtime objects, statement `$arg`
+bindings, and record-relative references to whole object definitions. General
+graph linking, filtering, and graph navigation remain future work.
 
 ## Additional context
 

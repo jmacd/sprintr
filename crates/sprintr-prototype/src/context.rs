@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::runtime::runtime;
-use crate::{Attribute, EntityHandle, Named, RecordAddress, json_error};
+use crate::{Attribute, EntityHandle, Named, RecordAddress, SpanRef, json_error};
 use std::io;
 use std::rc::Rc;
 
 /// A context association can refer to an application handle or a declared named entity.
 pub enum ContextEntity<'a> {
-    Anonymous(&'a EntityHandle),
+    Handle(&'a EntityHandle),
     Named(&'static Named),
 }
 
 impl<'a> From<&'a EntityHandle> for ContextEntity<'a> {
     fn from(handle: &'a EntityHandle) -> Self {
-        Self::Anonymous(handle)
+        Self::Handle(handle)
     }
 }
 
@@ -35,7 +35,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) enum ContextDefinition {
-    Anonymous(EntityHandle),
+    Handle(EntityHandle),
     Named { index: usize, value: &'static Named },
 }
 
@@ -49,10 +49,10 @@ impl Attribute<EntityHandle> {
         let attribute = rt.relation(self.__meta()).map_err(io::Error::other)?;
         let named_key;
         let (relation, key, definition) = match value.into() {
-            ContextEntity::Anonymous(handle) => (
+            ContextEntity::Handle(handle) => (
                 handle.relation,
                 handle.payload.key.as_str(),
-                ContextDefinition::Anonymous(handle.clone()),
+                ContextDefinition::Handle(handle.clone()),
             ),
             ContextEntity::Named(named) => {
                 let relation = rt
@@ -94,7 +94,7 @@ impl EntityContext {
 
     fn value(&self) -> ContextEntity<'_> {
         match &self.0.definition {
-            ContextDefinition::Anonymous(handle) => ContextEntity::Anonymous(handle),
+            ContextDefinition::Handle(handle) => ContextEntity::Handle(handle),
             ContextDefinition::Named { value, .. } => ContextEntity::Named(value),
         }
     }
@@ -128,6 +128,7 @@ enum Bindings {
 pub struct Context {
     bindings: Bindings,
     origin: Option<RecordAddress>,
+    span: Option<SpanRef>,
 }
 
 scoped_tls_hkt::scoped_thread_local!(static CURRENT: Context);
@@ -138,16 +139,32 @@ impl Context {
         Self {
             bindings: Bindings::Empty,
             origin: None,
+            span: None,
         }
     }
 
-    /// Address of this snapshot's `context!` creation record, if one was accepted.
+    /// Origin of this context: an accepted context creation or span start.
     pub fn origin(&self) -> Option<RecordAddress> {
         self.origin
     }
 
     pub(crate) fn with_origin(mut self, origin: Option<RecordAddress>) -> Self {
         self.origin = origin;
+        self
+    }
+
+    /// The active span's non-owning reference, if its start was recorded.
+    pub fn span(&self) -> Option<&SpanRef> {
+        self.span.as_ref()
+    }
+
+    pub(crate) fn take_span(&mut self) -> Option<SpanRef> {
+        self.span.take()
+    }
+
+    pub(crate) fn for_span(mut self, span: Option<SpanRef>) -> Self {
+        self.origin = span.as_ref().map(SpanRef::start);
+        self.span = span;
         self
     }
 
@@ -221,7 +238,7 @@ impl Context {
             .position(|binding| binding.0.attribute == index))
     }
 
-    fn entries(&self) -> &[EntityContext] {
+    pub(crate) fn entries(&self) -> &[EntityContext] {
         match &self.bindings {
             Bindings::Empty => &[],
             Bindings::One(binding) => std::slice::from_ref(binding),
@@ -230,10 +247,10 @@ impl Context {
     }
 }
 
-pub(crate) fn with_current<R>(f: impl FnOnce(&[EntityContext]) -> R) -> R {
+pub(crate) fn with_current<R>(f: impl FnOnce(&Context) -> R) -> R {
     if CURRENT.is_set() {
-        CURRENT.with(|context| f(context.entries()))
+        CURRENT.with(f)
     } else {
-        f(&[])
+        f(&Context::root())
     }
 }

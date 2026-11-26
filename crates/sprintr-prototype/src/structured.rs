@@ -68,6 +68,11 @@ impl StructuredArgument for dyn StructuredValue + '_ {
         Value::Structured(self)
     }
 }
+impl StructuredArgument for crate::SpanRef {
+    fn __sprintr_argument(&self) -> Value<'_> {
+        Value::Span(self)
+    }
+}
 impl StructuredValue for EntityHandle {
     fn encode(&self, out: &mut dyn ValueWriter) -> io::Result<()> {
         out.entity(self)
@@ -179,9 +184,33 @@ impl<'a> Encoder<'a> {
             Value::Debug(d) => {
                 serde_json::to_writer(&mut self.buf, &DebugText(d)).map_err(json_error)
             }
+            Value::Exception(role, target) => {
+                let target = target.ok_or_else(|| invalid("exception UID unavailable"))?;
+                let relation = runtime()
+                    .relation(schema::exception.__meta())
+                    .map_err(io::Error::other)?;
+                if let Some(role) = role {
+                    role.check_relation(relation)?;
+                }
+                self.pending.schema(self.state, relation);
+                write!(self.buf, "{{\"$ref\":\"{target}\"}}")
+            }
+            Value::Span(span) => {
+                self.pending.schema(
+                    self.state,
+                    runtime()
+                        .relation(schema::span_start.__meta())
+                        .map_err(io::Error::other)?,
+                );
+                write!(
+                    self.buf,
+                    "{{\"$ref\":\"{}\"}}",
+                    span.start().span_start_ref()
+                )
+            }
             Value::EntityArgument(attr, e) => self.value(Value::Entity(attr.check(e)?)),
             Value::Entity(e) => {
-                let seq = self.pending.entity(self.state, self.record, e);
+                let seq = self.pending.entity(self.state, self.record, e)?;
                 write!(self.buf, "{{\"$ref\":\"{seq}{}\"}}", e.payload.fragment)
             }
             Value::Structured(value) => {

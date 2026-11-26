@@ -12,6 +12,7 @@ publish = false
 backtrace = "0.3"
 findshlibs = "0.10"
 gettid = "0.1.4"
+getrandom = "0.3"
 linkme = "0.3"
 scoped-tls-hkt = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -24,6 +25,7 @@ libc = "0.2"
 
 [dev-dependencies]
 allocation-counter = "0.8"
+thiserror = "2"
 
 [lints.rust]
 unsafe_code = "deny"

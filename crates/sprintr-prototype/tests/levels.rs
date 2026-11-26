@@ -35,7 +35,7 @@ fn named_levels_are_static_and_deduplicated() {
     assert_eq!(
         startup["defs"]["log.relation:log.level"],
         serde_json::json!({
-            "kind": "entity", "type": "object", "desc": "Logging level"
+            "kind": "entity", "type": "object", "desc": "Logging level", "id_scope":"global"
         })
     );
     assert_eq!(

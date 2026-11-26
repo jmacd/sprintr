@@ -2,12 +2,13 @@
 
 use super::{
     Argument, EncodeDefinition, Message, RecordAddress, RelationDefinition, RelationKind, Renderer,
-    STRUCT_ENCODE, STRUCT_NAME, format, reference, validate_entity_name,
+    STRUCT_ENCODE, STRUCT_NAME, SpanLinks, format, reference, span::SpanRefs, validate_entity_name,
 };
 use format::{Field, FormatError, Part, Spec};
 use reference::Target;
 use std::{collections::BTreeMap, fmt::Write as _};
 
+#[derive(Clone, Copy)]
 enum Layout<'a> {
     Named(&'a str),
     Formatted(&'a [Part]),
@@ -27,6 +28,9 @@ pub(super) struct RecordArgs<'a> {
     address: Option<RecordAddress>,
     annotations: BTreeMap<Vec<String>, Annotations<'a>>,
     pub associations: Vec<(&'a str, &'a Argument)>,
+    pub span_links: Option<SpanLinks>,
+    pub inline_starts: Vec<RecordAddress>,
+    pub inline_exceptions: Vec<super::ExceptionTarget>,
 }
 
 impl<'a> RecordArgs<'a> {
@@ -43,14 +47,21 @@ impl<'a> RecordArgs<'a> {
             address,
             annotations: BTreeMap::new(),
             associations: Vec::new(),
+            span_links: None,
+            inline_starts: Vec::new(),
+            inline_exceptions: Vec::new(),
         };
-        for entry in &message.refs {
-            if entry.len() != 1 {
-                return Err(FormatError(
-                    "each event refs entry must have exactly one name and path".into(),
-                ));
+        let mut spans = SpanRefs::default();
+        for entry in message.event_refs() {
+            let (key, fragment) = entry?;
+            let (name, suffix) = key
+                .split_once(':')
+                .map_or((key, None), |(name, value)| (name, Some(value)));
+            let def =
+                relation(name).ok_or_else(|| FormatError(format!("unknown relation {name:?}")))?;
+            if spans.collect(key, fragment)? {
+                continue;
             }
-            let (key, fragment) = entry.iter().next().expect("one entry");
             let Target::Argument(path) = reference::parse(fragment)? else {
                 return Err(FormatError(format!(
                     "expected a local argument path, got {fragment:?}"
@@ -58,11 +69,6 @@ impl<'a> RecordArgs<'a> {
             };
             let arg = Argument::at(&message.args, &path)
                 .ok_or_else(|| FormatError(format!("no argument at {fragment:?}")))?;
-            let (name, suffix) = key
-                .split_once(':')
-                .map_or((key.as_str(), None), |(name, value)| (name, Some(value)));
-            let def =
-                relation(name).ok_or_else(|| FormatError(format!("unknown relation {name:?}")))?;
             match (name, suffix) {
                 // Relation validation reserves these names for named object relations.
                 (STRUCT_NAME | STRUCT_ENCODE, Some(value)) => {
@@ -120,7 +126,7 @@ impl<'a> RecordArgs<'a> {
                         && let Target::Definition {
                             key: referenced, ..
                         } = reference::parse(target)?
-                        && referenced == *key
+                        && referenced == key
                     {
                         continue;
                     }
@@ -131,6 +137,7 @@ impl<'a> RecordArgs<'a> {
                 _ => return Err(FormatError(format!("invalid event association {key:?}"))),
             }
         }
+        record.span_links = spans.finish()?;
         // Check after collecting layouts: the refs list need not be in traversal order.
         for (path, node) in &record.annotations {
             if !node.attributes.is_empty()
@@ -149,11 +156,15 @@ impl<'a> RecordArgs<'a> {
         Ok(record)
     }
 
-    pub fn args(&self) -> &[Argument] {
+    pub fn args(&self) -> &'a [Argument] {
         &self.message.args
     }
 
-    pub fn write_association(&self, out: &mut String, arg: &Argument) -> Result<(), FormatError> {
+    pub fn write_association(
+        &mut self,
+        out: &mut String,
+        arg: &Argument,
+    ) -> Result<(), FormatError> {
         if let Argument::String(s) = arg {
             out.extend(s.escape_debug());
             return Ok(());
@@ -162,7 +173,7 @@ impl<'a> RecordArgs<'a> {
     }
 
     pub fn write_root(
-        &self,
+        &mut self,
         out: &mut String,
         index: usize,
         field: &Field,
@@ -178,7 +189,7 @@ impl<'a> RecordArgs<'a> {
     }
 
     fn write_field(
-        &self,
+        &mut self,
         out: &mut String,
         path: &mut Vec<String>,
         field: &Field,
@@ -216,7 +227,7 @@ impl<'a> RecordArgs<'a> {
     }
 
     fn write_value(
-        &self,
+        &mut self,
         out: &mut String,
         path: &mut Vec<String>,
         arg: &Argument,
@@ -227,6 +238,14 @@ impl<'a> RecordArgs<'a> {
             Argument::String(s) => out.push_str(s),
             Argument::Unsigned(n) => write!(out, "{n}").expect("string formatting"),
             Argument::Reference { target } => match reference::parse(target)? {
+                Target::Exception(link) => {
+                    self.inline_exceptions.push(link);
+                    write!(out, "{}", link.diagnostic()).expect("write to string");
+                }
+                Target::SpanStart(address) => {
+                    self.inline_starts.push(address);
+                    out.push_str(target); // Diagnostic address, not a recursive expansion.
+                }
                 Target::Definition { sequence, key } => {
                     let object = self.renderer.resolve_definition(
                         sequence,
@@ -277,7 +296,7 @@ impl<'a> RecordArgs<'a> {
             Argument::Array(array) => {
                 if let Some(Layout::Formatted(parts)) = self.layout(path) {
                     let mut children = array.iter().enumerate();
-                    for part in *parts {
+                    for part in parts {
                         match part {
                             Part::Literal(text) => out.push_str(text),
                             Part::Field(field) => {
@@ -315,8 +334,8 @@ impl<'a> RecordArgs<'a> {
         Ok(())
     }
 
-    fn layout(&self, path: &[String]) -> Option<&Layout<'a>> {
-        self.annotations.get(path)?.layout.as_ref()
+    fn layout(&self, path: &[String]) -> Option<Layout<'a>> {
+        self.annotations.get(path)?.layout
     }
 }
 

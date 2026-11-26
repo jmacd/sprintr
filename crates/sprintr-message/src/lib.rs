@@ -3,14 +3,20 @@
 //! Statement templates, event records, and stateful formatted playback.
 
 mod argument;
+mod exception;
 pub mod format;
+mod identity;
 mod reference;
+mod span;
 mod structured;
 #[cfg(test)]
 mod tests;
 
 pub use argument::Argument;
+pub use exception::{EXCEPTION, EXCEPTION_CAUSE, EXCEPTION_CLASS, ExceptionTarget};
+pub use identity::{IdScope, IdentityComponent, IdentityValue};
 pub use reference::{definition_fragment, push_pointer_token};
+pub use span::{SPAN_PARENT, SPAN_START, SpanLink, SpanLinks, TRACE_START, TraceLink};
 
 use format::{FormatError, Part, Spec};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
@@ -78,6 +84,28 @@ pub struct RelationDefinition {
     pub desc: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub anonymous: bool,
+    /// Only explicit metadata establishes the scope of a named entity.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub id_scope: Option<IdScope>,
+    /// Ordered scalar attribute relations identifying a runtime named entity.
+    /// Omitted for static names; when supplied the list must be nonempty.
+    #[serde(
+        default,
+        deserialize_with = "identity::id_keys",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub id_keys: Vec<String>,
+    /// The enclosing entity relation when `id_scope` is `local`.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub scope_entity_type: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -104,7 +132,7 @@ impl RelationDefinition {
         if !supported {
             return Err(FormatError(format!("unsupported relation {name:?}")));
         }
-        if matches!(name, STATEMENT | THREAD | RECORD | SOURCE)
+        if matches!(name, STATEMENT | THREAD | RECORD | SOURCE | EXCEPTION)
             && !(self.kind == RelationKind::Entity && self.anonymous)
         {
             return Err(FormatError(format!(
@@ -116,12 +144,21 @@ impl RelationDefinition {
                 "{STACK} must describe a [u64] attribute"
             )));
         }
-        if matches!(name, STRUCT_NAME | STRUCT_ENCODE) && !self.describes_named_entities() {
+        if matches!(
+            name,
+            STRUCT_NAME | STRUCT_ENCODE | SPAN_START | TRACE_START | SPAN_PARENT | EXCEPTION_CLASS
+        ) && !self.describes_named_entities()
+        {
             return Err(FormatError(format!(
                 "{name} must describe named object entities"
             )));
         }
-        Ok(())
+        if name == EXCEPTION_CAUSE
+            && !matches!(&self.value_type, RelationType::Entity(r) if r == EXCEPTION)
+        {
+            return Err(FormatError(format!("{name} must reference {EXCEPTION}")));
+        }
+        self.validate_identity(name)
     }
 
     fn describes_named_entities(&self) -> bool {
@@ -303,7 +340,7 @@ pub struct Message {
     /// Entity-valued associations from event `attrs`, separate from positional arguments.
     pub context: BTreeMap<String, ContextRef>,
     pub args: Vec<Argument>,
-    /// Ordered, single-entry associations with local JSON Pointer fragments into `args`.
+    /// Ordered, single-entry associations with local argument paths or span start addresses.
     pub refs: Vec<BTreeMap<String, String>>,
     pub defs: BTreeMap<String, Definition>,
 }
@@ -311,11 +348,11 @@ pub struct Message {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireEvent {
-    #[serde(default, deserialize_with = "present_u64")]
+    #[serde(default, deserialize_with = "present")]
     seq: Option<u64>,
-    #[serde(default, deserialize_with = "present_u64")]
+    #[serde(default, deserialize_with = "present")]
     stmt: Option<u64>,
-    #[serde(default, deserialize_with = "present_u64")]
+    #[serde(default, deserialize_with = "present")]
     thread: Option<u64>,
     ts: u64,
     attrs: WireAttrs,
@@ -326,7 +363,7 @@ struct WireEvent {
     defs: BTreeMap<String, Definition>,
 }
 
-/// A process-local entity key in event context, not a record-relative JSON Pointer.
+/// An entity key in event context, not a record-relative JSON Pointer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextRef {
@@ -385,7 +422,7 @@ impl<'de> Deserialize<'de> for WireRef {
             type Value = WireRef;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a single-entry name to fragment map")
+                f.write_str("a single-entry name to reference target map")
             }
 
             fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<WireRef, A::Error> {
@@ -402,9 +439,9 @@ impl<'de> Deserialize<'de> for WireRef {
     }
 }
 
-// A field can be absent (longhand or an unaddressed record); null is not a number.
-fn present_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-    u64::deserialize(d).map(Some)
+// Optional wire fields may be absent, but null is not a value of the field's type.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
 }
 
 impl TryFrom<WireEvent> for Message {
@@ -502,6 +539,18 @@ impl Serialize for Message {
 }
 
 impl Message {
+    fn event_refs(&self) -> impl Iterator<Item = Result<(&str, &str), FormatError>> {
+        self.refs.iter().map(|entry| {
+            if entry.len() != 1 {
+                return Err(FormatError(
+                    "each event refs entry must have exactly one name and target".into(),
+                ));
+            }
+            let (key, target) = entry.first_key_value().expect("one entry");
+            Ok((key.as_str(), target.as_str()))
+        })
+    }
+
     /// Validate the event identity and return its address within the originating
     /// process. Self-contained records may be unaddressed.
     pub fn address(&self) -> Result<Option<RecordAddress>, FormatError> {
@@ -612,7 +661,11 @@ impl CompiledStatement {
         })
     }
 
-    fn render(&self, message: &Message, record: &RecordArgs<'_>) -> Result<String, FormatError> {
+    fn render(
+        &self,
+        message: &Message,
+        record: &mut RecordArgs<'_>,
+    ) -> Result<(String, std::ops::Range<usize>), FormatError> {
         let args = record.args();
         if self.decimal.len() != args.len() {
             return Err(FormatError(format!(
@@ -624,7 +677,6 @@ impl CompiledStatement {
         for binding in &self.bindings {
             args[binding.argument].check_attribute(&binding.name, &binding.value_type)?;
         }
-        let mut index = 0;
         let timestamp = message.timestamp;
         let instant = UNIX_EPOCH
             .checked_add(Duration::from_nanos(timestamp))
@@ -634,6 +686,8 @@ impl CompiledStatement {
                 ))
             })?;
         let mut output = format!("{} ", humantime::format_rfc3339_millis(instant));
+        let body_start = output.len();
+        let mut index = 0;
         for part in &self.parts {
             match part {
                 Part::Literal(text) => output.push_str(text),
@@ -643,6 +697,7 @@ impl CompiledStatement {
                 }
             }
         }
+        let body = body_start..output.len();
         let attrs = self
             .template
             .attrs
@@ -659,7 +714,7 @@ impl CompiledStatement {
             .iter()
             .map(|b| (b.name.as_str(), &args[b.argument]));
         for (position, (name, value)) in bindings
-            .chain(record.associations.iter().copied())
+            .chain(std::mem::take(&mut record.associations))
             .enumerate()
         {
             output.push_str(
@@ -673,7 +728,7 @@ impl CompiledStatement {
             output.push_str(" = ");
             record.write_association(&mut output, value)?;
         }
-        Ok(output)
+        Ok((output, body))
     }
 }
 
@@ -745,10 +800,17 @@ pub struct Renderer {
     entities: BTreeMap<String, StoredEntity>,
     statements: BTreeMap<u64, CompiledStatement>,
     encoders: BTreeMap<String, CompiledEncoder>,
-    last_record: BTreeMap<u64, u64>,
+    history: span::RecordHistory,
+    spans: span::SpanIndex,
+    exceptions: exception::ExceptionIndex,
 }
 
 impl Renderer {
+    /// Immutable schema of a relation from an accepted record.
+    pub fn relation(&self, name: &str) -> Option<&RelationDefinition> {
+        self.relations.get(name)
+    }
+
     /// The immutable template (including its static associations) of an accepted statement.
     pub fn statement(&self, id: u64) -> Option<&StatementTemplate> {
         self.statements.get(&id).map(|s| &s.template)
@@ -759,14 +821,11 @@ impl Renderer {
         self.statement(id).map(|s| &s.source)
     }
 
-    /// Invalid records never install definitions or advance a thread's sequence.
+    /// Invalid records never install definitions, claim span identities or advance a thread's sequence.
     pub fn render(&mut self, message: &Message) -> Result<String, FormatError> {
         let (id, address) = event_identity(&message.attrs)?;
         if let Some(address) = address
-            && self
-                .last_record
-                .get(&address.thread())
-                .is_some_and(|&last| address.sequence <= last)
+            && !self.history.increases(address)
         {
             return Err(FormatError(format!(
                 "{RECORD} {} does not increase on {THREAD} {}",
@@ -793,15 +852,7 @@ impl Renderer {
             }
         }
         let relation = |name: &str| relations.get(name).or_else(|| self.relations.get(name));
-        for definition in relations.values() {
-            if let RelationType::Entity(target) = &definition.value_type
-                && !relation(target).is_some_and(|r| r.kind == RelationKind::Entity)
-            {
-                return Err(FormatError(format!(
-                    "expected an entity relation for attribute target {target:?}"
-                )));
-            }
-        }
+        identity::validate_relations(&relations, relation)?;
         for name in [STATEMENT, STACK, SOURCE] {
             if relation(name).is_none() {
                 return Err(FormatError(format!("unknown relation {name:?}")));
@@ -822,6 +873,11 @@ impl Renderer {
                 .ok_or_else(|| FormatError(format!("unsupported definition {key:?}")))?;
             let described = relation(relation_name)
                 .ok_or_else(|| FormatError(format!("unknown relation {relation_name:?}")))?;
+            if matches!(relation_name, SPAN_START | TRACE_START | SPAN_PARENT) {
+                return Err(FormatError(format!(
+                    "{key:?} annotates a start record; it cannot have a definition"
+                )));
+            }
             if relation_name == STRUCT_ENCODE {
                 validate_entity_name(name)?;
                 let Definition::Encoder(definition) = definition else {
@@ -857,13 +913,21 @@ impl Renderer {
                         "invalid anonymous entity identity {key:?}"
                     )));
                 }
-            } else {
+            } else if described.id_keys.is_empty() {
                 validate_entity_name(name)?;
                 if object.len() != 1 || !object.get("desc").is_some_and(Value::is_string) {
                     return Err(FormatError(format!(
                         "named entity {key:?} must contain only a string desc"
                     )));
                 }
+            } else {
+                identity::read_runtime_identity(
+                    relation_name,
+                    described,
+                    name,
+                    relation,
+                    |_, _| {},
+                )?;
             }
             if self
                 .entities
@@ -939,10 +1003,40 @@ impl Renderer {
             .get(&id)
             .or_else(|| self.statements.get(&id))
             .ok_or_else(|| FormatError(format!("unknown statement {id}")))?;
-        let arguments = RecordArgs::new(self, message, address, relation, |key| {
+        let mut arguments = RecordArgs::new(self, message, address, relation, |key| {
             encoders.get(key).or_else(|| self.encoders.get(key))
         })?;
-        let output = statement.render(message, &arguments)?;
+        let kind = statement.template.attrs.get("log.kind").map(String::as_str);
+        let span_event = span::SpanEvent::from_record(kind, address, arguments.span_links)?;
+        self.spans.validate(span_event, address, &self.history)?;
+        let (output, body) = statement.render(message, &mut arguments)?;
+        let exception = exception::Occurrence::read(
+            kind,
+            statement,
+            message,
+            address,
+            &output[body],
+            relation,
+        )?;
+        let exception_refs = arguments.inline_exceptions;
+        if !exception_refs.is_empty() && relation(EXCEPTION).is_none() {
+            return Err(FormatError(format!("unknown relation {EXCEPTION:?}")));
+        }
+        let inline_starts = arguments.inline_starts;
+        if !inline_starts.is_empty() && relation(SPAN_START).is_none() {
+            return Err(FormatError(format!("unknown relation {SPAN_START:?}")));
+        }
+        self.spans.validate_inline(
+            &inline_starts,
+            address,
+            span_event.is_start(),
+            &self.history,
+        )?;
+
+        self.exceptions
+            .validate(address, exception.as_ref(), &exception_refs, &self.history)?;
+        self.exceptions.commit(exception, exception_refs);
+        self.spans.commit(span_event, inline_starts);
         self.encoders.extend(encoders);
         self.relations.extend(relations);
         self.statements.extend(statements);
@@ -961,7 +1055,7 @@ impl Renderer {
             }
         }
         if let Some(address) = address {
-            self.last_record.insert(address.thread(), address.sequence);
+            self.history.record(address);
         }
         Ok(output)
     }

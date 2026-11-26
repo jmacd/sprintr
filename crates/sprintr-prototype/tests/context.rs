@@ -12,6 +12,7 @@ entities! {
     #[anonymous]
     session = "session";
     /// Deployment environment
+    #[named(global)]
     environment = "environment" {
         /// Production
         PROD,
@@ -154,7 +155,7 @@ fn stored_context_owns_an_independently_editable_snapshot() {
         work.context.in_scope(|| {
             assert!(matches!(
                 Context::current().get(&active).unwrap(),
-                Some(ContextEntity::Anonymous(_))
+                Some(ContextEntity::Handle(_))
             ));
             emit(); // B, after b and its creator's scope have gone away
             let unwound = std::panic::catch_unwind(|| {

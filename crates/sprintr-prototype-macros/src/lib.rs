@@ -74,6 +74,9 @@ fn documented(attrs: Vec<syn::Attribute>, ident: &Ident) -> syn::Result<Document
     for attr in attrs {
         if attr.path().is_ident("anonymous") {
             attr.meta.require_path_only()?;
+            if anonymous {
+                return Err(syn::Error::new_spanned(attr, "duplicate #[anonymous]"));
+            }
             anonymous = true;
         } else if attr.path().is_ident("doc") {
             if let Meta::NameValue(meta) = &attr.meta
@@ -326,11 +329,76 @@ fn entity(root: &Path, item: EntityItem) -> syn::Result<Tokens> {
         name,
         values,
     } = item;
+    let (named_attrs, attrs): (Vec<_>, _) =
+        attrs.into_iter().partition(|a| a.path().is_ident("named"));
     let Documented {
         docs,
         description,
         anonymous,
     } = documented(attrs, &ident)?;
+    if named_attrs.len() + usize::from(anonymous) != 1 {
+        return Err(syn::Error::new(
+            ident.span(),
+            "declare exactly one of #[anonymous], #[named(global)], or #[named(within = relation, id = key)]",
+        ));
+    }
+    let mut within: Option<Path> = None;
+    let mut global = false;
+    let mut keys: Option<Vec<Path>> = None;
+    if let Some(attr) = named_attrs.first() {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("global") && !global {
+                global = true;
+            } else if meta.path.is_ident("within") && within.is_none() {
+                within = Some(meta.value()?.parse()?);
+            } else if meta.path.is_ident("id") && keys.is_none() {
+                let value = meta.value()?;
+                let list = if value.peek(syn::token::Paren) {
+                    let contents;
+                    syn::parenthesized!(contents in value);
+                    Punctuated::<Path, Token![,]>::parse_terminated(&contents)?
+                        .into_iter()
+                        .collect()
+                } else {
+                    vec![value.parse()?]
+                };
+                if list.is_empty() {
+                    return Err(meta.error("expected identifying attribute(s)"));
+                }
+                keys = Some(list);
+            } else {
+                return Err(meta.error("unknown or repeated named entity option"));
+            }
+            Ok(())
+        })?;
+        if global == within.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "specify global or within = relation",
+            ));
+        }
+        if within.is_some() && keys.is_none() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "a scoped runtime entity needs id = attribute",
+            ));
+        }
+        if values.is_some() && (within.is_some() || keys.is_some()) {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "enumerated constants use #[named(global)]; supply scoped runtime keys at construction",
+            ));
+        }
+    }
+    let local = within.is_some();
+    let parent = within.map_or_else(|| quote!(None), |r| quote!(Some((#r).__scope_type())));
+    let keys = keys.unwrap_or_default();
+    let metadata = if anonymous {
+        quote!(#root::__private::RelationMeta::__new(#name, #root::RelationKind::Entity,
+            #root::RelationType::Object, true, #description))
+    } else {
+        quote!(#root::__private::RelationMeta::__named(#name, #description, #parent, &[#((#keys).__id_key()),*]))
+    };
     let relation = relation_name(&name)?;
     let registration = register(
         root,
@@ -339,15 +407,7 @@ fn entity(root: &Path, item: EntityItem) -> syn::Result<Tokens> {
     let relation_static = |vis: Tokens, ident: &Ident| {
         quote! {
             #[allow(non_upper_case_globals)]
-            #vis static #ident: #root::Entity<#anonymous> = #root::Entity::__new(
-                #root::__private::RelationMeta::__new(
-                    #name,
-                    #root::RelationKind::Entity,
-                    #root::RelationType::Object,
-                    #anonymous,
-                    #description,
-                ),
-            );
+            #vis static #ident: #root::Entity<#anonymous, #local> = #root::Entity::__new(#metadata);
         }
     };
     let Some(values) = values else {
@@ -420,9 +480,18 @@ struct Compiled {
     declaration: Tokens,
     stack: Tokens,
     arguments: Vec<Tokens>,
+    display: Tokens,
 }
 
-fn compile(input: &Input, nested: bool) -> syn::Result<Compiled> {
+#[derive(Clone, Copy, PartialEq)]
+enum Capture {
+    Statement,
+    Nested,
+    Exception,
+}
+
+fn compile(input: &Input, capture: Capture) -> syn::Result<Compiled> {
+    let nested = capture == Capture::Nested;
     let root = &input.root;
     let span = input.format.span();
     let error = |message: &str| syn::Error::new(span, message);
@@ -432,13 +501,22 @@ fn compile(input: &Input, nested: bool) -> syn::Result<Compiled> {
     let mut attributes = Vec::new();
     let mut message = Vec::new();
     let mut references = Vec::new();
+    let mut display = String::new();
     for part in parts {
         match part {
             Part::Literal(text) => {
-                let literal = json_content(&text.replace('{', "{{").replace('}', "}}"), span);
+                let escaped = text.replace('{', "{{").replace('}', "}}");
+                display.push_str(&escaped);
+                let literal = json_content(&escaped, span);
                 message.push(quote!(#literal));
             }
             Part::Field(field) => {
+                display.push('{');
+                if matches!(field.spec, Spec::Hex { .. }) {
+                    display.push(':');
+                    display.push_str(&field.format);
+                }
+                display.push('}');
                 let (label, expression, attribute) = if field.name.is_empty() {
                     let expression = positional
                         .next()
@@ -505,6 +583,10 @@ fn compile(input: &Input, nested: bool) -> syn::Result<Compiled> {
                     let label = json_content(&format!("{{{label}{suffix}}}"), span);
                     message.push(quote!(#label));
                     arguments.push(match (field.spec, field.format.is_empty()) {
+                        (Spec::String, true) if capture == Capture::Exception => quote!({
+                            use #root::__private::RetainedArgument as _;
+                            (#expression).__sprintr_retained_argument()
+                        }),
                         (Spec::String, true) => {
                             let scalars =
                                 nested.then(|| quote!(use #root::__private::ScalarArgument as _;));
@@ -575,24 +657,81 @@ fn compile(input: &Input, nested: bool) -> syn::Result<Compiled> {
     let stack = quote! {
         #root::__private::capture_stack(&mut [0u64; #root::MAX_STACK_DEPTH])
     };
+    let positions = (0..arguments.len()).map(syn::Index::from);
+    let display = quote!(|__fields, __f| ::core::write!(__f, #display #(, __fields[#positions])*));
     Ok(Compiled {
         declaration,
         stack,
         arguments,
+        display,
     })
 }
 
 /// Write a statement whose template carries the given static named values.
 #[proc_macro]
 pub fn record(input: TokenStream) -> TokenStream {
+    event(input, format_ident!("write_event"))
+}
+
+/// Record a start and return the single lifecycle owner.
+#[proc_macro]
+pub fn span(input: TokenStream) -> TokenStream {
+    event(input, format_ident!("start_span"))
+}
+
+fn event(input: TokenStream, method: Ident) -> TokenStream {
     let input = parse_macro_input!(input as Input);
-    let result = compile(&input, false).map(|compiled| {
+    let result = compile(&input, Capture::Statement).map(|compiled| {
         let declaration = compiled.declaration;
         let stack = compiled.stack;
         let arguments = compiled.arguments;
         let root = input.root;
-        quote! {{ #declaration #root::__private::write_event(&__STATEMENT, #stack, &[#(#arguments),*]) }}
+        quote! {{ #declaration #root::__private::#method(&__STATEMENT, #stack, &[#(#arguments),*]) }}
     });
+    result.unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+struct ExceptionInput(Path, Input);
+impl Parse for ExceptionInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let variant = input.parse()?;
+        input.parse::<Token![;]>()?;
+        Ok(Self(variant, input.parse()?))
+    }
+}
+
+#[proc_macro]
+pub fn exception(input: TokenStream) -> TokenStream {
+    let ExceptionInput(variant, mut input) = parse_macro_input!(input as ExceptionInput);
+    let root = &input.root;
+    let mut cause = quote!(None);
+    if let Some(Expr::Assign(a)) = input.arguments.last()
+        && matches!(a.left.as_ref(), Expr::Path(p) if p.path.is_ident("cause"))
+    {
+        let value = &a.right;
+        cause = quote!(Some(::core::convert::Into::into(#value)));
+        input.arguments.pop();
+    }
+    let class = variant
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::");
+    let fragment = bytes(
+        &format!("\"exception.class\":{}", json(&class)),
+        input.format.span(),
+    );
+    input.values.push(syn::parse_quote!(__CLASS));
+    let registration = register(root, quote!(#root::__private::Declaration::Named(&__CLASS)));
+    let result = compile(&input, Capture::Exception).map(|Compiled { declaration, stack, arguments, display }| quote! {{
+        static __CLASS: #root::Named = #root::Named::__new(&#root::schema::exception_class, #class, #class, #fragment);
+        #registration
+        #declaration
+        static __SITE: #root::__private::ErrorSite = #root::__private::ErrorSite::new(
+            &__STATEMENT, #class, ::core::panic::Location::caller(), #display);
+        #variant(#root::__private::capture_exception(&__SITE, #stack, [#(#root::__private::OwnedField::capture(#arguments)),*], #cause))
+    }});
     result.unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
@@ -600,7 +739,7 @@ pub fn record(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn structured(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as Input);
-    let result = compile(&input, true).map(|compiled| {
+    let result = compile(&input, Capture::Nested).map(|compiled| {
         let root = &input.root;
         let declaration = compiled.declaration;
         let arguments = compiled.arguments;

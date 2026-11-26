@@ -9,6 +9,8 @@ use std::sync::OnceLock;
 
 /// One definition, pre-encoded as a `"key":value` member of a `defs` object.
 pub(crate) struct Encoded {
+    /// Schema required to interpret this definition (ID keys, scope or target).
+    pub(crate) dependencies: Box<[usize]>,
     /// The recorded name: the key without its relation prefix.
     pub(crate) name: String,
     pub(crate) bytes: Box<[u8]>,
@@ -30,6 +32,7 @@ pub(crate) struct Runtime {
     keys: HashMap<String, usize>,
     /// Declarations by address. Distinct statics have distinct addresses.
     relations: HashMap<usize, usize>,
+    invalid: HashMap<usize, String>,
     named: HashMap<usize, usize>,
 }
 
@@ -58,43 +61,74 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
 impl Runtime {
     pub(crate) fn new<'a>(declarations: impl Iterator<Item = &'a Declaration> + Clone) -> Self {
         let mut runtime = Self::default();
+        let mut path = Vec::new();
         for declaration in declarations.clone() {
-            if let Declaration::Relation(meta) = declaration {
-                runtime.declare_relation(meta);
+            if let Declaration::Relation(meta) = declaration
+                && let Err(reason) = runtime.declare_relation(meta, &mut path)
+            {
+                runtime.invalid.insert(address(*meta), reason);
             }
         }
         for declaration in declarations {
-            if let Declaration::Named(named) = declaration {
-                runtime.declare_named(named);
+            if let Declaration::Named(named) = declaration
+                && let Ok(relation) = runtime.relation(named.relation().__meta())
+            {
+                runtime.declare_named(named, relation);
             }
         }
         runtime
     }
 
-    fn declare_relation(&mut self, meta: &'static RelationMeta) -> usize {
-        if let Some(index) = self.relations.get(&address(meta)) {
-            return *index;
+    pub(crate) fn check_schema(&self) -> Result<(), String> {
+        if self.invalid.is_empty() {
+            return Ok(());
         }
+        let mut reasons: Vec<_> = self.invalid.values().map(String::as_str).collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        Err(reasons.join("; "))
+    }
+
+    fn declare_relation(
+        &mut self,
+        meta: &'static RelationMeta,
+        path: &mut Vec<usize>,
+    ) -> Result<usize, String> {
+        if let Some(index) = self.relations.get(&address(meta)) {
+            return Ok(*index);
+        }
+        if path.contains(&address(meta)) {
+            return Err(format!(
+                "cyclic entity schema dependency at {:?}",
+                meta.name
+            ));
+        }
+        path.push(address(meta));
+        let mut dependencies = Vec::new();
         let definition = meta.definition(|target| {
-            let index = self.declare_relation(target);
-            self.definitions[index].name.clone()
+            let index = self.declare_relation(target, path)?;
+            if !dependencies.contains(&index) {
+                dependencies.push(index);
+            }
+            Ok(self.definitions[index].name.clone())
         });
+        path.pop();
         let index = self.insert(
             RELATION_PREFIX,
             meta.name,
-            Definition::Relation(definition),
+            Definition::Relation(definition?),
             meta.kind_name(),
             meta.description,
         );
+        self.definitions[index].dependencies = dependencies.into_boxed_slice();
         self.relations.insert(address(meta), index);
-        index
+        Ok(index)
     }
 
-    fn declare_named(&mut self, named: &'static Named) -> usize {
+    fn declare_named(&mut self, named: &'static Named, relation: usize) -> usize {
         if let Some(index) = self.named.get(&address(named)) {
             return *index;
         }
-        let relation = self.declare_relation(named.relation().__meta());
         let prefix = format!("{}:", self.definitions[relation].name);
         let index = self.insert(
             &prefix,
@@ -158,6 +192,7 @@ impl Runtime {
                     let index = self.definitions.len();
                     self.keys.insert(key, index);
                     self.definitions.push(Encoded {
+                        dependencies: Box::default(),
                         name: candidate,
                         bytes: bytes.into_bytes().into_boxed_slice(),
                         definition,
@@ -169,10 +204,14 @@ impl Runtime {
     }
 
     pub(crate) fn relation(&self, meta: &'static RelationMeta) -> Result<usize, String> {
-        self.relations
-            .get(&address(meta))
-            .copied()
-            .ok_or_else(|| format!("relation {:?} was not registered at startup", meta.name))
+        self.relations.get(&address(meta)).copied().ok_or_else(|| {
+            self.invalid
+                .get(&address(meta))
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!("relation {:?} was not registered at startup", meta.name)
+                })
+        })
     }
 
     pub(crate) fn named(&self, named: &'static Named) -> Result<usize, String> {

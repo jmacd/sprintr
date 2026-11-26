@@ -44,9 +44,15 @@ log.level = INFO, account.name = Grace
 
 See the [prototype API and format subset](crates/sprintr-prototype/README.md)
 for [nested structured arguments](crates/sprintr-prototype/README.md#structured-arguments),
-anonymous application objects, [scoped entity context](crates/sprintr-prototype/README.md#scoped-entity-context),
+anonymous and [scoped named entities](crates/sprintr-prototype/README.md#globally-and-locally-named-entities),
+[scoped entity context](crates/sprintr-prototype/README.md#scoped-entity-context),
 implicit captures, positional expressions,
 caller-owned writers, and [deferred call-stack symbolization](crates/sprintr-prototype/README.md#call-stacks-and-symbols).
+The [DFE hierarchy example](crates/sprintr-prototype/examples/dfe_hierarchy.rs)
+shows two batches traced through an engine, group, pipeline, and node.
+`crates/sprintr-prototype/examples/exception_chain.rs` shows a Rust error
+enum wrapping a structured cause, a warning that refers to it, and
+`Caused by:` playback in a separate process.
 
 ## Workspace
 
@@ -56,7 +62,7 @@ caller-owned writers, and [deferred call-stack symbolization](crates/sprintr-pro
 | `sprintr-prototype-macros` | Compile-time format parsing and typed argument capture |
 | `sprintr-prototype` | Public macros, direct JSON recording, reusable buffers, and playback |
 
-Runtime named entities, additional attribute types, graph navigation, and binary
+Additional attribute types, graph navigation, and binary
 encoding are future work. The old tracing/OTLP runtime, adapters, and examples have been
 removed rather than maintained as a second implementation.
 

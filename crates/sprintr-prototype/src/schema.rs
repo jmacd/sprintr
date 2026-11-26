@@ -28,19 +28,46 @@ crate::entities! {
     #[anonymous]
     pub log_record = "log.record";
 
+    /// One captured failure, identified by its generated process-local UID
+    #[anonymous]
+    pub exception = "exception";
+    /// Rust variant classifying an exception statement
+    #[named(global)]
+    pub exception_class = "exception.class";
+
     /// Rust type name for a structured object argument
+    #[named(global)]
     pub struct_name = "struct.name";
 
     /// Named encoder for a positional structured argument
+    #[named(global)]
     pub struct_encode = "struct.encode";
 
+    /// Start record of this span, named by its 16-digit span ID
+    #[named(within = trace_start, id = span_id)]
+    pub span_start = "span.start";
+    /// Root start record of this trace, named by its 32-digit trace ID
+    #[named(global, id = trace_id)]
+    pub trace_start = "trace.start";
+    /// Parent span's start record at child creation
+    #[named(within = trace_start, id = span_id)]
+    pub span_parent = "span.parent";
+
     /// Purpose of a statement in the event stream
+    #[named(global)]
     pub log_kind = "log.kind" {
         /// Creation of a detached instrumentation context
         CONTEXT_START,
+        /// Start of a span
+        SPAN_START,
+        /// End of a span
+        SPAN_END,
+        /// Capture of a structured exception occurrence
+        EXCEPTION,
     }
 
     /// Logging level
+    #[named(global)]
     pub log_level = "log.level" {
         /// Informational event
         INFO,
@@ -52,6 +79,12 @@ crate::entities! {
 }
 
 crate::attributes! {
+    /// Prior exception occurrence that caused this failure
+    pub exception_cause: entity(exception) = "exception.cause";
+    /// OTel trace ID in canonical lowercase hexadecimal
+    pub trace_id: str = "trace.id";
+    /// OTel span ID in canonical lowercase hexadecimal, local to its trace
+    pub span_id: str = "span.id";
     /// Caller PCs after the statement's static frame zero, innermost first; each u64 identifies a log.source
     pub log_stack: [u64] = "log.stack";
     /// Process identifier (PID)
@@ -63,7 +96,18 @@ crate::attributes! {
 }
 
 /// Resolution order for sprintr's own declarations; not a reservation.
-pub(crate) static DECLARATIONS: [Declaration; 16] = [
+pub(crate) static DECLARATIONS: [Declaration; 27] = [
+    Declaration::Relation(exception.__meta()),
+    Declaration::Relation(exception_class.__meta()),
+    Declaration::Relation(exception_cause.__meta()),
+    Declaration::Named(&log_kind::EXCEPTION),
+    Declaration::Relation(trace_id.__meta()),
+    Declaration::Relation(span_id.__meta()),
+    Declaration::Relation(span_start.__meta()),
+    Declaration::Relation(trace_start.__meta()),
+    Declaration::Relation(span_parent.__meta()),
+    Declaration::Named(&log_kind::SPAN_START),
+    Declaration::Named(&log_kind::SPAN_END),
     Declaration::Relation(log_kind.__meta()),
     Declaration::Named(&log_kind::CONTEXT_START),
     Declaration::Relation(struct_name.__meta()),

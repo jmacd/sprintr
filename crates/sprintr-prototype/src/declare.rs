@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::__private::{BorrowedArgument, Unsigned, unsigned};
-use crate::{EntityHandle, RelationDefinition, RelationKind, RelationType};
+use crate::{EntityHandle, IdScope, RelationDefinition, RelationKind, RelationType};
 use std::io;
 use std::marker::PhantomData;
 
@@ -13,7 +13,14 @@ pub struct RelationMeta {
     kind: RelationKind,
     value_type: DeclaredType,
     anonymous: bool,
+    pub(crate) identity: Option<NamedIdentity>,
     pub(crate) description: &'static str,
+}
+
+#[derive(Debug)]
+pub(crate) struct NamedIdentity {
+    pub within: Option<&'static RelationMeta>,
+    pub keys: &'static [&'static RelationMeta],
 }
 
 #[derive(Debug)]
@@ -36,37 +43,83 @@ impl RelationMeta {
             kind,
             value_type: DeclaredType::Literal(value_type),
             anonymous,
+            identity: None,
             description,
         }
     }
 
     #[doc(hidden)]
-    pub const fn __entity_attribute<const ANONYMOUS: bool>(
+    pub const fn __entity_attribute<const ANONYMOUS: bool, const LOCAL: bool>(
         name: &'static str,
         desc: &'static str,
-        target: &'static Entity<ANONYMOUS>,
+        target: &'static Entity<ANONYMOUS, LOCAL>,
     ) -> Self {
         Self {
             name,
             kind: RelationKind::Attribute,
             value_type: DeclaredType::Entity(target.__meta()),
             anonymous: false,
+            identity: None,
             description: desc,
         }
     }
 
     pub(crate) fn definition(
         &self,
-        recorded_name: impl FnOnce(&'static RelationMeta) -> String,
-    ) -> RelationDefinition {
-        RelationDefinition {
+        mut recorded_name: impl FnMut(&'static RelationMeta) -> Result<String, String>,
+    ) -> Result<RelationDefinition, String> {
+        let mut id_keys = Vec::new();
+        if let Some(layout) = &self.identity {
+            for key in layout.keys {
+                let name = recorded_name(key)?;
+                if id_keys.contains(&name) {
+                    return Err(format!(
+                        "duplicate ID attribute {name:?} on {:?}",
+                        self.name
+                    ));
+                }
+                id_keys.push(name);
+            }
+        }
+        Ok(RelationDefinition {
             kind: self.kind,
             value_type: match &self.value_type {
                 DeclaredType::Literal(ty) => ty.clone(),
-                DeclaredType::Entity(target) => RelationType::Entity(recorded_name(target)),
+                DeclaredType::Entity(target) => RelationType::Entity(recorded_name(target)?),
             },
             desc: self.description.into(),
             anonymous: self.anonymous,
+            id_scope: self.identity.as_ref().map(|i| {
+                if i.within.is_some() {
+                    IdScope::Local
+                } else {
+                    IdScope::Global
+                }
+            }),
+            id_keys,
+            scope_entity_type: self
+                .identity
+                .as_ref()
+                .and_then(|i| i.within)
+                .map(recorded_name)
+                .transpose()?,
+        })
+    }
+
+    #[doc(hidden)]
+    pub const fn __named(
+        name: &'static str,
+        desc: &'static str,
+        within: Option<&'static RelationMeta>,
+        keys: &'static [&'static RelationMeta],
+    ) -> Self {
+        Self {
+            name,
+            kind: RelationKind::Entity,
+            value_type: DeclaredType::Literal(RelationType::Object),
+            anonymous: false,
+            description: desc,
+            identity: Some(NamedIdentity { within, keys }),
         }
     }
 
@@ -127,6 +180,11 @@ impl<T: ?Sized> Attribute<T> {
 
 impl Attribute<str> {
     #[doc(hidden)]
+    pub const fn __id_key(&'static self) -> &'static RelationMeta {
+        self.__meta()
+    }
+
+    #[doc(hidden)]
     pub fn __value<'a, V: AsRef<str> + ?Sized>(&self, value: &'a V) -> BorrowedArgument<'a> {
         BorrowedArgument::String(value.as_ref())
     }
@@ -138,6 +196,11 @@ impl Attribute<str> {
 }
 
 impl Attribute<u64> {
+    #[doc(hidden)]
+    pub const fn __id_key(&'static self) -> &'static RelationMeta {
+        self.__meta()
+    }
+
     #[doc(hidden)]
     pub fn __value<V: Unsigned + ?Sized>(&self, value: &V) -> BorrowedArgument<'static> {
         BorrowedArgument::Unsigned(unsigned(value))
@@ -151,8 +214,8 @@ impl Attribute<u64> {
 
 impl Attribute<EntityHandle> {
     #[doc(hidden)]
-    pub fn __value<'a>(&'static self, handle: &'a EntityHandle) -> BorrowedArgument<'a> {
-        BorrowedArgument::EntityArgument(self, handle)
+    pub fn __value<'a>(&'static self, handle: &'a impl EntityArgument) -> BorrowedArgument<'a> {
+        handle.with_role(self)
     }
 
     pub(crate) fn check<'a>(&self, handle: &'a EntityHandle) -> io::Result<&'a EntityHandle> {
@@ -181,12 +244,27 @@ impl Attribute<EntityHandle> {
     }
 }
 
+#[doc(hidden)]
+pub trait EntityArgument {
+    fn with_role(&self, role: &'static Attribute<EntityHandle>) -> BorrowedArgument<'_>;
+}
+impl EntityArgument for EntityHandle {
+    fn with_role(&self, role: &'static Attribute<EntityHandle>) -> BorrowedArgument<'_> {
+        BorrowedArgument::EntityArgument(role, self)
+    }
+}
+impl<T: EntityArgument + ?Sized> EntityArgument for &T {
+    fn with_role(&self, role: &'static Attribute<EntityHandle>) -> BorrowedArgument<'_> {
+        (**self).with_role(role)
+    }
+}
+
 /// An entity relation declared with [`crate::entities!`].
-pub struct Entity<const ANONYMOUS: bool = false> {
+pub struct Entity<const ANONYMOUS: bool = false, const LOCAL: bool = false> {
     meta: RelationMeta,
 }
 
-impl<const ANONYMOUS: bool> Entity<ANONYMOUS> {
+impl<const ANONYMOUS: bool, const LOCAL: bool> Entity<ANONYMOUS, LOCAL> {
     #[doc(hidden)]
     pub const fn __new(meta: RelationMeta) -> Self {
         Self { meta }
@@ -204,6 +282,11 @@ impl<const ANONYMOUS: bool> Entity<ANONYMOUS> {
     #[doc(hidden)]
     pub const fn __meta(&'static self) -> &'static RelationMeta {
         &self.meta
+    }
+
+    #[doc(hidden)]
+    pub const fn __scope_type(&'static self) -> &'static RelationMeta {
+        self.__meta()
     }
 }
 

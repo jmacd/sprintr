@@ -3,6 +3,9 @@
 use super::*;
 use serde_json::json;
 
+mod identity;
+mod spans;
+
 fn snapshot() -> Value {
     let relation = json!({"kind":"entity","type":"object","desc":"","anonymous":true});
     json!({

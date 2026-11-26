@@ -42,6 +42,18 @@ For a tour that prints each JSON record immediately followed by its indented
 rendering, run
 `cargo run --quiet -p sprintr-prototype --example tour`.
 
+The [DFE hierarchy example](examples/dfe_hierarchy.rs) models one engine and
+an `ingest` group with `logs` and `metrics` pipelines. Each pipeline has a
+`batch` node with a different qualified identity. Two workers each process
+one batch: dispatch starts a fresh trace, and the group, pipeline, and node
+operations are child spans. Filter the JSON Lines by trace ID to follow
+one batch even when the workers' records interleave, or replay both as text:
+
+```sh
+cargo run --quiet -p sprintr-prototype --example dfe_hierarchy \
+  | cargo run --quiet -p sprintr-prototype --example json_lines -- replay
+```
+
 The reader requires only the recorded JSON, not the original application.
 Every malformed record or unsupported format stops playback with its input
 line number. Input, output, and flush failures are returned rather than ignored.
@@ -324,6 +336,125 @@ a usable context with its inherited bindings and no origin. A pre-start stderr
 preview likewise has no origin. Acceptance means the writer took the complete
 record, not that buffered output reached durable storage.
 
+### Starting, entering, and ending a span
+
+```rust
+use sprintr_prototype::{info, span, start};
+
+start()?;
+let batch = 42u32;
+let job = span!("process batch {batch:04x}");
+job.in_scope(|| {
+    let read = span!("read input"); // child of job
+    read.in_scope(|| info!("reading"));
+    // Dropping read records its end.
+});
+job.in_scope(|| info!("publishing")); // same span, second entry
+job.end(); // close now instead of on drop
+# Ok::<(), std::io::Error>(())
+```
+
+`span!` uses the ordinary format and argument grammar and returns one local
+owner. Its typed `SPAN_START` record supplies the name, arguments, attributes,
+and timestamp. Entering and leaving only switch the current context. An
+explicit `end(self)` or dropping the owner attempts one distinct `SPAN_END`
+statement; duration is derived from the two timestamps. End uses the output
+selected **at close**, so keep a scoped logger installed through close when
+both records should go to that logger. A rejected or preview-only start
+still returns a usable local scope, but publishes no start reference or end.
+
+The start and events in the span carry `refs` like these (IDs are hex; the
+address components are decimal):
+
+```json
+[
+  {"span.start:000000000000000a":"log.thread:42/span.start:17"},
+  {"trace.start:0000000000000000000000000000000b":"log.thread:42/span.start:17"}
+]
+```
+
+Here record 17 is the root start. A child has a fresh span ID, inherits the
+root reference, and its start also carries `span.parent:<parentID>` pointing
+to the immediate parent start. `Message::span_links()` exposes these roles;
+`Renderer::span_start(address)` returns an accepted start's metadata.
+
+`job.reference()` gives an optional `SpanRef`: it is `Send + Sync`, loggable
+as `info!("blocked on {holder}")`, and remains valid after close. The argument
+contains only `{"$ref":"log.thread:42/span.start:17"}`. To give a worker the
+**close right** instead, consume the span with `job.into_owner()`. The
+resulting `SpanOwner` can move, cannot be cloned, and closes on drop or
+explicit `end()`. Its `in_scope` and close use the destination's selected
+logger and baggage, retaining the original span and trace references. This
+handoff does not transfer local entity handles.
+
+### Capturing and referring to errors
+
+Give an ordinary Rust error variant a `StructuredError` payload. `exception!`
+returns that variant, so callers can match it or return it with `Err(...)`.
+`thiserror` is optional: `#[error(transparent)]` delegates `Display` and
+`Error::source` to the payload without declaring the message twice.
+
+```rust
+use sprintr_prototype::{exception, warn, StructuredError};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum LoadError {
+    #[error(transparent)]
+    BadPort(StructuredError),
+    #[error(transparent)]
+    Config(StructuredError),
+}
+
+# sprintr_prototype::start()?;
+let port = "metrics";
+let LoadError::BadPort(inner) = exception!(LoadError::BadPort, "unknown output {port:s}")
+    else { unreachable!() };
+let path = "agent.yaml";
+let err = exception!(LoadError::Config, "could not load {path:s}", cause = &inner);
+assert_eq!(err.to_string(), "could not load agent.yaml");
+if let LoadError::Config(problem) = &err {
+    warn!("startup failed: {problem}");
+}
+# Ok::<(), std::io::Error>(())
+```
+
+This writes **two exception occurrences and one warning**. Each occurrence
+has its own UID, typed arguments, active context/span, source location and
+raw caller PCs. The warning's argument is just a `$ref` to the wrapper. The
+optional trailing `cause` refers to an earlier occurrence and consumes no
+placeholder. Use a qualified attribute path if an ordinary field is also
+named `cause`.
+
+The local `StructuredError` owns its fields and local cause chain through
+`Rc`. Local display formats the captured values on demand, even after the
+writer is gone. Exception fields support strings, unsigned integers, declared
+scalar and entity attributes, entity/span/exception handles, and explicit
+`:?` (Debug text captured once). Borrowed `StructuredValue` formatters are
+available in ordinary logs; in an exception, pass their identifying handle
+or the fields you want to retain.
+
+`problem.reference()` promotes an accepted occurrence to a `Send + Sync`
+`ExceptionRef`. Send it to a worker to log it or to wrap it with
+`cause = &reference`. Its local `Display` is the address; playback can
+retrieve the original message and stack. Rejected writes and pre-start
+diagnostics leave `reference()` as `None`. The application still receives its
+error, and a later wrapper explicitly identifies the unrecorded cause by UID.
+
+**Example path:** `crates/sprintr-prototype/examples/exception_chain.rs`.
+Record in one process and expand the reported error in another:
+
+```sh
+cargo run -q -p sprintr-prototype --example exception_chain -- record \
+  | cargo run -q -p sprintr-prototype --example exception_chain -- replay
+```
+
+`Renderer::exception_chain(origin, |_| None)` prints `Caused by:` with each
+occurrence's own frame zero and raw PCs, abbreviating common caller frames.
+A resolver callback can supply frame text using the **originating process's**
+module map and debug artifacts. `Some(symbols.format_frame(pc))` with
+`LocalSymbols` is appropriate only for a reader in the same execution.
+
 ## Declaring attributes and entities
 
 ```rust
@@ -338,6 +469,7 @@ attributes! {
 
 entities! {
     /// Deployment environment
+    #[named(global)]
     pub environment = "deployment.environment" {
         /// Production traffic
         PRODUCTION,
@@ -375,6 +507,57 @@ no scoping meaning, and equal declarations in different crates share a name.
 sprintr's own relations (`log.statement`, `log.level`, `process.pid`,
 `telemetry.sdk.*`) are declared the same way in `sprintr_prototype::schema`;
 only `log.relation`, the relation of relations, is built into the wire format.
+
+### Globally and locally named entities
+
+Declare the identifying attributes separately from the descriptive object.
+`within` names a relation in the declaration and takes a concrete container
+at construction. Entering a logger or entity context does not select the
+identity scope.
+
+```rust
+use sprintr_prototype::{attributes, entities, info, start};
+
+attributes! {
+    /// Pipeline instance UID
+    run_uid: str = "pipeline_instance.uid";
+    /// Node ID within this pipeline instance
+    node_id: str = "node.id";
+}
+entities! {
+    /// Pipeline instance
+    #[named(global, id = run_uid)]
+    pipeline_instance = "pipeline_instance";
+    /// Runtime node
+    #[named(within = pipeline_instance, id = node_id)]
+    node = "node";
+}
+
+start()?;
+let run = pipeline_instance.named("run-42", serde_json::json!({}))?;
+let batch = node.within(&run).named("batch", serde_json::json!({"kind":"processor"}))?;
+info!("starting {batch}");
+# Ok::<(), std::io::Error>(())
+```
+
+The resulting key is `node:[["run-42"],["batch"]]`. The relation definitions
+carry `id_scope`, the ordered `id_keys`, and (for local names) `scope_entity_type`.
+Each component of the key contains its typed ID values in declaration order.
+Compound IDs use `id = (first_attr, second_attr)` and accept a pair, or an
+array of `IdentityValue` for longer mixed keys. Wrong containers, arities and
+scalar types fail at construction. The parent can be dropped, and the child
+can be decoded even if the parent's object was never logged.
+
+For `within = sprintr_prototype::schema::span_start`, pass a `&SpanRef`.
+The child's identity includes `trace.id` and `span.id`; two traces may use the
+same SpanID. The start-record address locates the observation separately.
+
+For a direct encoder, `handle.identity()` exposes `declaration().id_keys`,
+`values()`, and `within()` as Rust data. JSON is one projection of that
+identity. The output deduplicates equal handles by their qualified identity;
+their record-relative `$ref` still identifies a particular accepted definition.
+`#[named(global)]` with a block declares static vocabulary such as `INFO`;
+`#[anonymous]` requests a library-assigned process-local UID.
 
 ### Defining and reusing an anonymous object
 

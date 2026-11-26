@@ -33,6 +33,7 @@ attributes! {
 // fresh identity for each application object.
 entities! {
     /// Deployment environment
+    #[named(global)]
     pub environment = "deployment.environment" {
         /// Production traffic
         PRODUCTION,

@@ -36,8 +36,13 @@ impl Argument {
                 Ok(())
             }
             (Self::Reference { target }, RelationType::Entity(relation))
-                if matches!(reference::parse(target)?, reference::Target::Definition { key, .. }
-                    if key.split_once(':').is_some_and(|(r, _)| r == relation)) =>
+                if match reference::parse(target)? {
+                    reference::Target::Definition { key, .. } => {
+                        key.split_once(':').is_some_and(|(r, _)| r == relation)
+                    }
+                    reference::Target::Exception(_) => relation == crate::EXCEPTION,
+                    _ => false,
+                } =>
             {
                 Ok(())
             }

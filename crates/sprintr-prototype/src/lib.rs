@@ -13,8 +13,10 @@ pub mod buffer;
 mod context;
 mod declare;
 mod entity;
+mod exception;
 mod runtime;
 pub mod schema;
+mod span;
 mod stack;
 mod statement;
 mod stream;
@@ -30,12 +32,14 @@ use stream::StreamState;
 pub use context::{Context, ContextEntity, EntityContext};
 pub use declare::{Attribute, Entity, Named};
 pub use entity::BorrowedArgument as Value;
-pub use entity::EntityHandle;
+pub use entity::{EntityHandle, EntityIdentity, IdentityScopeRef, IdentityValues, Within};
+pub use exception::{ExceptionRef, StructuredError};
+pub use span::{Span, SpanOwner, SpanRef};
 pub use sprintr_message::{
-    Argument, ArgumentBinding, ContextRef, Definition, EncodeDefinition, Message, RECORD, RELATION,
-    RELATION_PREFIX, RecordAddress, RelationDefinition, RelationKind, RelationType, Renderer,
-    SOURCE, STACK, STATEMENT, STATEMENT_PREFIX, STRUCT_ENCODE, StatementSource, StatementTemplate,
-    THREAD, format, format::FormatError,
+    Argument, ArgumentBinding, ContextRef, Definition, EncodeDefinition, IdScope, IdentityValue,
+    Message, RECORD, RELATION, RELATION_PREFIX, RecordAddress, RelationDefinition, RelationKind,
+    RelationType, Renderer, SOURCE, STACK, STATEMENT, STATEMENT_PREFIX, STRUCT_ENCODE,
+    StatementSource, StatementTemplate, THREAD, format, format::FormatError,
 };
 pub use structured::{StructuredValue, ValueWriter};
 
@@ -43,8 +47,8 @@ pub use stack::{DEFAULT_STACK_DEPTH, MAX_STACK_DEPTH, set_stack_limit};
 
 #[doc(hidden)]
 pub use sprintr_prototype_macros::{
-    attributes as __attributes, entities as __entities, record as __record,
-    structured as __structured,
+    attributes as __attributes, entities as __entities, exception as __exception,
+    record as __record, span as __span, structured as __structured,
 };
 
 /// Describe how a [`StructuredValue`] formats itself. Call `.encode(out)` on
@@ -114,6 +118,7 @@ macro_rules! attributes {
 /// ```
 /// sprintr_prototype::entities! {
 ///     /// Deployment environment
+///     #[named(global)]
 ///     pub environment = "deployment.environment" {
 ///         /// Production traffic
 ///         PRODUCTION,
@@ -283,6 +288,32 @@ macro_rules! context {
     };
 }
 
+/// Record a span start and return its sole close owner. Entering the span is
+/// explicit, using [`Span::in_scope`]; closing records a separate end statement.
+#[macro_export]
+macro_rules! span {
+    ($($input:tt)*) => { $crate::__span!($crate; [$crate::schema::log_kind::SPAN_START]; $($input)*) };
+}
+
+/// Capture one error occurrence and return the supplied tuple variant. The
+/// optional final `cause = &inner` is a link, not a message placeholder.
+#[macro_export]
+macro_rules! exception {
+    ($variant:path, $($input:tt)*) => { $crate::__exception!($variant; $crate; [$crate::schema::log_kind::EXCEPTION]; $($input)*) };
+}
+
+#[derive(Clone, Copy)]
+struct EventArgs<'a> {
+    values: &'a [BorrowedArgument<'a>],
+    kind: EventKind<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum EventKind<'a> {
+    Ordinary,
+    SpanStart(&'a span::Start),
+    Exception(exception::Occurrence),
+}
 /// A synchronous, caller-owned JSON Lines writer.
 pub struct Logger<W, B = HeapBuffer> {
     writer: W,
@@ -327,7 +358,7 @@ impl<W: Write, B: RecordBuffer> Logger<W, B> {
         &mut self,
         statement: &'static Statement,
         stack: io::Result<&[u64]>,
-        arguments: &[BorrowedArgument<'_>],
+        arguments: EventArgs<'_>,
     ) -> io::Result<Option<RecordAddress>> {
         if self.state.startup.is_none() {
             return unstarted(statement, arguments);
@@ -384,7 +415,7 @@ fn startup_result(result: &io::Result<()>) -> io::Result<()> {
 
 fn unstarted(
     statement: &'static Statement,
-    args: &[BorrowedArgument<'_>],
+    args: EventArgs<'_>,
 ) -> io::Result<Option<RecordAddress>> {
     use std::cell::RefCell;
     thread_local! { static FALLBACK: RefCell<()> = const { RefCell::new(()) }; }
@@ -417,15 +448,14 @@ fn unstarted(
         .map_err(|_| io::Error::other("pre-start logging unavailable"))?
 }
 
-type Dispatch<'scope> = dyn Fn(
-        &'static Statement,
-        io::Result<&[u64]>,
-        &[BorrowedArgument<'_>],
-    ) -> io::Result<Option<RecordAddress>>
+type Dispatch<'scope> = dyn Fn(&'static Statement, io::Result<&[u64]>, EventArgs<'_>) -> io::Result<Option<RecordAddress>>
     + 'scope;
 scoped_tls_hkt::scoped_thread_local!(static CURRENT: for<'a> &'a Dispatch<'a>);
 
 fn announce() -> io::Result<()> {
+    runtime()
+        .check_schema()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     crate::__record!(crate; [crate::schema::log_level::INFO];
         "process {} started logging with {} {}",
         schema::process_pid = std::process::id(),
@@ -513,6 +543,7 @@ pub mod __private {
     };
     pub use crate::declare::{Declaration, RelationMeta};
     pub use crate::entity::BorrowedArgument;
+    pub use crate::exception::{ErrorSite, OwnedField, RetainedArgument, capture_exception};
     pub use crate::stack::capture_stack;
     pub use crate::statement::{
         NestedTemplate, Statement, concatenate, encoded_len, json_string, json_string_len,
@@ -540,7 +571,9 @@ pub mod __private {
     static STDOUT_START: OnceLock<io::Result<()>> = OnceLock::new();
 
     #[inline]
-    fn accepted_address(result: io::Result<Option<RecordAddress>>) -> Option<RecordAddress> {
+    pub(super) fn accepted_address(
+        result: io::Result<Option<RecordAddress>>,
+    ) -> Option<RecordAddress> {
         result.unwrap_or_else(|error| {
             // stderr itself may be unavailable; instrumentation must still return.
             let _ = writeln!(
@@ -618,6 +651,46 @@ pub mod __private {
         statement: &'static Statement,
         stack: io::Result<&[u64]>,
         arguments: &[BorrowedArgument<'_>],
+    ) -> io::Result<Option<RecordAddress>> {
+        dispatch(
+            statement,
+            stack,
+            super::EventArgs {
+                values: arguments,
+                kind: super::EventKind::Ordinary,
+            },
+        )
+    }
+
+    pub fn start_span(
+        statement: &'static Statement,
+        stack: io::Result<&[u64]>,
+        arguments: &[BorrowedArgument<'_>],
+    ) -> crate::Span {
+        let base = Context::current();
+        let start = super::span::Start::new(base.span());
+        let reference = match start {
+            Ok(start) => accepted_address(dispatch(
+                statement,
+                stack,
+                super::EventArgs {
+                    values: arguments,
+                    kind: super::EventKind::SpanStart(&start),
+                },
+            ))
+            .map(|address| start.accepted(address)),
+            Err(error) => {
+                report(Err(error));
+                None
+            }
+        };
+        crate::Span::new(base, reference)
+    }
+
+    pub(super) fn dispatch(
+        statement: &'static Statement,
+        stack: io::Result<&[u64]>,
+        arguments: super::EventArgs<'_>,
     ) -> io::Result<Option<RecordAddress>> {
         if super::CURRENT.is_set() {
             return super::CURRENT.with(|dispatch| dispatch(statement, stack, arguments));

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::RecordAddress;
 use crate::format::FormatError;
 use std::fmt::Write as _;
 
@@ -36,7 +37,7 @@ pub fn push_pointer_token(fragment: &mut String, token: &str) {
     }
 }
 
-fn unsigned_id(text: &str) -> Option<u64> {
+pub(super) fn unsigned_id(text: &str) -> Option<u64> {
     if (text.len() > 1 && text.starts_with('0')) || !text.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -51,6 +52,35 @@ pub(super) fn index(text: &str) -> Option<usize> {
     usize::try_from(unsigned_id(text)?).ok()
 }
 
+impl RecordAddress {
+    /// Format `log.thread:<thread>/span.start:<sequence>` without allocating a string.
+    /// The last component is a record sequence, not the span ID.
+    pub fn span_start_ref(self) -> impl std::fmt::Display {
+        std::fmt::from_fn(move |f| {
+            write!(
+                f,
+                "log.thread:{}/span.start:{}",
+                self.thread(),
+                self.sequence()
+            )
+        })
+    }
+
+    /// Parse `log.thread:<native-thread>/span.start:<sequence>` in canonical decimal.
+    pub fn parse_span_start_ref(target: &str) -> Result<Self, FormatError> {
+        let invalid = || FormatError(format!("invalid span start address {target:?}"));
+        let (thread, sequence) = target
+            .strip_prefix("log.thread:")
+            .and_then(|s| s.split_once("/span.start:"))
+            .ok_or_else(invalid)?;
+        Self::new(
+            unsigned_id(thread).ok_or_else(invalid)?,
+            unsigned_id(sequence).ok_or_else(invalid)?,
+        )
+        .ok_or_else(invalid)
+    }
+}
+
 pub(super) enum Target {
     Definition {
         sequence: Option<u64>,
@@ -58,10 +88,21 @@ pub(super) enum Target {
     },
     /// Decoded tokens *after* `/args/`, starting with the argument index.
     Argument(Vec<String>),
+    SpanStart(RecordAddress),
+    Exception(crate::ExceptionTarget),
 }
 
-/// Decode the URI fragment before splitting the pointer or unescaping tokens.
+/// Process addresses are not URI fragments. For pointers, decode the fragment
+/// before splitting it or unescaping tokens.
 pub(super) fn parse(target: &str) -> Result<Target, FormatError> {
+    if target.starts_with("exception:")
+        || (target.starts_with("log.thread:") && target.contains("#/defs/exception:"))
+    {
+        return crate::ExceptionTarget::parse(target).map(Target::Exception);
+    }
+    if target.starts_with("log.thread:") {
+        return RecordAddress::parse_span_start_ref(target).map(Target::SpanStart);
+    }
     let invalid = || FormatError(format!("invalid reference {target:?}"));
     let (record, fragment) = target.split_once('#').ok_or_else(invalid)?;
     let sequence = if record.is_empty() {

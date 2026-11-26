@@ -24,11 +24,13 @@ mod other {
 mod levels {
     sprintr_prototype::entities! {
         /// Logging level
+        #[named(global)]
         pub same = "log.level" {
             /// Informational
             INFO,
         }
         /// Severity
+        #[named(global)]
         pub different = "log.level";
     }
 }
