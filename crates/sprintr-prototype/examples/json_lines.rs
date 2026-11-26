@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use sprintr_prototype::symbols::{ModuleMap, RecordedSymbols};
-use sprintr_prototype::{Message, Renderer, attributes, info, replay};
-use std::io::{self, BufRead, Write};
+use sprintr_prototype::symbols::ModuleMap;
+use sprintr_prototype::{ReplayMode, attributes, info};
+use std::io::{self, Write};
 
 attributes! {
     /// Account name
@@ -31,50 +31,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 file.flush()?;
             }
         }
-        (Some("replay"), Some(path)) => {
-            let map: Option<ModuleMap> = if path == "--symbols" {
-                None
-            } else {
-                let file = std::fs::File::open(path)?;
-                Some(serde_json::from_reader(io::BufReader::new(file))?)
+        (Some("replay"), modules) => {
+            let map: ModuleMap;
+            let mode = match modules.as_deref() {
+                None => ReplayMode::Plain,
+                Some("--symbols") => ReplayMode::EmbeddedSymbols,
+                Some(path) => {
+                    map = serde_json::from_reader(io::BufReader::new(std::fs::File::open(path)?))?;
+                    ReplayMode::ModuleMap(&map)
+                }
             };
-            let mut symbols = RecordedSymbols::default();
-            let mut renderer = Renderer::default();
-            let mut out = io::stdout().lock();
-            for (index, line) in io::stdin().lock().lines().enumerate() {
-                let record: Message =
-                    serde_json::from_str(&line?).map_err(|e| format!("line {}: {e}", index + 1))?;
-                writeln!(
-                    out,
-                    "{}",
-                    renderer
-                        .render(&record)
-                        .map_err(|e| format!("line {}: {e}", index + 1))?
-                )?;
-                let site = renderer
-                    .statement_source(record.attrs["log.statement"])
-                    .expect("rendered statement");
-                writeln!(out, "  log.stack =\n      {site}")?;
-                if map.is_none() {
-                    symbols.observe(&record)?;
-                }
-                for &pc in &record.stack {
-                    if let Some((module, linked)) = map.as_ref().and_then(|m| m.locate(pc)) {
-                        writeln!(
-                            out,
-                            "      at {pc:#x} ({} @ {linked:#x})",
-                            sprintr_message::short_path(&module.path)
-                        )?;
-                    } else if let Some(frame) = symbols.format_frame(pc)? {
-                        writeln!(out, "      {frame}")?;
-                    } else {
-                        writeln!(out, "      at <unmapped> ({pc:#x})")?;
-                    }
-                }
-            }
-            out.flush()?;
+            mode.replay(io::stdin().lock(), io::stdout().lock())?;
         }
-        (Some("replay"), None) => replay(io::stdin().lock(), io::stdout().lock())?,
         _ => return Err(usage.into()),
     }
     Ok(())

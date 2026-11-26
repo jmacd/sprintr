@@ -6,7 +6,7 @@
 
 #![doc = include_str!("../README.md")]
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod buffer;
@@ -14,6 +14,7 @@ mod context;
 mod declare;
 mod entity;
 mod exception;
+mod replay;
 mod runtime;
 pub mod schema;
 mod span;
@@ -34,6 +35,7 @@ pub use declare::{Attribute, Entity, Named};
 pub use entity::BorrowedArgument as Value;
 pub use entity::{EntityHandle, EntityIdentity, IdentityScopeRef, IdentityValues, Within};
 pub use exception::{ExceptionRef, StructuredError};
+pub use replay::{ReplayMode, replay};
 pub use span::{Span, SpanOwner, SpanRef};
 pub use sprintr_message::{
     Argument, ArgumentBinding, ContextRef, Definition, EncodeDefinition, IdScope, IdentityValue,
@@ -507,33 +509,6 @@ fn timestamp_now() -> io::Result<u64> {
         .map_err(io::Error::other)?;
     u64::try_from(elapsed.as_nanos())
         .map_err(|_| io::Error::other("Unix timestamp exceeds u64 nanoseconds"))
-}
-
-/// Read JSON Lines and write formatted messages without their structured envelope.
-///
-/// Invalid records report their one-based input line. Processing stops on the
-/// first error; previously written messages are not rolled back.
-pub fn replay(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
-    let mut renderer = Renderer::default();
-    for (index, line) in input.lines().enumerate() {
-        let number = index + 1;
-        let line =
-            line.map_err(|error| io::Error::new(error.kind(), format!("line {number}: {error}")))?;
-        let message: Message = serde_json::from_str(&line).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("line {number}: {error}"),
-            )
-        })?;
-        let text = renderer.render(&message).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("line {number}: {error}"),
-            )
-        })?;
-        writeln!(output, "{text}")?;
-    }
-    output.flush()
 }
 
 #[doc(hidden)]

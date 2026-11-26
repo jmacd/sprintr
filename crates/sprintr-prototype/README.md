@@ -22,11 +22,12 @@ After the [startup announcement](#startup-announcement):
 {"seq":2,"stmt":2,"thread":88888,"ts":1704067200124567890,"attrs":{"log.stack":[4336737584,4336770768]},"args":["Grace",42]}
 ```
 
-Replay from stdin:
+Install the reader from the repository root and replay from stdin:
 
 ```sh
+cargo install --locked --path crates/sprintr-cli
 cargo run --quiet -p sprintr-prototype --example json_lines -- record \
-  | cargo run --quiet -p sprintr-prototype --example json_lines -- replay
+  | sprintr replay
 ```
 
 ```text
@@ -51,7 +52,7 @@ one batch even when the workers' records interleave, or replay both as text:
 
 ```sh
 cargo run --quiet -p sprintr-prototype --example dfe_hierarchy \
-  | cargo run --quiet -p sprintr-prototype --example json_lines -- replay
+  | sprintr replay
 ```
 
 With `--fail-metrics`, the logs batch still succeeds. The metrics node records
@@ -727,7 +728,7 @@ one optional sidecar, not one symbol entry per address:
 
 ```sh
 cargo run --quiet -p sprintr-prototype --example json_lines -- record modules.json > records.jsonl
-cargo run --quiet -p sprintr-prototype --example json_lines -- replay modules.json < records.jsonl
+sprintr replay --module-map modules.json records.jsonl
 ```
 
 This prints the module and its linked call-instruction address for each PC
@@ -760,7 +761,7 @@ bytes; neither opens paths named in the recording.
 
 ```sh
 cargo run -q -p sprintr-prototype --example exception_chain -- replay < run.jsonl
-cargo run -q -p sprintr-prototype --example json_lines -- replay --symbols < run.jsonl
+sprintr replay --symbols run.jsonl
 ```
 
 Applications call `symbols::record_symbols(paths)?` once on the started

@@ -1,0 +1,23 @@
+[package]
+name = "sprintr-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+description = "Command-line reader for sprintr JSON Lines recordings"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "sprintr"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+sprintr-prototype = { path = "../sprintr-prototype" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"

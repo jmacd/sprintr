@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/sprintr-cli",
     "crates/sprintr-message",
     "crates/sprintr-prototype-macros",
     "crates/sprintr-prototype",

@@ -15,6 +15,27 @@ a statement reference and typed arguments; first-use definitions
 bootstrap the reader. Playback executes the stored formatting. It is not production-ready.
 There is no Tokio, tracing, or OpenTelemetry SDK dependency.
 
+## Read a recording
+
+Install the `sprintr` command from the repository root:
+
+```sh
+cargo install --locked --path crates/sprintr-cli
+```
+
+Pipe your application's JSON Lines to `sprintr replay`, or pass a saved recording:
+
+```sh
+./your-app | sprintr replay
+sprintr replay run.jsonl
+sprintr replay --symbols run.jsonl
+```
+
+`--symbols` prints stacks using symbol packs embedded in the recording.
+For recordings with a separate module map, use `--module-map modules.json`
+to display linked addresses instead. Start at the beginning of the recording
+so the reader sees any definitions that later events reuse.
+
 ## Try it
 
 ```sh
@@ -30,7 +51,7 @@ After the startup announcement:
 
 ```sh
 cargo run --quiet -p sprintr-prototype --example json_lines -- record \
-  | cargo run --quiet -p sprintr-prototype --example json_lines -- replay
+  | sprintr replay
 ```
 
 ```text
@@ -58,6 +79,7 @@ enum wrapping a structured cause, a warning that refers to it, and
 
 | Crate | Purpose |
 |-------|---------|
+| `sprintr-cli` | Installable `sprintr` command for reading recordings |
 | `sprintr-message` | Message representation, shared format grammar, and rendering |
 | `sprintr-prototype-macros` | Compile-time format parsing and typed argument capture |
 | `sprintr-prototype` | Public macros, direct JSON recording, reusable buffers, and playback |
