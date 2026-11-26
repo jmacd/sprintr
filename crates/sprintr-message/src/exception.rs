@@ -234,7 +234,24 @@ impl Renderer {
         origin: RecordAddress,
         mut symbol: impl FnMut(u64) -> Option<String>,
     ) -> Option<String> {
-        let mut e = self.exceptions.by_origin.get(&origin)?.1.as_ref()?;
+        self.try_exception_chain(origin, |pc| Ok::<_, std::convert::Infallible>(symbol(pc)))
+            .expect("infallible symbol callback")
+    }
+
+    /// As `exception_chain`, but distinguish absent symbols from resolver errors.
+    pub fn try_exception_chain<E>(
+        &self,
+        origin: RecordAddress,
+        mut symbol: impl FnMut(u64) -> Result<Option<String>, E>,
+    ) -> Result<Option<String>, E> {
+        let Some(mut e) = self
+            .exceptions
+            .by_origin
+            .get(&origin)
+            .and_then(|(_, e)| e.as_ref())
+        else {
+            return Ok(None);
+        };
         let mut out = String::new();
         let mut previous: &[u64] = &[];
         loop {
@@ -254,7 +271,7 @@ impl Renderer {
                 .take_while(|(a, b)| a == b)
                 .count();
             for &pc in &e.stack[..e.stack.len() - common] {
-                if let Some(frame) = symbol(pc) {
+                if let Some(frame) = symbol(pc)? {
                     write!(out, "\n    {frame}")
                 } else {
                     write!(out, "\n    at <unresolved> ({pc:#x})")
@@ -281,6 +298,6 @@ impl Renderer {
             previous = &e.stack;
             e = next;
         }
-        Some(out)
+        Ok(Some(out))
     }
 }

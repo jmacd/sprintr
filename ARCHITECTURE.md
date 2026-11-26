@@ -616,6 +616,25 @@ locally after recording, or relocate the PCs with a bulk module map and
 matching debug artifacts from that run. Each concept is described through a relation rooted in
 `log.relation`. Placement of this context in OTel resources is deferred.
 
+#### Self-contained stack replay
+
+Opt-in recordings publish one `log.symbol_bundle` entity before worker
+events. A `log.recorded_symbols` role points to it. The bundle contains
+two different kinds of data: the originating execution's architecture and
+loaded-to-linked code ranges, and standalone GSYM v1 bytes generated at build
+time for the supplied modules. The module's ELF build ID or Mach-O UUID
+selects the right symbols; a SHA-256 digest identifies the pack contents.
+The JSON projection base64-encodes each distinct pack once. Neither per-event
+stack capture nor exception wrapping consults these tables.
+
+The reader locates the recorded return PC in that map, adjusts to the call
+instruction once, and looks up the linked address using the embedded bytes.
+It can recover functions, source lines and inline frames without a binary,
+network service or debug files on the replay host. Symbol coverage is per
+module: missing packs or symbols leave the original PC visible. This version
+uses one stable module map per recording; supporting unloads or address reuse
+requires associating a stack with the mapping epoch at capture.
+
 ### Structured exceptions (implemented)
 
 `exception!(LoadError::Config, "could not load {path:s}", cause = &inner)`

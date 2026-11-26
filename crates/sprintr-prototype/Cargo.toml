@@ -10,6 +10,8 @@ publish = false
 
 [dependencies]
 backtrace = "0.3"
+base64 = "0.22"
+blazesym = { version = "0.2.7", default-features = false, features = ["gsym", "demangle"] }
 findshlibs = "0.10"
 gettid = "0.1.4"
 getrandom = "0.3"
@@ -17,6 +19,7 @@ linkme = "0.3"
 scoped-tls-hkt = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sprintr-message = { path = "../sprintr-message" }
 sprintr-prototype-macros = { path = "../sprintr-prototype-macros" }
 

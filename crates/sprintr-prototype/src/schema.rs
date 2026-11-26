@@ -20,6 +20,10 @@ crate::entities! {
     #[anonymous]
     pub log_source = "log.source";
 
+    /// Bulk symbol data and executable mappings for a recording
+    #[anonymous]
+    pub symbol_bundle = "log.symbol_bundle";
+
     /// Logging thread identified by its native operating-system thread ID
     #[anonymous]
     pub log_thread = "log.thread";
@@ -79,6 +83,8 @@ crate::entities! {
 }
 
 crate::attributes! {
+    /// Offline stack symbolization metadata published by this record
+    pub recorded_symbols: entity(symbol_bundle) = "log.recorded_symbols";
     /// Prior exception occurrence that caused this failure
     pub exception_cause: entity(exception) = "exception.cause";
     /// OTel trace ID in canonical lowercase hexadecimal
@@ -96,7 +102,9 @@ crate::attributes! {
 }
 
 /// Resolution order for sprintr's own declarations; not a reservation.
-pub(crate) static DECLARATIONS: [Declaration; 27] = [
+pub(crate) static DECLARATIONS: [Declaration; 29] = [
+    Declaration::Relation(symbol_bundle.__meta()),
+    Declaration::Relation(recorded_symbols.__meta()),
     Declaration::Relation(exception.__meta()),
     Declaration::Relation(exception_class.__meta()),
     Declaration::Relation(exception_cause.__meta()),

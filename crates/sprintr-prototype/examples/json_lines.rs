@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use sprintr_prototype::symbols::ModuleMap;
+use sprintr_prototype::symbols::{ModuleMap, RecordedSymbols};
 use sprintr_prototype::{Message, Renderer, attributes, info, replay};
 use std::io::{self, BufRead, Write};
 
@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
     let modules = arguments.next();
-    let usage = "usage: json_lines <record|replay> [module-map.json]";
+    let usage = "usage: json_lines record [module-map.json] | replay [module-map.json|--symbols]";
     if arguments.next().is_some() {
         return Err(usage.into());
     }
@@ -32,8 +32,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         (Some("replay"), Some(path)) => {
-            let file = std::fs::File::open(path)?;
-            let map: ModuleMap = serde_json::from_reader(io::BufReader::new(file))?;
+            let map: Option<ModuleMap> = if path == "--symbols" {
+                None
+            } else {
+                let file = std::fs::File::open(path)?;
+                Some(serde_json::from_reader(io::BufReader::new(file))?)
+            };
+            let mut symbols = RecordedSymbols::default();
             let mut renderer = Renderer::default();
             let mut out = io::stdout().lock();
             for (index, line) in io::stdin().lock().lines().enumerate() {
@@ -50,13 +55,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .statement_source(record.attrs["log.statement"])
                     .expect("rendered statement");
                 writeln!(out, "  log.stack =\n      {site}")?;
+                if map.is_none() {
+                    symbols.observe(&record)?;
+                }
                 for &pc in &record.stack {
-                    if let Some((module, linked)) = map.locate(pc) {
+                    if let Some((module, linked)) = map.as_ref().and_then(|m| m.locate(pc)) {
                         writeln!(
                             out,
                             "      at {pc:#x} ({} @ {linked:#x})",
                             sprintr_message::short_path(&module.path)
                         )?;
+                    } else if let Some(frame) = symbols.format_frame(pc)? {
+                        writeln!(out, "      {frame}")?;
                     } else {
                         writeln!(out, "      at <unmapped> ({pc:#x})")?;
                     }

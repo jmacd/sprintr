@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Reader-side symbolization. Neither unwinding nor writing a record loads this map.
+//! Offline and same-process symbolization. Ordinary event capture does no symbol lookup.
+
+mod bundle;
+pub use bundle::{RecordedSymbols, record_symbols};
 
 use findshlibs::{Segment, SharedLibrary, TargetSharedLibrary};
 use serde::{Deserialize, Serialize};

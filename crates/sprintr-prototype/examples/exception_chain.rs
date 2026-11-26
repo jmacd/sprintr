@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sprintr_message::{Argument, ExceptionTarget};
+use sprintr_prototype::symbols::RecordedSymbols;
 use sprintr_prototype::{Message, Renderer, StructuredError, exception, warn};
 use std::io;
 use thiserror::Error;
@@ -42,17 +43,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("replay") => {
             let mut reader = Renderer::default();
+            let mut symbols = RecordedSymbols::default();
             for event in
                 serde_json::Deserializer::from_reader(io::stdin().lock()).into_iter::<Message>()
             {
                 let event = event?;
                 reader.render(&event)?;
-                if let [Argument::Reference { target }] = event.args.as_slice() {
-                    let origin = ExceptionTarget::parse(target)?
+                symbols.observe(&event)?;
+                // Other single-reference arguments can name DFE entities or spans.
+                if let [Argument::Reference { target }] = event.args.as_slice()
+                    && let Ok(exception) = ExceptionTarget::parse(target)
+                {
+                    let origin = exception
                         .origin
                         .ok_or("reported exception was not recorded")?;
                     let chain = reader
-                        .exception_chain(origin, |_| None)
+                        .try_exception_chain(origin, |pc| symbols.format_frame(pc))?
                         .ok_or("missing exception record")?;
                     println!("{chain}");
                 }

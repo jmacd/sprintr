@@ -54,6 +54,17 @@ cargo run --quiet -p sprintr-prototype --example dfe_hierarchy \
   | cargo run --quiet -p sprintr-prototype --example json_lines -- replay
 ```
 
+With `--fail-metrics`, the logs batch still succeeds. The metrics node records
+`NodeError::OutputClosed` in its execution span. Back in the pipeline span,
+`PipelineError::BatchRejected` links that cause to batch 2. The engine's
+dispatch span records a warning containing just the wrapper reference.
+To expand that warning into the two failure-site stacks:
+
+```sh
+cargo run --quiet -p sprintr-prototype --example dfe_hierarchy -- --fail-metrics \
+  | cargo run --quiet -p sprintr-prototype --example exception_chain -- replay
+```
+
 The reader requires only the recorded JSON, not the original application.
 Every malformed record or unsupported format stops playback with its input
 line number. Input, output, and flush failures are returned rather than ignored.
@@ -726,6 +737,40 @@ contains executable segment ranges, their link-time addresses and debug IDs
 where available, not the debug sections themselves. Use the map from the
 **same run**: ASLR changes addresses even for identical binaries. Take the
 snapshot while the images are loaded; dynamic unload/reload is not tracked.
+
+### Replay using only the recording
+
+For a self-contained recording, build a **standalone GSYM v1** pack for each
+image you want to symbolize. This is a build/release step; the exact executable
+and its debug information are required here, not at replay. For the DFE demo:
+
+```sh
+CARGO_PROFILE_DEV_DEBUG=2 cargo build -p sprintr-prototype --example dfe_hierarchy
+exe=target/debug/examples/dfe_hierarchy
+# ELF with embedded DWARF (Linux):
+llvm-gsymutil --convert="$exe" -o dfe.gsym
+# On macOS use these two commands instead:
+# dsymutil --flat "$exe" -o dfe.dwarf
+# llvm-gsymutil --convert=dfe.dwarf -o dfe.gsym
+"$exe" --symbols dfe.gsym --fail-metrics > run.jsonl
+```
+
+Copy only `run.jsonl` to the reader. Both commands below use the embedded
+bytes; neither opens paths named in the recording.
+
+```sh
+cargo run -q -p sprintr-prototype --example exception_chain -- replay < run.jsonl
+cargo run -q -p sprintr-prototype --example json_lines -- replay --symbols < run.jsonl
+```
+
+Applications call `symbols::record_symbols(paths)?` once on the started
+output, before starting workers. Repeat `--symbols FILE` in the demo to cover
+shared libraries. Duplicate copies of a pack cost one payload. Unmatched
+build IDs or corrupt pack data produce errors; uncovered frames retain the
+address, module and build ID when available. This prototype accepts
+little-endian GSYM v1 and assumes the executable mappings stay stable.
+Enabling it includes function names and build-time source paths in the log:
+apply the same access and retention policy as for debug artifacts.
 
 ## Producer allocation profile
 
