@@ -11,6 +11,9 @@
 
 use crate::__private::Declaration;
 
+mod catalog;
+pub use catalog::*;
+
 crate::entities! {
     /// Logging statement
     #[anonymous]

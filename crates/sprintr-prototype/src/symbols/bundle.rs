@@ -132,6 +132,7 @@ pub fn record_symbols(
     publish(bundle)
 }
 
+#[allow(unsafe_code)] // linkme callsite registration
 fn publish(bundle: Bundle) -> io::Result<RecordAddress> {
     let definition = schema::symbol_bundle.new(bundle)?;
     schema::recorded_symbols.context(&definition)?.in_scope(|| {

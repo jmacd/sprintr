@@ -165,6 +165,11 @@ pub(crate) struct Resolved {
     pub(crate) definitions: Box<[usize]>,
 }
 
+pub(crate) struct StatementDescription {
+    pub template: Cow<'static, [u8]>,
+    definitions: Box<[usize]>,
+}
+
 impl Statement {
     pub const fn new(
         encoded: &'static [u8],
@@ -187,6 +192,22 @@ impl Statement {
     }
 
     fn resolve_once(&self) -> Result<Resolved, String> {
+        let StatementDescription {
+            template,
+            definitions,
+        } = self.describe()?;
+        let id = NEXT_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| "statement identity space exhausted".to_string())?;
+        Ok(Resolved {
+            id,
+            template,
+            definitions,
+        })
+    }
+
+    /// Resolve declared names without assigning a first-use statement ID.
+    pub(crate) fn describe(&self) -> Result<StatementDescription, String> {
         let runtime = runtime();
         let mut definitions = Vec::new();
         let mut add = |index: usize| {
@@ -224,11 +245,7 @@ impl Statement {
         } else {
             Cow::Borrowed(self.encoded)
         };
-        let id = NEXT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| "statement identity space exhausted".to_string())?;
-        Ok(Resolved {
-            id,
+        Ok(StatementDescription {
             template,
             definitions: definitions.into_boxed_slice(),
         })

@@ -41,9 +41,11 @@ pub(crate) fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         // sprintr's schema comes first so that its names are never renamed.
         Runtime::new(
-            crate::schema::DECLARATIONS
-                .iter()
-                .chain(crate::__private::DECLARATIONS.iter()),
+            crate::schema::DECLARATIONS.iter().chain(
+                crate::__private::DECLARATIONS
+                    .iter()
+                    .map(|d| &d.declaration),
+            ),
         )
     })
 }

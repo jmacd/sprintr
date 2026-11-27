@@ -47,6 +47,7 @@ fn bundle() -> Bundle {
     }
 }
 
+#[allow(unsafe_code)] // linkme callsite registration
 fn recording() -> Vec<Message> {
     let mut logger = Logger::new(Vec::new());
     logger.start().unwrap();

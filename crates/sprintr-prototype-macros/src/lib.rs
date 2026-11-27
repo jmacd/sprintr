@@ -2,7 +2,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
-use quote::{ToTokens, format_ident, quote};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use sprintr_message::format::{Part, Spec, parse_capture};
 use sprintr_message::validate_relation_name;
 use syn::parse::{Parse, ParseStream};
@@ -115,12 +115,15 @@ fn relation_name(name: &LitStr) -> syn::Result<String> {
     Ok(value)
 }
 
-fn register(root: &Path, declaration: Tokens) -> Tokens {
+fn register(root: &Path, declaration: Tokens, at: Span) -> Tokens {
+    let location = quote_spanned!(at=> ::core::panic::Location::caller());
     quote! {
         const _: () = {
             #[#root::__private::linkme::distributed_slice(#root::__private::DECLARATIONS)]
             #[linkme(crate = #root::__private::linkme)]
-            static DECLARATION: #root::__private::Declaration = #declaration;
+            static DECLARATION: #root::__private::LocatedDeclaration = #root::__private::LocatedDeclaration {
+                declaration: #declaration, module: ::core::module_path!(), location: #location
+            };
         };
     }
 }
@@ -251,6 +254,7 @@ fn attribute(root: &Path, item: AttributeItem) -> syn::Result<Tokens> {
     let registration = register(
         root,
         quote!(#root::__private::Declaration::Relation(#ident.__meta())),
+        ident.span(),
     );
     Ok(quote! {
         #(#docs)*
@@ -403,6 +407,7 @@ fn entity(root: &Path, item: EntityItem) -> syn::Result<Tokens> {
     let registration = register(
         root,
         quote!(#root::__private::Declaration::Relation(#ident.__meta())),
+        ident.span(),
     );
     let relation_static = |vis: Tokens, ident: &Ident| {
         quote! {
@@ -443,8 +448,11 @@ fn entity(root: &Path, item: EntityItem) -> syn::Result<Tokens> {
                 &format!("{}:{}", json(&relation), json(&value_name)),
                 value.span(),
             );
-            let registration =
-                register(root, quote!(#root::__private::Declaration::Named(&#value)));
+            let registration = register(
+                root,
+                quote!(#root::__private::Declaration::Named(&#value)),
+                value.span(),
+            );
             named.push(quote! {
                 #(#docs)*
                 #[allow(non_upper_case_globals)]
@@ -487,7 +495,7 @@ struct Compiled {
 enum Capture {
     Statement,
     Nested,
-    Exception,
+    Exception(bool),
 }
 
 fn compile(input: &Input, capture: Capture) -> syn::Result<Compiled> {
@@ -583,10 +591,12 @@ fn compile(input: &Input, capture: Capture) -> syn::Result<Compiled> {
                     let label = json_content(&format!("{{{label}{suffix}}}"), span);
                     message.push(quote!(#label));
                     arguments.push(match (field.spec, field.format.is_empty()) {
-                        (Spec::String, true) if capture == Capture::Exception => quote!({
-                            use #root::__private::RetainedArgument as _;
-                            (#expression).__sprintr_retained_argument()
-                        }),
+                        (Spec::String, true) if matches!(capture, Capture::Exception(_)) => {
+                            quote!({
+                                use #root::__private::RetainedArgument as _;
+                                (#expression).__sprintr_retained_argument()
+                            })
+                        }
                         (Spec::String, true) => {
                             let scalars =
                                 nested.then(|| quote!(use #root::__private::ScalarArgument as _;));
@@ -653,6 +663,22 @@ fn compile(input: &Input, capture: Capture) -> syn::Result<Compiled> {
             );
         }
     };
+    let template = if nested {
+        quote!(#root::__private::CatalogTemplate::Structure(&__FORMAT))
+    } else {
+        quote!(#root::__private::CatalogTemplate::Statement(&__STATEMENT))
+    };
+    let source_format = &input.format;
+    let cause = matches!(capture, Capture::Exception(true));
+    let declaration = quote! {
+        #declaration
+        #[#root::__private::linkme::distributed_slice(#root::__private::CATALOG_SITES)]
+        #[linkme(crate = #root::__private::linkme)]
+        static __CATALOG_SITE: #root::__private::CatalogSite = #root::__private::CatalogSite {
+            template: #template, source_format: #source_format, cause: #cause,
+            module: ::core::module_path!(), location: ::core::panic::Location::caller()
+        };
+    };
     // Capture each invocation before entering the logger.
     let stack = quote! {
         #root::__private::capture_stack(&mut [0u64; #root::MAX_STACK_DEPTH])
@@ -704,14 +730,16 @@ impl Parse for ExceptionInput {
 pub fn exception(input: TokenStream) -> TokenStream {
     let ExceptionInput(variant, mut input) = parse_macro_input!(input as ExceptionInput);
     let root = &input.root;
-    let mut cause = quote!(None);
-    if let Some(Expr::Assign(a)) = input.arguments.last()
+    let cause = if let Some(Expr::Assign(a)) = input.arguments.last()
         && matches!(a.left.as_ref(), Expr::Path(p) if p.path.is_ident("cause"))
     {
         let value = &a.right;
-        cause = quote!(Some(::core::convert::Into::into(#value)));
+        let value = quote!(Some(::core::convert::Into::into(#value)));
         input.arguments.pop();
-    }
+        Some(value)
+    } else {
+        None
+    };
     let class = variant
         .segments
         .iter()
@@ -723,8 +751,14 @@ pub fn exception(input: TokenStream) -> TokenStream {
         input.format.span(),
     );
     input.values.push(syn::parse_quote!(__CLASS));
-    let registration = register(root, quote!(#root::__private::Declaration::Named(&__CLASS)));
-    let result = compile(&input, Capture::Exception).map(|Compiled { declaration, stack, arguments, display }| quote! {{
+    let registration = register(
+        root,
+        quote!(#root::__private::Declaration::Named(&__CLASS)),
+        input.format.span(),
+    );
+    let mode = Capture::Exception(cause.is_some());
+    let cause = cause.unwrap_or_else(|| quote!(None));
+    let result = compile(&input, mode).map(|Compiled { declaration, stack, arguments, display }| quote! {{
         static __CLASS: #root::Named = #root::Named::__new(&#root::schema::exception_class, #class, #class, #fragment);
         #registration
         #declaration

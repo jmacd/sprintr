@@ -36,6 +36,30 @@ For recordings with a separate module map, use `--module-map modules.json`
 to display linked addresses instead. Start at the beginning of the recording
 so the reader sees any definitions that later events reuse.
 
+## Compare the compiled telemetry schema
+
+Applications can serialize `sprintr_prototype::schema::catalog()?` before
+starting the logger. The DFE example exposes this as an export-and-exit flag:
+
+```sh
+cargo run -q -p sprintr-prototype --example dfe_hierarchy -- --print-telemetry-schema > head.json
+sprintr schema diff base.json head.json > telemetry-diff.md
+sprintr schema diff base.json head.json --format json
+```
+
+Generate both catalogs from the same binary target and feature set. The JSON
+catalog includes resolved relation names, declaration origins, entity identity
+rules, static named values, statement and `structured!` templates, and ordered
+argument bindings and capture types. A dynamic `{}` slot stays dynamic; the
+exporter never calls user formatters or samples runtime entity payloads.
+
+The report compares fields rather than lines of JSON. Moving an unchanged
+statement is silent; repeated statements retain their multiplicity. For an
+edit in the same file and module, unique wording or a unique nonempty sequence
+of argument bindings can identify the pair. Ambiguous changes appear as
+removals and additions. Differences are informational (exit status zero);
+invalid input and I/O failures are errors.
+
 ## Try it
 
 ```sh

@@ -7,6 +7,8 @@ use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod schema;
+
 #[derive(Parser)]
 #[command(name = "sprintr", version, about = "Read sprintr recordings")]
 struct Cli {
@@ -16,6 +18,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Compare catalogs exported by instrumented applications.
+    #[command(subcommand)]
+    Schema(schema::Command),
     /// Stream a JSON Lines recording as formatted text.
     Replay {
         /// Recording to read (default: stdin; use - for stdin explicitly).
@@ -35,13 +40,15 @@ fn open(path: &Path) -> io::Result<BufReader<File>> {
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
 
-fn run(
-    Command::Replay {
-        input,
-        symbols,
-        module_map,
-    }: Command,
-) -> io::Result<()> {
+fn run(command: Command) -> io::Result<()> {
+    let (input, symbols, module_map) = match command {
+        Command::Schema(command) => return schema::run(command),
+        Command::Replay {
+            input,
+            symbols,
+            module_map,
+        } => (input, symbols, module_map),
+    };
     let map: ModuleMap;
     let mode = if let Some(path) = module_map {
         map = serde_json::from_reader(open(&path)?).map_err(|e| {

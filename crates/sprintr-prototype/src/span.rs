@@ -200,6 +200,7 @@ impl Drop for SpanOwner {
     }
 }
 
+#[allow(unsafe_code)] // linkme callsite registration
 fn end_event() {
     crate::__private::report(
         crate::__record!(crate; [crate::schema::log_kind::SPAN_END]; "span ended"),

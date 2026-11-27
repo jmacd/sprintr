@@ -210,7 +210,7 @@ pub struct StatementTemplate {
     pub source: StatementSource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatementSource {
     #[serde(rename = "mod")]

@@ -106,13 +106,22 @@ fn main() -> io::Result<()> {
     let usage = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: dfe_hierarchy [--fail-metrics] [--symbols MODULE.gsym]...",
+            "usage: dfe_hierarchy --print-telemetry-schema | [--fail-metrics] [--symbols MODULE.gsym]...",
         )
     };
     let mut metrics_open = true;
     let mut packs = Vec::new();
     while let Some(arg) = args.next() {
-        if arg == "--fail-metrics" && metrics_open {
+        if arg == "--print-telemetry-schema"
+            && metrics_open
+            && packs.is_empty()
+            && args.next().is_none()
+        {
+            use std::io::Write;
+            let mut out = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut out, &sprintr_prototype::schema::catalog()?)?;
+            return writeln!(out);
+        } else if arg == "--fail-metrics" && metrics_open {
             metrics_open = false;
         } else if arg == "--symbols" {
             packs.push(args.next().ok_or_else(usage)?);

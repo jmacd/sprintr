@@ -106,6 +106,24 @@ Its value is pre-encoded with the source code.
 Log events reference the statement and supply argument values, allowing
 the recorded format to be reused when recovering formatted messages.
 
+### Compiled catalog
+
+`schema::catalog()` enumerates two link-time collections: declarations and
+macro-generated callsites (including nested `structured!` templates). It
+resolves names through the same relation registry as recording, without
+starting an output, assigning first-use statement IDs, or evaluating
+arguments. `sprintr.catalog/1` records declared and resolved names, source
+locations, ordered slots, source and recorded formats, static associations
+and exception cause bindings. For example, `:?` and `:s` both record a
+string but have different capture semantics. Value-dependent object shapes
+and concrete generic encoder instances are runtime facts.
+
+A statement needs no author-assigned name. `sprintr schema diff` compares
+catalogs as multisets of descriptors, reports field changes for unambiguous
+pairs, and keeps additions and removals separate when identity is uncertain.
+The catalog is sprintr's inventory, distinct from a Weaver registry; the
+report assigns no compatibility or policy verdict.
+
 ## Relations
 
 The schema is self-describing, built on a base entity, `log.relation`.

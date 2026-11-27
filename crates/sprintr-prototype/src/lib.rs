@@ -454,6 +454,7 @@ type Dispatch<'scope> = dyn Fn(&'static Statement, io::Result<&[u64]>, EventArgs
     + 'scope;
 scoped_tls_hkt::scoped_thread_local!(static CURRENT: for<'a> &'a Dispatch<'a>);
 
+#[allow(unsafe_code)] // linkme callsite registrations within the SDK itself
 fn announce() -> io::Result<()> {
     runtime()
         .check_schema()
@@ -519,6 +520,7 @@ pub mod __private {
     pub use crate::declare::{Declaration, RelationMeta};
     pub use crate::entity::BorrowedArgument;
     pub use crate::exception::{ErrorSite, OwnedField, RetainedArgument, capture_exception};
+    pub use crate::schema::{CatalogSite, CatalogTemplate, LocatedDeclaration};
     pub use crate::stack::capture_stack;
     pub use crate::statement::{
         NestedTemplate, Statement, concatenate, encoded_len, json_string, json_string_len,
@@ -531,7 +533,10 @@ pub mod __private {
 
     /// Every declaration in the program, collected at link time.
     #[linkme::distributed_slice]
-    pub static DECLARATIONS: [Declaration];
+    pub static DECLARATIONS: [LocatedDeclaration];
+
+    #[linkme::distributed_slice]
+    pub static CATALOG_SITES: [CatalogSite];
 
     #[derive(Default)]
     struct StdoutState {
